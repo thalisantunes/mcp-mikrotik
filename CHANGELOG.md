@@ -3,6 +3,141 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.13.0] - Unreleased
+
+WireGuard VPN management round - the most security-sensitive round to date,
+since WireGuard uses **private keys**. One new read tool
+(`wireguard_interfaces`) and three new guarded write tools
+(`add_wireguard_interface`, `add_wireguard_peer`, `remove_wireguard_peer`).
+Same write-guard mechanism as every previous round (read-only default,
+central allowlist, confirm/preview, audit journal - none of it weakened or
+bypassed), plus a security invariant unique to this round: no tool, error
+message, preview, or audit journal entry may EVER contain a private-key or
+preshared-key.
+
+### Added
+
+- **`wireguard_interfaces`** (read, `server.py`): lists `/interface/wireguard`
+  - name, listen-port, public-key, running, disabled, mtu. **SECURITY**:
+  unlike `wireguard_peers` (v0.8), RouterOS's own reply for THIS menu
+  genuinely carries a `private-key` field - always stripped before
+  returning, via `formatting.strip_sensitive_fields` with the new
+  `formatting.WIREGUARD_SENSITIVE_FIELDS` constant (`{"private-key",
+  "preshared-key"}`, shared between this tool, `wireguard_peers`, and every
+  WireGuard write tool's redaction below). `wireguard_peers` itself is
+  unchanged in shape but now also strips a peer's `preshared-key` (a real,
+  optional field on that menu this package previously didn't defend
+  against). Empty list (never an error) for a device with no WireGuard
+  package/interfaces - same convention as `wireguard_peers`.
+- **`add_wireguard_interface`** (write, guarded, `guard.py` + `server.py`):
+  creates a WireGuard tunnel interface (`/interface/wireguard add` - `name`,
+  optional `listen_port`). RouterOS generates the interface's private key
+  internally on creation - this tool has NO `private_key` parameter at all
+  (not "rejected if given", genuinely absent from the function signature -
+  same "no code path to smuggle a secret through" pattern v0.9's
+  `add_netwatch` used for up-script/down-script), and never returns one. The
+  `confirm=false` preview's `after` deliberately does not invent a
+  `public-key` (RouterOS hasn't generated the key pair yet at preview time)
+  - only `name`/`listen-port` (if given). The `confirm=true` applied result
+  re-reads the newly created interface and reports its real `public-key`
+  (safe to share with a remote peer), with `private-key` always stripped by
+  `guard._redact_wireguard_row` **before** the `WritePreview` is
+  constructed - see "How the private-key redaction is enforced" below for
+  why that ordering is the whole point. Refuses to create a second interface
+  sharing `name` (`ResourceAlreadyExistsError`).
+- **`add_wireguard_peer`** (write, guarded): adds a peer
+  (`/interface/wireguard/peers add`) to an existing tunnel `interface` - the
+  remote peer's `public_key` (validated as a 44-character base64 WireGuard
+  key - `validation.validate_wireguard_key`), `allowed_address` (a
+  comma-separated CIDR list - `validation.validate_allowed_address_list`),
+  and optional `endpoint_address`/`endpoint_port`/`persistent_keepalive`/
+  `comment`. Has NO `private_key` or `preshared_key` parameter either - the
+  remote peer's own private key, and any preshared key, are entirely out of
+  this tool's scope. `interface` must already exist
+  (`/interface/wireguard`) - raises `ResourceNotFoundError` otherwise; never
+  creates one. Refuses to add a duplicate peer - the same `public_key`
+  already registered on the same `interface` - raises
+  `ResourceAlreadyExistsError` instead.
+- **`remove_wireguard_peer`** (write, guarded): removes a peer
+  (`/interface/wireguard/peers remove`) from `interface`, resolved by
+  `public_key` or `comment` (`public_key` tried first if both are given,
+  scoped to `interface` so a peer sharing a public-key on a DIFFERENT
+  interface never matches). `ResourceNotFoundError` if nothing matches;
+  `AmbiguousResourceError` if more than one peer still matches after
+  narrowing (e.g. two peers sharing a `comment` on the same interface) -
+  never guesses which one to remove.
+- `validation.validate_port` (listen-port/endpoint-port, 1-65535),
+  `validation.validate_wireguard_key` (a 44-character base64 WireGuard key
+  shape - used ONLY for a caller-supplied PUBLIC key; this package never
+  accepts a private/preshared key as a parameter, so there is no validator
+  for one either), `validation.validate_allowed_address_list` (a
+  comma-separated CIDR list, each entry validated via the existing
+  `validate_target`) - all new, `src/mcp_mikrotik/validation.py`.
+- `formatting.WIREGUARD_SENSITIVE_FIELDS` (new): the shared
+  `{"private-key", "preshared-key"}` constant `server.py`'s read tools and
+  `guard.py`'s write-preview redaction both use, so the two paths can never
+  drift out of sync with each other.
+
+### How the private-key/preshared-key redaction is enforced (two independent layers)
+
+1. **`formatting.strip_sensitive_fields`** (with the new
+   `WIREGUARD_SENSITIVE_FIELDS`) is applied to every WireGuard row this
+   package ever returns or journals - both read tools
+   (`wireguard_interfaces`/`wireguard_peers`, `server.py`) and every write
+   tool's before/after preview, via a new `guard._redact_wireguard_row`
+   helper.
+2. **Redaction happens INSIDE `guard.py`, before a `WritePreview` is ever
+   constructed - not one layer up in `server.py`.** This is the critical
+   ordering: the write-guard's `_audited` decorator (v0.5) journals exactly
+   whatever a `guard.py` function returns. If redaction only happened in
+   `server.py` (after `guard.py` already returned), a private-key would
+   already be sitting in the audit journal (a file on disk, or a stderr log
+   line) by the time `server.py` got a chance to strip it. So
+   `add_wireguard_interface` redacts the freshly-created interface row
+   BEFORE building the `WritePreview` the decorator logs -
+   `guard._redact_wireguard_row` runs first, every time.
+3. **`audit._SENSITIVE_KEY`** (extended this round: added a `private` term,
+   on top of the existing `pre.?shared` term that already covered
+   `preshared-key`/`pre-shared-key`/`presharedkey`) is a SECOND, independent
+   line of defense on top of (1)/(2) - not a substitute for it. If a future
+   write function ever forgot to redact before returning, this regex is
+   what stands between that and a leaked key reaching the journal.
+
+`add_wireguard_interface`/`add_wireguard_peer` also have no code path to
+leak a key a different way: neither function has a `private_key` parameter
+at all (and `add_wireguard_peer` has no `preshared_key` parameter either) -
+see `test_add_wireguard_interface_never_accepts_a_private_key_parameter`/
+`test_add_wireguard_peer_never_accepts_a_private_key_or_preshared_key_parameter`
+(`tests/test_guard.py`, assert `TypeError` for either kwarg), mirroring
+v0.9's `add_netwatch` up-script/down-script guarantee.
+
+### Tests
+
+54 new tests (869 → 923, full suite green): `validate_port`/
+`validate_wireguard_key`/`validate_allowed_address_list` (accept/reject);
+`wireguard_interfaces` (happy path, the explicit private-key-redaction
+proof, empty-for-no-WireGuard) and `wireguard_peers`'
+`preshared-key`-redaction proof (`tests/test_server.py`); guard-level
+coverage for all three new writes (blocked when read-only, read-only gate
+before touching the device, preview vs confirm, `ALLOWLIST.action`-driven
+dispatch, name/public-key duplicate → `ResourceAlreadyExistsError`,
+unknown-interface/unknown-peer → `ResourceNotFoundError`, ambiguous-comment
+→ `AmbiguousResourceError`, the no-private-key-parameter guarantee); audit
+journal coverage (preview/applied/error outcomes, folded into the existing
+cross-tool no-password-leak sweep - now 27 events) plus a dedicated
+**CRITICAL security test**,
+`test_add_wireguard_interface_confirmed_call_never_leaks_private_key_into_journal`
+(`tests/test_guard_audit.py`) and its end-to-end counterpart,
+`test_add_wireguard_interface_never_leaks_private_key_anywhere`
+(`tests/test_server.py`): `tests/fakes.py`'s `FakePath.add()` now simulates
+RouterOS genuinely generating a key pair - including a
+distinctively-marked private-key - on `/interface/wireguard add` (a fake
+`add()` that only echoed back the fields it was given would never produce a
+private-key for the redaction to strip in the first place, making the leak
+test vacuous), and both tests assert that marker never reaches the tool's
+own return value, the audit journal's `before` AND `after`, or any other
+log line.
+
 ## [0.12.0] - Unreleased
 
 Security audit round: two new READ-ONLY tools, `security_audit` and

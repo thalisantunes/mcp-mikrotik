@@ -52,14 +52,31 @@ def strip_sensitive_fields(rows: Iterable[dict[str, Any]], keys: Iterable[str]) 
     v0.8: used by `wireguard_peers` to guarantee a WireGuard private-key can
     never be returned. RouterOS's own `/interface/wireguard/peers` reply
     doesn't carry a `private-key` field in the first place (only
-    `/interface/wireguard` - the tunnel interfaces themselves, which this
-    package does not expose a read tool for - does), so this is
-    belt-and-suspenders: it strips the field defensively regardless, so a
-    future RouterOS version, firmware quirk, or added read tool can't leak
-    one just because the safety net wasn't there yet.
+    `/interface/wireguard` - the tunnel interfaces themselves - does), so
+    this was originally belt-and-suspenders: it strips the field defensively
+    regardless, so a future RouterOS version, firmware quirk, or added read
+    tool can't leak one just because the safety net wasn't there yet.
+
+    v0.13 adds a read tool (`wireguard_interfaces`) for `/interface/wireguard`
+    itself, whose reply DOES genuinely carry a `private-key` - see
+    `WIREGUARD_SENSITIVE_FIELDS` below, and `guard.py`'s
+    `_redact_wireguard_row`, which applies this same helper to every
+    WireGuard write tool's before/after preview too (interface `private-key`,
+    peer `preshared-key`), so the write-guard's audit journal - which logs
+    whatever a guard.py function returns - can never carry one either.
     """
     key_set = set(keys)
     return [{field: value for field, value in row.items() if field not in key_set} for row in rows]
+
+
+# v0.13: the two field names that must NEVER survive in any WireGuard row
+# this package returns or journals, from any tool (read or write):
+# `private-key` (a tunnel interface's own key, RouterOS-generated, never
+# accepted as input) and `preshared-key` (an optional per-peer secret,
+# likewise never accepted as input by add_wireguard_peer). One shared
+# constant so server.py's read tools and guard.py's write-preview redaction
+# can never drift out of sync with each other.
+WIREGUARD_SENSITIVE_FIELDS = frozenset({"private-key", "preshared-key"})
 
 
 def split_address_port(value: str) -> tuple[str, str | None]:

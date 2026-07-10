@@ -14,9 +14,24 @@ from typing import Any, Callable
 from librouteros.exceptions import LibRouterosError
 
 
+# v0.13: real RouterOS generates a WireGuard interface's private/public key
+# pair itself on `/interface/wireguard add` - a caller never supplies (or
+# gets back from add()) a private key. Simulated here, keyed by path
+# segments, so tests can prove guard.add_wireguard_interface's redaction
+# (see guard._redact_wireguard_row) actually strips a private-key that a
+# real device would otherwise hand back on the very next read - without this,
+# a fake add() that only echoes back the fields it was given would never
+# produce a private-key for the redaction to strip in the first place, and
+# the leak test would be vacuous.
+_WIREGUARD_INTERFACE_PATH = ("interface", "wireguard")
+FAKE_WIREGUARD_PRIVATE_KEY_MARKER = "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK-mZ9k1q2r3s4t5u6v7w8x9y0z1A2B3C4D5E="
+FAKE_WIREGUARD_PUBLIC_KEY_MARKER = "FAKE-PUBLIC-KEY-OK-TO-SHOW-1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8="
+
+
 class FakePath:
-    def __init__(self, rows: list[dict[str, Any]]):
+    def __init__(self, rows: list[dict[str, Any]], segments: tuple[str, ...] = ()):
         self._rows = rows
+        self._segments = segments
 
     def __iter__(self):
         return iter(self._rows)
@@ -43,7 +58,17 @@ class FakePath:
             self._rows.append(dict(fields))
 
     def add(self, **fields: Any) -> str:
-        self._rows.append(dict(fields))
+        row = dict(fields)
+        if self._segments == _WIREGUARD_INTERFACE_PATH:
+            # See module note above: mirror RouterOS generating a WireGuard
+            # interface's key pair server-side, so a private-key genuinely
+            # exists on this row for guard.add_wireguard_interface's
+            # redaction to have to strip.
+            row.setdefault("private-key", FAKE_WIREGUARD_PRIVATE_KEY_MARKER)
+            row.setdefault("public-key", FAKE_WIREGUARD_PUBLIC_KEY_MARKER)
+            row.setdefault("running", "true")
+            row.setdefault("disabled", "false")
+        self._rows.append(row)
         return str(len(self._rows))
 
     def remove(self, *ids: str) -> None:
@@ -126,7 +151,7 @@ class FakeConnection:
         if key in self._raise_for:
             raise self._raise_for[key]
         rows = self._data.setdefault(key, [])
-        return FakePath(rows)
+        return FakePath(rows, key)
 
     def __call__(self, cmd: str, **kwargs: Any):
         self.calls.append((cmd, kwargs))

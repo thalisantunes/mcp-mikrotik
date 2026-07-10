@@ -208,6 +208,23 @@ def fake_connection() -> FakeConnection:
                 {".id": "*1", "slot": "usb1", "type": "usb", "total-size": "32000000000", "free-size": "20000000000"}
             ],
             # v0.8: VPN / routing / failover diagnostics.
+            # v0.13: the tunnel interface itself - deliberately no
+            # private-key here (a real device's reply would carry one; this
+            # fixture only exercises the happy path of visible fields -
+            # the explicit private-key-redaction proof uses its own
+            # dedicated FakeConnection with a distinctive marker, mirroring
+            # test_wireguard_peers_never_exposes_private_key's pattern).
+            ("interface", "wireguard"): [
+                {
+                    ".id": "*1",
+                    "name": "wg1",
+                    "listen-port": "13231",
+                    "public-key": "SERVERPUBKEYAAAA==",
+                    "running": "true",
+                    "disabled": "false",
+                    "mtu": "1420",
+                }
+            ],
             ("interface", "wireguard", "peers"): [
                 {
                     ".id": "*1",

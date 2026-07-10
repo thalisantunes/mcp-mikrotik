@@ -219,11 +219,27 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     guard.wake_on_lan(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
     guard.disable_firewall_rule(client, settings_write_enabled, comment="allow established", confirm=True)
     guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
+    guard.add_wireguard_interface(client, settings_write_enabled, name="wg-sweep", confirm=True)
+    guard.add_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+        allowed_address="10.10.0.9/32",
+        confirm=True,
+    )
+    guard.remove_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+        confirm=True,
+    )
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 24
+    assert len(events) == 27
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -826,3 +842,167 @@ def test_disable_firewall_rule_confirmed_call_journals_outcome_applied_without_l
 
     raw = audit_log.read_text(encoding="utf-8")
     assert device.password not in raw
+
+
+# --- WireGuard management (v0.13): CRITICAL - private-key must never reach --
+# --- the audit journal, in any outcome -------------------------------------
+
+
+def test_add_wireguard_interface_confirmed_call_never_leaks_private_key_into_journal(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """The fake device (tests/fakes.py) simulates RouterOS generating a real
+    key pair - including a distinctively-marked private-key - on
+    `/interface/wireguard add`. This proves that marker never reaches the
+    audit journal's `before` OR `after`, even though guard.py had to re-read
+    the freshly created row (which genuinely carries it) to report the
+    public-key."""
+    applied = guard.add_wireguard_interface(
+        client, settings_write_enabled, name="wg-audit-test", confirm=True
+    )
+    assert "public-key" in applied.after
+    assert "private-key" not in applied.after
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_wireguard_interface"
+    assert event["summary"]["after"]["name"] == "wg-audit-test"
+    assert "private-key" not in event["summary"]["before"]
+    assert "private-key" not in event["summary"]["after"]
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK" not in raw
+
+
+def test_add_wireguard_interface_preview_never_leaks_a_public_key_that_does_not_exist_yet(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """A confirm=False preview never invents a public-key (RouterOS hasn't
+    generated one yet) - so the journal for a preview can't leak one either,
+    by construction."""
+    guard.add_wireguard_interface(client, settings_write_enabled, name="wg-preview-test", confirm=False)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert "public-key" not in events[0]["summary"]["after"]
+    assert "private-key" not in events[0]["summary"]["after"]
+
+
+def test_add_wireguard_interface_duplicate_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_wireguard_interface(client, settings_write_enabled, name="wg1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_wireguard_interface"
+
+
+def test_add_wireguard_interface_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.add_wireguard_interface(client, settings, name="wg2", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_wireguard_interface"
+
+
+def test_add_wireguard_peer_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.add_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+        allowed_address="10.10.0.9/32",
+        confirm=True,
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_wireguard_peer"
+    assert event["operation"] == "add_wireguard_peer"
+    assert event["action"] == "add"
+    assert event["summary"]["after"]["public-key"] == "OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0="
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_add_wireguard_peer_unknown_interface_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.add_wireguard_peer(
+            client,
+            settings_write_enabled,
+            interface="ghost-tunnel",
+            public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+            allowed_address="10.10.0.9/32",
+            confirm=True,
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_wireguard_peer"
+
+
+def test_remove_wireguard_peer_confirmed_call_journals_outcome_applied(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {
+                    ".id": "*1",
+                    "interface": "wg1",
+                    "public-key": "OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+                }
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    guard.remove_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+        confirm=True,
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "remove_wireguard_peer"
+    assert event["operation"] == "remove_wireguard_peer"
+    assert event["action"] == "remove"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_remove_wireguard_peer_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_wireguard_peer(
+            client, settings_write_enabled, interface="wg1", public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=", confirm=True
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_wireguard_peer"

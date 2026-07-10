@@ -33,6 +33,7 @@ EXPECTED_TOOLS = {
     "ip_pools",
     "wireless_registrations",
     "wireguard_peers",
+    "wireguard_interfaces",
     "ppp_active",
     "ipsec_active_peers",
     "bgp_sessions",
@@ -81,6 +82,9 @@ EXPECTED_TOOLS = {
     "disable_firewall_rule",
     "security_audit",
     "security_events",
+    "add_wireguard_interface",
+    "add_wireguard_peer",
+    "remove_wireguard_peer",
 }
 
 
@@ -290,6 +294,72 @@ async def test_wireguard_peers_returns_empty_when_no_wireguard(settings: Setting
     )
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_wireguard_peers_never_exposes_preshared_key(settings: Settings):
+    """SECURITY (v0.13): a peer's preshared-key (a real, optional RouterOS
+    field on /interface/wireguard/peers, unlike private-key which never
+    appears there) must be stripped exactly like private-key."""
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {
+                    ".id": "*1",
+                    "name": "peer1",
+                    "public-key": "PUBKEYAAAA==",
+                    "preshared-key": "SUPERSECRETPRESHAREDKEY==",
+                }
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
+    assert "preshared-key" not in result["result"][0]
+    assert "SUPERSECRETPRESHAREDKEY==" not in str(result)
+
+
+# --- wireguard_interfaces (v0.13, read-only) ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wireguard_interfaces_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("wireguard_interfaces", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "wg1"
+    assert result["result"][0]["public-key"] == "SERVERPUBKEYAAAA=="
+    assert result["result"][0]["listen-port"] == "13231"
+
+
+@pytest.mark.asyncio
+async def test_wireguard_interfaces_never_exposes_private_key(settings: Settings):
+    """SECURITY: /interface/wireguard's own reply DOES genuinely carry a
+    private-key on a real device (unlike wireguard_peers) - this must never
+    reach a caller."""
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard"): [
+                {
+                    ".id": "*1",
+                    "name": "wg1",
+                    "public-key": "PUBKEYAAAA==",
+                    "private-key": "SUPERSECRETPRIVATEKEY==",
+                }
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireguard_interfaces", {"device_name": "core-switch"})
+    assert "private-key" not in result["result"][0]
+    assert "SUPERSECRETPRIVATEKEY==" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_wireguard_interfaces_returns_empty_when_no_wireguard(settings: Settings):
+    fake = FakeConnection(raise_for={("interface", "wireguard"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireguard_interfaces", {"device_name": "core-switch"})
     assert result["result"] == []
 
 
@@ -2248,6 +2318,384 @@ async def test_enable_firewall_rule_rejects_empty_comment_before_touching_device
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("enable_firewall_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
     assert "non-empty" in str(exc_info.value)
+
+
+# --- WireGuard management (v0.13) -------------------------------------------
+#
+# The shared fixture's ("interface", "wireguard") table (see conftest) has
+# one interface, "wg1"; ("interface", "wireguard", "peers") has one peer,
+# "peer1", on interface "wg1". Real-shaped (44-char base64) public keys used
+# below - the validator this round adds (validate_wireguard_key) is strict
+# about that shape, unlike the shared fixture's own loosely-shaped
+# "PUBKEYAAAA==" placeholder (fine for a read-only tool that never validates
+# what a device hands back, but not accepted as *caller input* here).
+
+_REMOTE_PEER_PUBKEY_1 = "OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0="
+_REMOTE_PEER_PUBKEY_2 = "idtcei5gRabTeh7XqgAXUdSWE5+QsiES7xHooeHonO8="
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_interface_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("add_wireguard_interface", {"device_name": "core-switch", "name": "wg2", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_interface_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_wireguard_interface", {"device_name": "core-switch", "name": "wg2", "listen_port": 51820, "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"] == {}
+    # The preview never invents a public-key - RouterOS hasn't generated one yet.
+    assert preview["after"] == {"name": "wg2", "listen-port": "51820"}
+    assert "public-key" not in preview["after"]
+    names = {row["name"] for row in fake_connection.path("interface", "wireguard")._rows}
+    assert "wg2" not in names
+
+    _content, applied = await mcp.call_tool(
+        "add_wireguard_interface", {"device_name": "core-switch", "name": "wg2", "listen_port": 51820, "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert applied["after"]["name"] == "wg2"
+    # The applied result DOES report the real public-key RouterOS generated...
+    assert "public-key" in applied["after"]
+    # ...but never a private-key.
+    assert "private-key" not in applied["after"]
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_interface_rejects_duplicate_name(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_interface", {"device_name": "core-switch", "name": "wg1", "confirm": True}
+        )
+    assert "wg1" in str(exc_info.value)
+    assert len(fake_connection.path("interface", "wireguard")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_interface_never_leaks_private_key_anywhere(
+    device: Device, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """CRITICAL SECURITY TEST (v0.13): the fake device (tests/fakes.py)
+    simulates RouterOS generating a real key pair on `add` - including a
+    distinctively-marked private-key - so this proves that marker never
+    reaches (a) the tool's own return value, or (b) the audit journal
+    (before AND after), or (c) any other log line, regardless of how the
+    private-key got onto the row RouterOS handed back."""
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_wireguard_interface", {"device_name": "core-switch", "name": "wg-secure-test", "confirm": True}
+    )
+
+    # (a) the tool's own return value
+    assert "private-key" not in applied["after"]
+    assert "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK" not in str(applied)
+    # The device really did generate one (proves the redaction had something
+    # to strip - a vacuous test would prove nothing).
+    device_rows = fake_connection.path("interface", "wireguard")._rows
+    created_row = next(r for r in device_rows if r["name"] == "wg-secure-test")
+    assert "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK" in created_row["private-key"]
+
+    # (b) the audit journal - both before and after
+    raw = log_path.read_text(encoding="utf-8")
+    assert "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK" not in raw
+    event = json.loads(raw.strip().splitlines()[-1])
+    assert "private-key" not in event["summary"]["before"]
+    assert "private-key" not in event["summary"]["after"]
+    assert event["summary"]["after"]["name"] == "wg-secure-test"
+
+    # (c) no other log line either.
+    assert "FAKE-PRIVATE-KEY-MUST-NEVER-LEAK" not in str(_content)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_peer",
+            {
+                "device_name": "core-switch",
+                "interface": "wg1",
+                "public_key": _REMOTE_PEER_PUBKEY_1,
+                "allowed_address": "10.10.0.5/32",
+                "confirm": True,
+            },
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_wireguard_peer",
+        {
+            "device_name": "core-switch",
+            "interface": "wg1",
+            "public_key": _REMOTE_PEER_PUBKEY_1,
+            "allowed_address": "10.10.0.5/32",
+            "endpoint_address": "203.0.113.9",
+            "endpoint_port": 51820,
+            "persistent_keepalive": "25s",
+            "comment": "laptop",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+    assert preview["after"]["public-key"] == _REMOTE_PEER_PUBKEY_1
+    assert preview["after"]["allowed-address"] == "10.10.0.5/32"
+    assert preview["after"]["endpoint-address"] == "203.0.113.9"
+    assert preview["after"]["endpoint-port"] == "51820"
+    assert preview["after"]["persistent-keepalive"] == "25s"
+    peers = fake_connection.path("interface", "wireguard", "peers")._rows
+    assert all(row.get("public-key") != _REMOTE_PEER_PUBKEY_1 for row in peers)
+
+    _content, applied = await mcp.call_tool(
+        "add_wireguard_peer",
+        {
+            "device_name": "core-switch",
+            "interface": "wg1",
+            "public_key": _REMOTE_PEER_PUBKEY_1,
+            "allowed_address": "10.10.0.5/32",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    peers = fake_connection.path("interface", "wireguard", "peers")._rows
+    assert any(row.get("public-key") == _REMOTE_PEER_PUBKEY_1 for row in peers)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_unknown_interface_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_peer",
+            {
+                "device_name": "core-switch",
+                "interface": "ghost-tunnel",
+                "public_key": _REMOTE_PEER_PUBKEY_1,
+                "allowed_address": "10.10.0.5/32",
+                "confirm": True,
+            },
+        )
+    assert "ghost-tunnel" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_rejects_duplicate_public_key_on_same_interface(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    await mcp.call_tool(
+        "add_wireguard_peer",
+        {
+            "device_name": "core-switch",
+            "interface": "wg1",
+            "public_key": _REMOTE_PEER_PUBKEY_1,
+            "allowed_address": "10.10.0.5/32",
+            "confirm": True,
+        },
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_peer",
+            {
+                "device_name": "core-switch",
+                "interface": "wg1",
+                "public_key": _REMOTE_PEER_PUBKEY_1,
+                "allowed_address": "10.10.0.6/32",
+                "confirm": True,
+            },
+        )
+    assert _REMOTE_PEER_PUBKEY_1 in str(exc_info.value)
+    peers = [row for row in fake_connection.path("interface", "wireguard", "peers")._rows if row.get("public-key") == _REMOTE_PEER_PUBKEY_1]
+    assert len(peers) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_rejects_invalid_public_key_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_peer",
+            {
+                "device_name": "core-switch",
+                "interface": "wg1",
+                "public_key": "not-a-valid-key",
+                "allowed_address": "10.10.0.5/32",
+                "confirm": True,
+            },
+        )
+    assert "public_key" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_wireguard_peer_rejects_invalid_allowed_address_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_wireguard_peer",
+            {
+                "device_name": "core-switch",
+                "interface": "wg1",
+                "public_key": _REMOTE_PEER_PUBKEY_1,
+                "allowed_address": "not-a-cidr",
+                "confirm": True,
+            },
+        )
+    assert "not-a-cidr" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_blocked_read_only_by_default(settings: Settings):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "laptop"}
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_wireguard_peer",
+            {"device_name": "core-switch", "interface": "wg1", "public_key": _REMOTE_PEER_PUBKEY_1, "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_by_public_key_preview_then_confirm(device: Device):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "laptop"}
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_wireguard_peer",
+        {"device_name": "core-switch", "interface": "wg1", "public_key": _REMOTE_PEER_PUBKEY_1, "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["public-key"] == _REMOTE_PEER_PUBKEY_1
+    assert preview["after"] == {}
+    assert len(fake.path("interface", "wireguard", "peers")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "remove_wireguard_peer",
+        {"device_name": "core-switch", "interface": "wg1", "public_key": _REMOTE_PEER_PUBKEY_1, "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake.path("interface", "wireguard", "peers")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_by_comment(device: Device):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "laptop"}
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "remove_wireguard_peer",
+        {"device_name": "core-switch", "interface": "wg1", "comment": "laptop", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake.path("interface", "wireguard", "peers")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_unknown_public_key_raises_clear_error(device: Device):
+    fake = FakeConnection(data={("interface", "wireguard", "peers"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_wireguard_peer",
+            {"device_name": "core-switch", "interface": "wg1", "public_key": _REMOTE_PEER_PUBKEY_1, "confirm": True},
+        )
+    assert _REMOTE_PEER_PUBKEY_1 in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_ambiguous_comment_raises_and_disambiguated_by_public_key(device: Device):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "dup"},
+                {".id": "*2", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_2, "comment": "dup"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_wireguard_peer",
+            {"device_name": "core-switch", "interface": "wg1", "comment": "dup", "confirm": True},
+        )
+    assert "ambiguous" in str(exc_info.value).lower()
+    assert len(fake.path("interface", "wireguard", "peers")._rows) == 2
+
+    _content, applied = await mcp.call_tool(
+        "remove_wireguard_peer",
+        {"device_name": "core-switch", "interface": "wg1", "public_key": _REMOTE_PEER_PUBKEY_2, "confirm": True},
+    )
+    assert applied["applied"] is True
+    remaining = fake.path("interface", "wireguard", "peers")._rows
+    assert len(remaining) == 1
+    assert remaining[0]["public-key"] == _REMOTE_PEER_PUBKEY_1
+
+
+@pytest.mark.asyncio
+async def test_remove_wireguard_peer_requires_public_key_or_comment(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_wireguard_peer", {"device_name": "core-switch", "interface": "wg1", "confirm": True}
+        )
+    assert "public_key" in str(exc_info.value) or "comment" in str(exc_info.value)
 
 
 # --- security_audit / security_events (v0.12, read-only) -----------------

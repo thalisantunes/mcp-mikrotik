@@ -50,8 +50,21 @@ logger = logging.getLogger("mcp_mikrotik.audit")
 # covered password/secret/token/credential, and RouterOS's own field name for
 # a WPA2 key is `passphrase` (or `wpa2-pre-shared-key`/`wpa-pre-shared-key`),
 # none of which that pattern matched.
+#
+# `private` (v0.13, WireGuard): covers `private-key`/`privatekey`/
+# `private_key` - RouterOS's own `/interface/wireguard` reply field name for
+# a tunnel interface's private key. This is a SECOND, independent line of
+# defense on top of guard.py's own explicit redaction
+# (`_redact_wireguard_row`/`formatting.strip_sensitive_fields`, applied
+# before a WritePreview is ever constructed) - see guard.py's WireGuard
+# module note for why the redaction has to happen there first: this decorator
+# only ever sees whatever guard.py already returned, so if a future write
+# function ever forgot to redact before returning, this regex is what stands
+# between that and a leaked key in the audit journal. `pre.?shared` above
+# already covers `preshared-key`/`pre-shared-key`/`presharedkey` (WireGuard's
+# own peer-level secret) - no separate term needed for that one.
 _SENSITIVE_KEY = re.compile(
-    r"password|secret|token|credential|passphrase|psk|pre.?shared",
+    r"password|secret|token|credential|passphrase|psk|pre.?shared|private",
     re.IGNORECASE,
 )
 

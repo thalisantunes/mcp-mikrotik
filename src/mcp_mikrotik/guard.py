@@ -46,8 +46,10 @@ from .exceptions import (
     ValidationError,
     WriteDisabledError,
 )
+from .formatting import WIREGUARD_SENSITIVE_FIELDS, strip_sensitive_fields
 from .validation import (
     validate_address_list_name,
+    validate_allowed_address_list,
     validate_comment,
     validate_container_identifier,
     validate_dns_name,
@@ -58,12 +60,15 @@ from .validation import (
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
+    validate_ping_address,
     validate_poe_out,
+    validate_port,
     validate_rate_pair,
     validate_route_distance,
     validate_route_gateway,
     validate_target,
     validate_timeout,
+    validate_wireguard_key,
 )
 
 
@@ -299,6 +304,38 @@ ALLOWLIST: dict[str, WriteOperation] = {
             "Disable an EXISTING firewall filter rule (disabled=yes), resolved by its comment "
             "(optionally narrowed by chain) - never creates a rule."
         ),
+    ),
+    # v0.13: WireGuard VPN management - the most sensitive round yet, since
+    # WireGuard uses private keys. add_wireguard_interface never accepts (or
+    # returns) a private-key: RouterOS generates one internally, and every
+    # row this section's functions ever return has been through
+    # _redact_wireguard_row (formatting.strip_sensitive_fields) BEFORE the
+    # WritePreview is constructed - see the module note above
+    # add_wireguard_interface below for why that ordering matters for the
+    # audit journal too.
+    "add_wireguard_interface": WriteOperation(
+        name="add_wireguard_interface",
+        path=("interface", "wireguard"),
+        action="add",
+        description=(
+            "Create a WireGuard tunnel interface (name, optional listen-port). RouterOS generates "
+            "the private key internally - never supplied or returned by this tool."
+        ),
+    ),
+    "add_wireguard_peer": WriteOperation(
+        name="add_wireguard_peer",
+        path=("interface", "wireguard", "peers"),
+        action="add",
+        description=(
+            "Add a WireGuard peer (remote public-key, allowed-address, optional endpoint/keepalive) "
+            "to an existing tunnel interface. Never accepts a private-key or preshared-key."
+        ),
+    ),
+    "remove_wireguard_peer": WriteOperation(
+        name="remove_wireguard_peer",
+        path=("interface", "wireguard", "peers"),
+        action="remove",
+        description="Remove a WireGuard peer from an interface, resolved by public-key or comment.",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -1780,3 +1817,233 @@ def disable_firewall_rule(
     return _set_firewall_rule_disabled(
         client, settings, "disable_firewall_rule", comment, disabled=True, confirm=confirm, chain=chain
     )
+
+
+# --- v0.13: WireGuard VPN management -----------------------------------
+#
+# The most security-sensitive round in this package's history: WireGuard
+# uses PRIVATE KEYS. Absolute rule, enforced here (not just in server.py):
+# no WritePreview this section returns may EVER carry a `private-key` or
+# `preshared-key` field.
+#
+# WHY the redaction happens HERE, inside guard.py, and not one layer up in
+# server.py: the `_audited` decorator wraps every function below and calls
+# audit.record() with exactly `result.before`/`result.after` - whatever the
+# wrapped function returns, BEFORE server.py (the tool wrapper) ever sees it.
+# If a private-key were only stripped in server.py, it would already be
+# sitting in the audit journal (a file on disk, or a log line) by the time
+# server.py got a chance to redact it. So every function below builds its
+# `before`/`after` through `_redact_wireguard_row` (which applies
+# `formatting.strip_sensitive_fields` with `formatting.WIREGUARD_SENSITIVE_FIELDS`
+# - `{"private-key", "preshared-key"}`) BEFORE constructing the WritePreview
+# that `_audited` will log. `audit._SENSITIVE_KEY` (extended this round to
+# also match `private`) is a SECOND, independent line of defense on top of
+# that - not a substitute for it.
+#
+# add_wireguard_interface never accepts a private-key parameter at all (there
+# is no code path through which a caller could ever supply one - RouterOS
+# generates it internally on creation, exactly the same "genuinely absent
+# parameter" pattern v0.9's add_netwatch used for up-script/down-script -
+# see test_add_wireguard_interface_never_accepts_a_private_key_parameter).
+# add_wireguard_peer never accepts a private-key OR preshared-key parameter
+# either - the remote peer's own private key, and any preshared key, are
+# both entirely out of this tool's scope.
+
+
+def _redact_wireguard_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip `private-key`/`preshared-key` from one WireGuard row - see this
+    section's module note above for why this must run before a WritePreview
+    is ever constructed, not after."""
+    return strip_sensitive_fields([row], WIREGUARD_SENSITIVE_FIELDS)[0]
+
+
+@_audited("add_wireguard_interface")
+def add_wireguard_interface(
+    client: MikrotikClient, settings: Settings, name: str, confirm: bool, listen_port: int | None = None
+) -> WritePreview:
+    """Create a WireGuard tunnel interface (`/interface/wireguard add`).
+
+    RouterOS generates the interface's private-key internally - this
+    function has no `private_key` parameter at all, and never returns one
+    (see module note above).
+
+    The `confirm=False` preview's `after` deliberately does NOT invent a
+    `public-key` value: RouterOS hasn't generated the key pair yet at
+    preview time, so `after` only describes what will be created (`name`,
+    `listen-port` if given). Only the `confirm=True` applied result re-reads
+    the newly created interface and reports its real `public-key` - with
+    `private-key` (and any `preshared-key`-shaped field, defensively)
+    stripped via `_redact_wireguard_row`.
+
+    Refuses to create a second interface sharing `name` - raises
+    ResourceAlreadyExistsError instead of creating a duplicate.
+    """
+    op = _require_allowed(settings, "add_wireguard_interface")
+
+    validated_name = validate_interface_name(name)
+    validated_listen_port = validate_port(listen_port, "listen_port") if listen_port is not None else None
+
+    rows = client.path(*op.path)
+    if _find_row_by_field(rows, "name", validated_name) is not None:
+        raise ResourceAlreadyExistsError(client.device.name, "WireGuard interface", validated_name)
+
+    payload: dict[str, Any] = {"name": validated_name}
+    if validated_listen_port is not None:
+        payload["listen-port"] = str(validated_listen_port)
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+
+    new_rows = client.path(*op.path)
+    new_row = _find_row_by_field(new_rows, "name", validated_name)
+    after = _redact_wireguard_row(dict(new_row)) if new_row is not None else dict(payload)
+
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("add_wireguard_peer")
+def add_wireguard_peer(
+    client: MikrotikClient,
+    settings: Settings,
+    interface: str,
+    public_key: str,
+    allowed_address: str,
+    confirm: bool,
+    endpoint_address: str | None = None,
+    endpoint_port: int | None = None,
+    persistent_keepalive: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Add a WireGuard peer (`/interface/wireguard/peers add`) to an
+    existing tunnel `interface`.
+
+    `public_key` is the REMOTE peer's own public key (base64, 44 chars -
+    `validate_wireguard_key`). `allowed_address` is a comma-separated list of
+    CIDR ranges routed through this peer (`validate_allowed_address_list`).
+    `endpoint_address`/`endpoint_port` (the peer's reachable address, if it
+    has one) and `persistent_keepalive` (a RouterOS duration, e.g. "25s") are
+    optional.
+
+    Has NO `private_key`/`preshared_key` parameter at all - there is no code
+    path through which either could ever be sent to the device via this
+    function (see module note above); the remote peer's own private key is
+    entirely out of scope.
+
+    `interface` must already exist (`/interface/wireguard`) - raises
+    ResourceNotFoundError otherwise; this function never creates one (use
+    add_wireguard_interface first). Refuses to add a duplicate peer - the
+    same `public_key` already registered on the same `interface` - raises
+    ResourceAlreadyExistsError instead.
+    """
+    op = _require_allowed(settings, "add_wireguard_peer")
+
+    validated_interface = validate_interface_name(interface)
+    validated_public_key = validate_wireguard_key(public_key, "public_key")
+    validated_allowed_address = validate_allowed_address_list(allowed_address)
+    validated_endpoint_address = validate_ping_address(endpoint_address) if endpoint_address is not None else None
+    validated_endpoint_port = validate_port(endpoint_port, "endpoint_port") if endpoint_port is not None else None
+    validated_keepalive = (
+        validate_timeout(persistent_keepalive, "persistent_keepalive") if persistent_keepalive is not None else None
+    )
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    interface_rows = client.path("interface", "wireguard")
+    if _find_row_by_field(interface_rows, "name", validated_interface) is None:
+        raise ResourceNotFoundError(client.device.name, "WireGuard interface", validated_interface)
+
+    rows = client.path(*op.path)
+    duplicate = [
+        row
+        for row in rows
+        if row.get("interface") == validated_interface and row.get("public-key") == validated_public_key
+    ]
+    if duplicate:
+        raise ResourceAlreadyExistsError(client.device.name, "WireGuard peer", validated_public_key)
+
+    payload: dict[str, Any] = {
+        "interface": validated_interface,
+        "public-key": validated_public_key,
+        "allowed-address": validated_allowed_address,
+    }
+    if validated_endpoint_address is not None:
+        payload["endpoint-address"] = validated_endpoint_address
+    if validated_endpoint_port is not None:
+        payload["endpoint-port"] = str(validated_endpoint_port)
+    if validated_keepalive is not None:
+        payload["persistent-keepalive"] = validated_keepalive
+    if validated_comment is not None:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = _redact_wireguard_row(dict(payload))
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_wireguard_peer")
+def remove_wireguard_peer(
+    client: MikrotikClient,
+    settings: Settings,
+    interface: str,
+    confirm: bool,
+    public_key: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Remove a WireGuard peer (`/interface/wireguard/peers remove`) from
+    `interface`, resolved by `public_key` or `comment` (`public_key` tried
+    first if both are given). At least one of the two must be given.
+
+    Raises ResourceNotFoundError if nothing matches. Raises
+    AmbiguousResourceError if more than one row still matches (e.g. two
+    peers sharing the same `comment` on the same interface) - never guesses
+    which one to remove.
+    """
+    op = _require_allowed(settings, "remove_wireguard_peer")
+
+    validated_interface = validate_interface_name(interface)
+
+    if not public_key and not comment:
+        raise ValidationError("remove_wireguard_peer requires 'public_key' or 'comment'.")
+
+    validated_public_key = validate_wireguard_key(public_key, "public_key") if public_key else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    rows = client.path(*op.path)
+    matches = [row for row in rows if row.get("interface") == validated_interface]
+    if validated_public_key is not None:
+        matches = [row for row in matches if row.get("public-key") == validated_public_key]
+    elif validated_comment is not None:
+        matches = [row for row in matches if row.get("comment") == validated_comment]
+
+    identifier = validated_public_key or validated_comment or ""
+    if not matches:
+        raise ResourceNotFoundError(client.device.name, "WireGuard peer", identifier)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "WireGuard peer",
+            identifier,
+            [row.get("comment") or row.get("public-key", "") for row in matches],
+        )
+
+    row = matches[0]
+    before = _redact_wireguard_row(dict(row))
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

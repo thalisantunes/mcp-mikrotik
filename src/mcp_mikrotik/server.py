@@ -6,12 +6,14 @@ add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
 remove_from_address_list, set_poe_out, start_container/stop_container,
 set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
-wake_on_lan, enable_firewall_rule/disable_firewall_rule - see guard.py's
-ALLOWLIST for the full write-tool inventory), plus the read-only
-connection_tracking tool (v0.11) and the read-only security_audit/
-security_events tools (v0.12 - see security.py). Transport is stdio only -
-this process is meant to run on the operator's own machine, launched by an
-MCP client (e.g. Claude Code) over stdio, with no network exposure at all.
+wake_on_lan, enable_firewall_rule/disable_firewall_rule,
+add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer - see
+guard.py's ALLOWLIST for the full write-tool inventory), plus the read-only
+connection_tracking tool (v0.11), the read-only security_audit/
+security_events tools (v0.12 - see security.py), and the read-only
+wireguard_interfaces tool (v0.13). Transport is stdio only - this process is
+meant to run on the operator's own machine, launched by an MCP client (e.g.
+Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -34,7 +36,13 @@ from . import correlation, guard, security
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
-from .formatting import filter_disabled, rows_to_list, split_address_port, strip_sensitive_fields
+from .formatting import (
+    WIREGUARD_SENSITIVE_FIELDS,
+    filter_disabled,
+    rows_to_list,
+    split_address_port,
+    strip_sensitive_fields,
+)
 from .validation import (
     validate_conntrack_dst_port,
     validate_conntrack_protocol,
@@ -74,9 +82,12 @@ MAX_SECURITY_EVENTS_LIMIT = 500
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
 
-# v0.8: WireGuard private keys must never be returned by any read tool - see
-# wireguard_peers below and strip_sensitive_fields' docstring.
-_WIREGUARD_REDACTED_FIELDS = {"private-key"}
+# v0.8/v0.13: WireGuard private/preshared keys must never be returned by any
+# read tool - see wireguard_peers/wireguard_interfaces below,
+# strip_sensitive_fields' docstring, and formatting.WIREGUARD_SENSITIVE_FIELDS
+# (the same constant guard.py's write-preview redaction uses, so read and
+# write paths can never drift out of sync).
+_WIREGUARD_REDACTED_FIELDS = WIREGUARD_SENSITIVE_FIELDS
 
 
 def build_server(settings: Settings | None = None, client_factory: ClientFactory = get_client) -> FastMCP:
@@ -288,11 +299,13 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
         SECURITY: a `private-key` field never appears in RouterOS's own
         /interface/wireguard/peers reply (only /interface/wireguard - the
-        tunnel interfaces themselves, which this package deliberately does
-        not expose a read tool for - carries one), but this strips any
-        `private-key` field defensively before returning anyway, in case a
-        future RouterOS version ever included one here. See
-        test_wireguard_peers_never_exposes_private_key.
+        tunnel interfaces themselves - carries one; see wireguard_interfaces
+        below), but this strips it defensively anyway, along with any
+        `preshared-key` a configured peer may genuinely carry (a real, if
+        optional, RouterOS field on this menu) - see
+        formatting.WIREGUARD_SENSITIVE_FIELDS and
+        test_wireguard_peers_never_exposes_private_key/
+        test_wireguard_peers_never_exposes_preshared_key.
 
         Returns an empty list (never an error) for a device with no
         WireGuard package/interfaces at all - same "empty, not an error"
@@ -302,6 +315,31 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         client = _client(device_name)
         try:
             rows = rows_to_list(client.path("interface", "wireguard", "peers"))
+        except DeviceCommandError:
+            return []
+        return strip_sensitive_fields(rows, _WIREGUARD_REDACTED_FIELDS)
+
+    @mcp.tool()
+    @_safe
+    def wireguard_interfaces(device_name: str) -> list[dict[str, Any]]:
+        """List WireGuard tunnel interfaces (/interface/wireguard): name,
+        listen-port, public-key, running, disabled, mtu.
+
+        SECURITY: RouterOS's own /interface/wireguard reply carries the
+        interface's `private-key` - this is ALWAYS stripped before
+        returning (formatting.strip_sensitive_fields with
+        formatting.WIREGUARD_SENSITIVE_FIELDS), the same mechanism
+        wireguard_peers (v0.8) already used defensively for a peer's
+        private-key/preshared-key. A private-key never leaves this process.
+        See test_wireguard_interfaces_never_exposes_private_key.
+
+        Returns an empty list (never an error) for a device with no
+        WireGuard package/interfaces at all - same convention as
+        wireguard_peers.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("interface", "wireguard"))
         except DeviceCommandError:
             return []
         return strip_sensitive_fields(rows, _WIREGUARD_REDACTED_FIELDS)
@@ -1495,6 +1533,116 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.disable_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    # --- v0.13: WireGuard VPN management ---------------------------------
+
+    @mcp.tool()
+    @_safe
+    def add_wireguard_interface(
+        device_name: str, name: str, listen_port: int | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Create a WireGuard tunnel interface (`/interface/wireguard add`).
+
+        RouterOS generates the interface's private-key internally - this
+        tool never accepts (or returns) one. The `confirm=False` preview's
+        `after` only describes what will be created (`name`, `listen-port`
+        if given) - it does not invent a `public-key`, since RouterOS hasn't
+        generated the key pair yet at preview time. The `confirm=True`
+        applied result re-reads the created interface and reports its real
+        `public-key`, with `private-key` always stripped. See README's
+        "WireGuard management" section.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview without changing anything; call again with
+        confirm=True to actually create it. Errors clearly if `name` already
+        exists - never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_wireguard_interface(
+            client, settings, name=name, listen_port=listen_port, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_wireguard_peer(
+        device_name: str,
+        interface: str,
+        public_key: str,
+        allowed_address: str,
+        endpoint_address: str | None = None,
+        endpoint_port: int | None = None,
+        persistent_keepalive: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Add a WireGuard peer (`/interface/wireguard/peers add`) to an
+        existing tunnel `interface`.
+
+        `public_key` is the REMOTE peer's own public key (base64, 44 chars).
+        `allowed_address` is a comma-separated list of CIDR ranges routed
+        through this peer (e.g. "10.0.0.2/32,10.0.0.3/32").
+        `endpoint_address`/`endpoint_port` (the peer's reachable
+        address/port, if any) and `persistent_keepalive` (a RouterOS
+        duration, e.g. "25s") are optional.
+
+        Does NOT accept a private-key or preshared-key parameter - the
+        remote peer's own private key, and any preshared key, are entirely
+        out of this tool's scope.
+
+        `interface` must already exist - create it first with
+        add_wireguard_interface; errors clearly if it doesn't. Refuses to
+        add a duplicate peer (same `public_key` already registered on the
+        same `interface`) - never creates a duplicate.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview without changing anything; call again with
+        confirm=True to actually add it.
+        """
+        client = _client(device_name)
+        preview = guard.add_wireguard_peer(
+            client,
+            settings,
+            interface=interface,
+            public_key=public_key,
+            allowed_address=allowed_address,
+            endpoint_address=endpoint_address,
+            endpoint_port=endpoint_port,
+            persistent_keepalive=persistent_keepalive,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_wireguard_peer(
+        device_name: str,
+        interface: str,
+        public_key: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Remove a WireGuard peer (`/interface/wireguard/peers remove`)
+        from `interface`, resolved by `public_key` or `comment` (`public_key`
+        tried first if both are given). At least one of the two must be
+        given.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview what would be removed without changing
+        anything; call again with confirm=True to actually remove it.
+        Errors clearly if nothing matches, or if more than one peer still
+        matches (AmbiguousResourceError) - never guesses which one to
+        remove.
+        """
+        client = _client(device_name)
+        preview = guard.remove_wireguard_peer(
+            client, settings, interface=interface, public_key=public_key, comment=comment, confirm=confirm
+        )
         return asdict(preview)
 
     return mcp

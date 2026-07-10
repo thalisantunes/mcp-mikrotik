@@ -2241,3 +2241,404 @@ def test_enable_firewall_rule_dispatches_via_allowlist_action(
     guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {".id": "*2", "disabled": "no"}}
+
+
+# --- add_wireguard_interface / add_wireguard_peer / remove_wireguard_peer --
+# --- (v0.13) ------------------------------------------------------------
+#
+# The most sensitive round: WireGuard uses private keys. The shared
+# fixture's ("interface", "wireguard") table (see conftest) has one
+# interface, "wg1"; ("interface", "wireguard", "peers") has one peer,
+# "peer1", on interface "wg1". 44-char base64-shaped public keys are used
+# below - validate_wireguard_key is strict about that shape, unlike the
+# shared fixture's own loosely-shaped "PUBKEYAAAA==" placeholder.
+
+_REMOTE_PEER_PUBKEY_1 = "OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0="
+_REMOTE_PEER_PUBKEY_2 = "idtcei5gRabTeh7XqgAXUdSWE5+QsiES7xHooeHonO8="
+
+
+def test_add_wireguard_interface_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_wireguard_interface(client, settings, name="wg2", confirm=True)
+
+
+def test_add_wireguard_interface_read_only_gate_applies_before_touching_device(
+    device: Device, settings: Settings
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_wireguard_interface(guarded_client, settings, name="wg2", confirm=True)
+
+
+def test_add_wireguard_interface_preview_does_not_create(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_wireguard_interface(client, settings_write_enabled, name="wg2", confirm=False)
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "wg2"}
+    names = {row["name"] for row in fake_connection.path("interface", "wireguard")._rows}
+    assert "wg2" not in names
+
+
+def test_add_wireguard_interface_confirm_true_creates_and_reports_public_key_never_private_key(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_wireguard_interface(
+        client, settings_write_enabled, name="wg2", listen_port=51821, confirm=True
+    )
+    assert preview.applied is True
+    assert preview.after["name"] == "wg2"
+    assert preview.after["listen-port"] == "51821"
+    assert "public-key" in preview.after
+    assert "private-key" not in preview.after
+    row = next(r for r in fake_connection.path("interface", "wireguard")._rows if r["name"] == "wg2")
+    # The fake device DID generate a private-key (proving redaction had
+    # something real to strip) - it just never made it into the preview.
+    assert "private-key" in row
+
+
+def test_add_wireguard_interface_rejects_duplicate_name(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_wireguard_interface(client, settings_write_enabled, name="wg1", confirm=True)
+    assert "wg1" in str(exc_info.value)
+    assert len(fake_connection.path("interface", "wireguard")._rows) == 1
+
+
+def test_add_wireguard_interface_rejects_invalid_listen_port_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_wireguard_interface(guarded_client, settings_write_enabled, name="wg2", listen_port=70000, confirm=True)
+
+
+def test_add_wireguard_interface_never_accepts_a_private_key_parameter(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """SECURITY: there is no `private_key` parameter at all on this
+    function - passing one raises TypeError, proving there is no code path
+    through which a caller could ever supply RouterOS's own generated key
+    (or smuggle in one of their own)."""
+    with pytest.raises(TypeError):
+        guard.add_wireguard_interface(
+            client,
+            settings_write_enabled,
+            name="wg2",
+            confirm=True,
+            private_key="SOME-KEY==",  # type: ignore[call-arg]
+        )
+
+
+def test_add_wireguard_interface_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+        return "*99"
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_wireguard_interface"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_wireguard_interface", patched_op)
+
+    guard.add_wireguard_interface(client, settings_write_enabled, name="wg2", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"name": "wg2"}}
+
+
+def test_add_wireguard_peer_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_wireguard_peer(
+            client,
+            settings,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+        )
+
+
+def test_add_wireguard_peer_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_wireguard_peer(
+            guarded_client,
+            settings,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+        )
+
+
+def test_add_wireguard_peer_preview_does_not_create(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key=_REMOTE_PEER_PUBKEY_1,
+        allowed_address="10.10.0.5/32",
+        confirm=False,
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after["public-key"] == _REMOTE_PEER_PUBKEY_1
+    assert preview.after["allowed-address"] == "10.10.0.5/32"
+    keys = {row["public-key"] for row in fake_connection.path("interface", "wireguard", "peers")._rows}
+    assert _REMOTE_PEER_PUBKEY_1 not in keys
+
+
+def test_add_wireguard_peer_confirm_true_creates_with_optional_fields(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key=_REMOTE_PEER_PUBKEY_1,
+        allowed_address="10.10.0.5/32,10.10.0.6/32",
+        endpoint_address="203.0.113.9",
+        endpoint_port=51820,
+        persistent_keepalive="25s",
+        comment="laptop",
+        confirm=True,
+    )
+    assert preview.applied is True
+    row = next(
+        r for r in fake_connection.path("interface", "wireguard", "peers")._rows if r["public-key"] == _REMOTE_PEER_PUBKEY_1
+    )
+    assert row["interface"] == "wg1"
+    assert row["allowed-address"] == "10.10.0.5/32,10.10.0.6/32"
+    assert row["endpoint-address"] == "203.0.113.9"
+    assert row["endpoint-port"] == "51820"
+    assert row["persistent-keepalive"] == "25s"
+    assert row["comment"] == "laptop"
+
+
+def test_add_wireguard_peer_unknown_interface_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.add_wireguard_peer(
+            client,
+            settings_write_enabled,
+            interface="ghost-tunnel",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+        )
+    assert "ghost-tunnel" in str(exc_info.value)
+
+
+def test_add_wireguard_peer_rejects_duplicate_public_key_on_same_interface(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    guard.add_wireguard_peer(
+        client,
+        settings_write_enabled,
+        interface="wg1",
+        public_key=_REMOTE_PEER_PUBKEY_1,
+        allowed_address="10.10.0.5/32",
+        confirm=True,
+    )
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_wireguard_peer(
+            client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="10.10.0.6/32",
+            confirm=True,
+        )
+    assert _REMOTE_PEER_PUBKEY_1 in str(exc_info.value)
+    matches = [
+        row
+        for row in fake_connection.path("interface", "wireguard", "peers")._rows
+        if row["public-key"] == _REMOTE_PEER_PUBKEY_1
+    ]
+    assert len(matches) == 1
+
+
+def test_add_wireguard_peer_rejects_invalid_public_key_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_wireguard_peer(
+            guarded_client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key="not-a-valid-key",
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+        )
+
+
+def test_add_wireguard_peer_rejects_invalid_allowed_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_wireguard_peer(
+            guarded_client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="not-a-cidr",
+            confirm=True,
+        )
+
+
+def test_add_wireguard_peer_never_accepts_a_private_key_or_preshared_key_parameter(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """SECURITY: no `private_key`/`preshared_key` parameter exists on this
+    function at all - passing either raises TypeError."""
+    with pytest.raises(TypeError):
+        guard.add_wireguard_peer(
+            client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_1,
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+            private_key="SOME-KEY==",  # type: ignore[call-arg]
+        )
+    with pytest.raises(TypeError):
+        guard.add_wireguard_peer(
+            client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key=_REMOTE_PEER_PUBKEY_2,
+            allowed_address="10.10.0.5/32",
+            confirm=True,
+            preshared_key="SOME-KEY==",  # type: ignore[call-arg]
+        )
+
+
+def test_remove_wireguard_peer_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_wireguard_peer(client, settings, interface="wg1", public_key="PUBKEYAAAA==", confirm=True)
+
+
+def test_remove_wireguard_peer_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_wireguard_peer(
+            guarded_client, settings, interface="wg1", public_key="PUBKEYAAAA==", confirm=True
+        )
+
+
+def test_remove_wireguard_peer_requires_public_key_or_comment(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ValidationError):
+        guard.remove_wireguard_peer(client, settings_write_enabled, interface="wg1", confirm=True)
+
+
+def _wireguard_peer_fixture(interface: str = "wg1") -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": interface, "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "laptop"}
+            ]
+        }
+    )
+
+
+def test_remove_wireguard_peer_by_public_key_preview_then_confirm(settings_write_enabled: Settings, device: Device):
+    fake = _wireguard_peer_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_wireguard_peer(
+        client, settings_write_enabled, interface="wg1", public_key=_REMOTE_PEER_PUBKEY_1, confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before["public-key"] == _REMOTE_PEER_PUBKEY_1
+    assert preview.after == {}
+    assert len(fake.path("interface", "wireguard", "peers")._rows) == 1
+
+    applied = guard.remove_wireguard_peer(
+        client, settings_write_enabled, interface="wg1", public_key=_REMOTE_PEER_PUBKEY_1, confirm=True
+    )
+    assert applied.applied is True
+    assert fake.path("interface", "wireguard", "peers")._rows == []
+
+
+def test_remove_wireguard_peer_by_comment(settings_write_enabled: Settings, device: Device):
+    fake = _wireguard_peer_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.remove_wireguard_peer(
+        client, settings_write_enabled, interface="wg1", comment="laptop", confirm=True
+    )
+    assert applied.applied is True
+    assert fake.path("interface", "wireguard", "peers")._rows == []
+
+
+def test_remove_wireguard_peer_unknown_public_key_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_wireguard_peer(
+            client, settings_write_enabled, interface="wg1", public_key=_REMOTE_PEER_PUBKEY_1, confirm=True
+        )
+    assert _REMOTE_PEER_PUBKEY_1 in str(exc_info.value)
+
+
+def test_remove_wireguard_peer_scoped_to_interface(settings_write_enabled: Settings, device: Device):
+    """A peer with a matching public-key on a DIFFERENT interface must not
+    match - `interface` scopes the resolution."""
+    fake = _wireguard_peer_fixture(interface="wg-other")
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_wireguard_peer(
+            client, settings_write_enabled, interface="wg1", public_key=_REMOTE_PEER_PUBKEY_1, confirm=True
+        )
+
+
+def test_remove_wireguard_peer_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {".id": "*1", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_1, "comment": "dup"},
+                {".id": "*2", "interface": "wg1", "public-key": _REMOTE_PEER_PUBKEY_2, "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.remove_wireguard_peer(client, settings_write_enabled, interface="wg1", comment="dup", confirm=True)
+    assert "dup" in str(exc_info.value)
+    assert len(fake.path("interface", "wireguard", "peers")._rows) == 2
+
+
+def test_remove_wireguard_peer_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _wireguard_peer_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_wireguard_peer"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_wireguard_peer", patched_op)
+
+    guard.remove_wireguard_peer(
+        client, settings_write_enabled, interface="wg1", public_key=_REMOTE_PEER_PUBKEY_1, confirm=True
+    )
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}

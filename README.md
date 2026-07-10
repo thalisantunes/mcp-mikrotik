@@ -132,7 +132,8 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `scheduler` | List scheduled tasks (name, on-event, interval, next-run, disabled). |
 | `ip_pools` | List IP pools (name, ranges). |
 | `wireless_registrations` | List wireless clients currently associated to the device. Tries the ROS7 wifi registration table first, falls back to the ROS6 wireless one; returns an empty list (not an error) for a device with no radio. |
-| `wireguard_peers` | List WireGuard VPN peers (name, interface, public-key, endpoint, last-handshake, rx/tx, allowed-address, disabled). Never exposes a private-key, even defensively. Empty list (not an error) with no WireGuard interfaces. See "VPN & routing diagnostics" below. |
+| `wireguard_peers` | List WireGuard VPN peers (name, interface, public-key, endpoint, last-handshake, rx/tx, allowed-address, disabled). Never exposes a private-key or preshared-key, even defensively. Empty list (not an error) with no WireGuard interfaces. See "VPN & routing diagnostics" below. |
+| `wireguard_interfaces` | List WireGuard tunnel interfaces (name, listen-port, public-key, running, disabled, mtu). **Never exposes a private-key** - RouterOS's own reply genuinely carries one here (unlike `wireguard_peers`), always stripped before returning. Empty list (not an error) with no WireGuard interfaces. See "WireGuard management" below. |
 | `ppp_active` | List active PPP-based VPN server sessions (`/ppp/active`: name, service - l2tp/pptp/sstp/ovpn/pppoe, caller-id, address, uptime). Empty list (not an error) with no PPP server / no active sessions. |
 | `ipsec_active_peers` | List active IPsec peers (remote-address, state, uptime, rx/tx, side). Empty list (not an error) for a device that doesn't use IPsec. |
 | `bgp_sessions` | BGP session status (remote-address/as, state, uptime, prefix-count). Tries ROS7's `/routing/bgp/session` first, falls back to ROS6's `/routing/bgp/peer`; empty list (not an error) for a device that doesn't run BGP. |
@@ -191,6 +192,9 @@ model" below for the full guard mechanism.
 | `wake_on_lan` | Send a Wake-on-LAN magic packet (`/tool/wol`) for `mac_address`, out `interface`. Benign and targets no existing device row, but still guarded/confirm-gated. See "Wake-on-LAN" below. |
 | `enable_firewall_rule` | Enable an **EXISTING** firewall filter rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** See "Firewall rule toggle (by comment)" below. |
 | `disable_firewall_rule` | Disable an **EXISTING** firewall filter rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_firewall_rule`. |
+| `add_wireguard_interface` | Create a WireGuard tunnel interface (`name`, optional `listen_port`). RouterOS generates the private key internally - **never accepted or returned by this tool**. Refuses a duplicate `name`. See "WireGuard management" below. |
+| `add_wireguard_peer` | Add a WireGuard peer to an existing `interface` (remote `public_key`, `allowed_address`, optional `endpoint_address`/`endpoint_port`/`persistent_keepalive`/`comment`). **Never accepts a private-key or preshared-key.** Errors if `interface` doesn't exist; refuses a duplicate `public_key` on the same interface. |
+| `remove_wireguard_peer` | Remove a WireGuard peer from an `interface`, resolved by `public_key` or `comment`. Errors if more than one peer still matches after narrowing (`AmbiguousResourceError`) - never guesses which one to remove. |
 
 Not yet exposed, deliberately: device reboot, and creating/generally
 modifying a firewall filter rule (only the narrow `disabled` TOGGLE of an
@@ -664,6 +668,96 @@ unfiltered log via `logs`.
 Both tools are **read-only** - neither is gated by `MIKROTIK_ALLOW_WRITE`,
 and neither changes anything on the device.
 
+### WireGuard management (v0.13)
+
+The most security-sensitive round in this package's history: WireGuard uses
+**private keys**. The absolute rule this round is built around: **no tool,
+error message, preview, or audit journal entry may ever contain one.**
+Private keys stay on the router - period.
+
+Four tools, all covering `/interface/wireguard` and
+`/interface/wireguard/peers`:
+
+- **`wireguard_interfaces`** (read) - lists tunnel interfaces (name,
+  listen-port, public-key, running, disabled, mtu). RouterOS's own reply for
+  this menu genuinely carries a `private-key` field - always stripped
+  before returning. `wireguard_peers` (v0.8) is unchanged in shape but now
+  also strips a peer's `preshared-key` (a real, optional field on that menu)
+  the same way.
+- **`add_wireguard_interface`** (write, guarded) - creates a tunnel
+  interface (`name`, optional `listen_port`). RouterOS generates the
+  private key internally when the interface is created - there is no
+  `private_key` parameter on this tool at all, so there is no code path
+  through which a caller could ever supply (or receive back) one. The
+  `confirm=false` preview's `after` only describes what will be created
+  (`name`/`listen-port`) - it never invents a `public-key`, since RouterOS
+  hasn't generated the key pair yet at preview time. Only the `confirm=true`
+  applied result re-reads the newly created interface and reports its real
+  `public-key` (safe to share - it's what a remote peer needs to connect to
+  you), with `private-key` always stripped. Refuses to create a second
+  interface sharing `name`.
+- **`add_wireguard_peer`** (write, guarded) - registers a remote peer on an
+  existing `interface`: its `public_key` (validated as a 44-character
+  base64 WireGuard key), `allowed_address` (a comma-separated list of CIDR
+  ranges, e.g. `"10.0.0.2/32,10.0.0.3/32"`), and optional
+  `endpoint_address`/`endpoint_port`/`persistent_keepalive`/`comment`. Has
+  no `private_key` or `preshared_key` parameter either - the remote peer's
+  own private key (and any preshared key) are entirely out of this tool's
+  scope. `interface` must already exist (create it first with
+  `add_wireguard_interface`); refuses to add a duplicate peer (same
+  `public_key` already registered on the same `interface`).
+- **`remove_wireguard_peer`** (write, guarded) - removes a peer from an
+  `interface`, resolved by `public_key` or `comment`. Errors if more than
+  one peer still matches after narrowing (`AmbiguousResourceError`) - never
+  guesses which one to remove.
+
+**Typical flow** to stand up a site-to-site or road-warrior tunnel:
+
+1. `add_wireguard_interface` (`confirm=false` to preview, then
+   `confirm=true`) to create the tunnel interface on this device.
+   `wireguard_interfaces` to read back its real `public-key` - give that to
+   the remote peer, out of band, so it can configure its own side.
+2. `add_wireguard_peer` (`confirm=false` then `confirm=true`) to register
+   the remote side's `public_key` and the traffic (`allowed_address`) routed
+   through it.
+3. `wireguard_peers` to check `last-handshake`/rx/tx counters once the
+   remote side connects, confirming the tunnel is actually passing traffic.
+4. `remove_wireguard_peer` to revoke a peer later (e.g. a decommissioned
+   site or a compromised key).
+
+**How the private-key/preshared-key redaction is enforced (belt-and-suspenders,
+two independent layers):**
+
+1. **`formatting.strip_sensitive_fields`** (with
+   `formatting.WIREGUARD_SENSITIVE_FIELDS = {"private-key", "preshared-key"}`)
+   is applied to every row these tools ever return - both read tools
+   (`wireguard_interfaces`/`wireguard_peers`, in `server.py`) and every
+   write tool's before/after preview (in `guard.py`'s
+   `_redact_wireguard_row`, applied **before** a `WritePreview` is ever
+   constructed - see next point for why that ordering matters).
+2. **The audit journal never gets a chance to see one either.** The
+   write-guard's `_audited` decorator (v0.5) journals exactly whatever a
+   `guard.py` function returns - so if redaction happened only in
+   `server.py` (one layer up, after `guard.py` returns), a private-key
+   would already be sitting in the audit journal (a file on disk, or a log
+   line) by the time `server.py` got a chance to strip it. Every WireGuard
+   write function in `guard.py` therefore redacts its own `before`/`after`
+   before constructing the `WritePreview` the decorator will log.
+   `audit._SENSITIVE_KEY` (extended this round to also match `private`, on
+   top of the existing `pre.?shared` term that already covers
+   `preshared-key`) is a **second, independent** line of defense on top of
+   that, not a substitute for it.
+
+See `tests/test_guard.py`'s WireGuard section, `tests/test_guard_audit.py`'s
+`test_add_wireguard_interface_confirmed_call_never_leaks_private_key_into_journal`,
+and `tests/test_server.py`'s
+`test_add_wireguard_interface_never_leaks_private_key_anywhere` for the tests
+proving all of this: a fake device (`tests/fakes.py`) simulates RouterOS
+generating a real key pair - including a distinctively-marked private-key -
+on interface creation, and every test asserts that marker never reaches the
+tool's return value, the audit journal (`before` **and** `after`), or any
+other log line.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -742,28 +836,35 @@ On top of the write guard:
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
   `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`/
   `set_route_distance`/`enable_route`/`disable_route`/`remove_netwatch`/
-  `enable_firewall_rule`/`disable_firewall_rule`)
+  `enable_firewall_rule`/`disable_firewall_rule`/`add_wireguard_peer`/
+  `remove_wireguard_peer`)
   look it up first - by name, by the v0.9 route tools' stable `dst-address`
   (+`gateway`/`comment`) identifier described in "Failover control" above,
-  or, for the v0.11 firewall rule tools, by `comment` (+`chain`) described
-  in "Firewall rule toggle (by comment)" above. If nothing matches, the tool
-  raises a clear error instead of creating one - a typo can never silently
-  provision something new. `set_poe_out` additionally requires the matched
-  interface to actually have a `poe-out` field (i.e. be PoE-capable
-  hardware) - a name that exists but isn't a PoE port raises the same clear
-  error rather than doing nothing silently. The v0.9 route tools and the
-  v0.11 firewall rule tools additionally never resolve by a RouterOS `.id`
-  or a list index (both can shift as rows are added/removed elsewhere on
-  the device); if an identifier still matches more than one row after
-  narrowing, `AmbiguousResourceError` is raised instead of guessing which
-  one to touch.
+  by the v0.11 firewall rule tools' `comment` (+`chain`) described in
+  "Firewall rule toggle (by comment)" above, or, for the v0.13 WireGuard peer
+  tools, by `public-key`/`comment` scoped to a given `interface` (described
+  in "WireGuard management" above). If nothing matches, the tool raises a
+  clear error instead of creating one - a typo can never silently provision
+  something new. `set_poe_out` additionally requires the matched interface
+  to actually have a `poe-out` field (i.e. be PoE-capable hardware) - a name
+  that exists but isn't a PoE port raises the same clear error rather than
+  doing nothing silently. `add_wireguard_peer` additionally requires its
+  `interface` to already exist as a WireGuard tunnel - it never creates one
+  (use `add_wireguard_interface` first). The v0.9 route tools, the v0.11
+  firewall rule tools, and the v0.13 `remove_wireguard_peer` additionally
+  never resolve by a RouterOS `.id` or a list index (both can shift as rows
+  are added/removed elsewhere on the device); if an identifier still matches
+  more than one row after narrowing, `AmbiguousResourceError` is raised
+  instead of guessing which one to touch.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
   existing lease on the given `mac_address` first, `add_to_address_list`
   checks for an existing entry with the same `list_name`+`address` pair
-  first, and `add_netwatch` checks for an existing monitor on the given
-  `host` first - each raising `ResourceAlreadyExistsError` instead of
-  creating a second one - both for `confirm=false` previews and
-  `confirm=true` applies.
+  first, `add_netwatch` checks for an existing monitor on the given `host`
+  first, `add_wireguard_interface` checks for an existing interface with
+  the given `name` first, and `add_wireguard_peer` checks for an existing
+  peer with the same `public_key` on the same `interface` first - each
+  raising `ResourceAlreadyExistsError` instead of creating a second one -
+  both for `confirm=false` previews and `confirm=true` applies.
 - **Structured API, not shell commands.** All device communication goes
   through [`librouteros`](https://github.com/luqasz/librouteros)'s
   structured API (`path().select()/.add()/.update()/.remove()`, and the
@@ -786,7 +887,15 @@ On top of the write guard:
   template referencing only non-secret fields, even though several of the
   menus it reads (`/ip/service`, `/snmp/community`, wireless/wifi security
   profiles, `/user`) can carry a password/passphrase/community-string field
-  - see "Security audit" above.
+  - see "Security audit" above. Since v0.13, `wireguard_interfaces` and
+  every WireGuard write tool (`add_wireguard_interface`/`add_wireguard_peer`/
+  `remove_wireguard_peer`) apply the same redaction to a genuinely
+  secret-bearing menu - a tunnel interface's `private-key` and a peer's
+  `preshared-key` - **before** a write's before/after preview is ever
+  constructed, so `guard.py`'s own audit journal (which logs exactly what a
+  write function returns) can never carry one either; see "WireGuard
+  management" above for the full two-layer redaction (`guard.py` first,
+  `audit._SENSITIVE_KEY` as a second, independent line of defense).
 - **Structured errors.** All errors raised inside the package derive from
   `MikrotikMCPError` (see `src/mcp_mikrotik/exceptions.py`) and are caught at
   the tool boundary in `server.py`. The exception is deliberately re-raised,
