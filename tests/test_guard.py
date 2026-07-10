@@ -460,3 +460,218 @@ def test_remove_simple_queue_unknown_target_raises_resource_not_found(
     assert "10.0.0.99" in str(exc_info.value)
     # Nothing was removed.
     assert len(fake_connection.path("queue", "simple")._rows) == 1
+
+
+def test_remove_simple_queue_rejects_invalid_target_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """An invalid `target` must be rejected before client.path() is ever
+    called - RaisingConnection asserts if path()/call() is invoked at all."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_simple_queue(guarded_client, settings_write_enabled, target="not-an-ip", confirm=True)
+
+
+# --- add_to_address_list / remove_from_address_list (v0.4) ------------------
+
+
+def test_add_to_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.add_to_address_list(
+            client, settings, list_name="blocked-clients", address="10.0.0.61", confirm=True
+        )
+
+
+def test_add_to_address_list_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_to_address_list(
+            guarded_client, settings, list_name="blocked-clients", address="10.0.0.61", confirm=True
+        )
+
+
+def test_add_to_address_list_preview_does_not_create(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_to_address_list(
+        client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.61", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after["list"] == "blocked-clients"
+    assert preview.after["address"] == "10.0.0.61"
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1  # only the fixture's entry
+
+
+def test_add_to_address_list_confirm_true_creates(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.add_to_address_list(
+        client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.61", confirm=True
+    )
+    assert applied.applied is True
+    rows = fake_connection.path("ip", "firewall", "address-list")._rows
+    assert any(row["list"] == "blocked-clients" and row["address"] == "10.0.0.61" for row in rows)
+
+
+def test_add_to_address_list_optional_comment_and_timeout(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.add_to_address_list(
+        client,
+        settings_write_enabled,
+        list_name="blocked-clients",
+        address="10.0.0.62",
+        comment="repeat offender",
+        timeout="1d",
+        confirm=True,
+    )
+    assert applied.applied is True
+    rows = fake_connection.path("ip", "firewall", "address-list")._rows
+    created = next(row for row in rows if row["address"] == "10.0.0.62")
+    assert created["comment"] == "repeat offender"
+    assert created["timeout"] == "1d"
+
+
+def test_add_to_address_list_rejects_duplicate_list_and_address(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """The fixture already has list=blocked-clients address=10.0.0.60 - adding it again must be refused."""
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_to_address_list(
+            client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=True
+        )
+    assert "blocked-clients" in str(exc_info.value)
+    assert "10.0.0.60" in str(exc_info.value)
+    rows = fake_connection.path("ip", "firewall", "address-list")._rows
+    assert len(rows) == 1  # no duplicate created
+
+
+def test_add_to_address_list_allows_same_address_in_a_different_list(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """Same `address` already exists in "blocked-clients" - adding it to a
+    different list is a distinct entry, not a duplicate."""
+    applied = guard.add_to_address_list(
+        client, settings_write_enabled, list_name="allowed-clients", address="10.0.0.60", confirm=True
+    )
+    assert applied.applied is True
+    rows = fake_connection.path("ip", "firewall", "address-list")._rows
+    assert len(rows) == 2
+
+
+def test_add_to_address_list_rejects_invalid_list_name(client: MikrotikClient, settings_write_enabled: Settings):
+    with pytest.raises(ValidationError):
+        guard.add_to_address_list(
+            client, settings_write_enabled, list_name="bad list", address="10.0.0.61", confirm=True
+        )
+
+
+def test_add_to_address_list_rejects_invalid_address(client: MikrotikClient, settings_write_enabled: Settings):
+    with pytest.raises(ValidationError):
+        guard.add_to_address_list(
+            client, settings_write_enabled, list_name="blocked-clients", address="not-an-ip", confirm=True
+        )
+
+
+def test_add_to_address_list_rejects_invalid_comment(client: MikrotikClient, settings_write_enabled: Settings):
+    with pytest.raises(ValidationError):
+        guard.add_to_address_list(
+            client,
+            settings_write_enabled,
+            list_name="blocked-clients",
+            address="10.0.0.61",
+            comment="bad\ncomment",
+            confirm=True,
+        )
+
+
+def test_add_to_address_list_rejects_invalid_timeout(client: MikrotikClient, settings_write_enabled: Settings):
+    with pytest.raises(ValidationError):
+        guard.add_to_address_list(
+            client,
+            settings_write_enabled,
+            list_name="blocked-clients",
+            address="10.0.0.61",
+            timeout="not-a-timeout",
+            confirm=True,
+        )
+
+
+def test_add_to_address_list_rejects_invalid_input_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_to_address_list(
+            guarded_client, settings_write_enabled, list_name="blocked-clients", address="not-an-ip", confirm=True
+        )
+
+
+def test_remove_from_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.remove_from_address_list(
+            client, settings, list_name="blocked-clients", address="10.0.0.60", confirm=True
+        )
+
+
+def test_remove_from_address_list_read_only_gate_applies_before_touching_device(
+    device: Device, settings: Settings
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_from_address_list(
+            guarded_client, settings, list_name="blocked-clients", address="10.0.0.60", confirm=True
+        )
+
+
+def test_remove_from_address_list_preview_then_confirm(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.remove_from_address_list(
+        client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before["address"] == "10.0.0.60"
+    # Preview must not have removed anything.
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+    applied = guard.remove_from_address_list(
+        client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=True
+    )
+    assert applied.applied is True
+    assert fake_connection.path("ip", "firewall", "address-list")._rows == []
+
+
+def test_remove_from_address_list_unknown_entry_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_from_address_list(
+            client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.99", confirm=True
+        )
+    assert "10.0.0.99" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+
+def test_remove_from_address_list_wrong_list_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """The fixture's 10.0.0.60 entry is in "blocked-clients", not "other-list"."""
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_from_address_list(
+            client, settings_write_enabled, list_name="other-list", address="10.0.0.60", confirm=True
+        )
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+
+def test_remove_from_address_list_rejects_invalid_input_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_from_address_list(
+            guarded_client, settings_write_enabled, list_name="blocked-clients", address="not-an-ip", confirm=True
+        )

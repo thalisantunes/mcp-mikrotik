@@ -13,15 +13,16 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.3: read tools covering the core device inventory plus DHCP leases, DNS
-cache, firewall filter rules, wireless client registrations, system health
-and Simple Queue entries, and a set of guarded write tools (`set_identity`,
-`enable_interface`/`disable_interface`, `set_wifi_ssid`, plus v0.3's
-`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue` for
-identifying and limiting a client that's consuming too much bandwidth) that
-all go through the same write-guard mechanism. See `CHANGELOG.md` for what
-changed since v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the
-next write tool.
+v0.4: read tools covering the core device inventory plus DHCP leases, DNS
+cache, firewall filter/NAT rules, address-lists, scheduler, IP pools,
+wireless client registrations, system health and Simple Queue entries; a
+`traceroute` diagnostic tool; and a set of guarded write tools
+(`set_identity`, `enable_interface`/`disable_interface`, `set_wifi_ssid`,
+`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`, plus
+v0.4's `add_to_address_list`/`remove_from_address_list` for limiting or
+blocking who uses the network) that all go through the same write-guard
+mechanism. See `CHANGELOG.md` for what changed since v0.1.0, and
+`src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
 ## Installation
 
@@ -93,12 +94,17 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `neighbors` | List neighbors discovered via CDP/MNDP/LLDP. |
 | `dhcp_leases` | List DHCP server leases (address, mac, host-name, status, server, comment). |
 | `simple_queues` | List Simple Queue entries (name, target, max-limit, limit-at, bytes counters, disabled) - see who already has a bandwidth limit and how much traffic they've moved. |
+| `address_lists` | List firewall address-list entries (list, address, timeout, dynamic, disabled) - see who's currently in which named list. |
+| `firewall_nat` | List IPv4 firewall NAT rules (chain, action, to-addresses, etc). Read-only - does not add/modify/remove rules. |
+| `scheduler` | List scheduled tasks (name, on-event, interval, next-run, disabled). |
+| `ip_pools` | List IP pools (name, ranges). |
 | `wireless_registrations` | List wireless clients currently associated to the device. Tries the ROS7 wifi registration table first, falls back to the ROS6 wireless one; returns an empty list (not an error) for a device with no radio. |
 | `dns_cache` | List cached DNS records (name, type, data, ttl). |
 | `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
 | `system_health` | System health metrics (voltage, temperature, ...), if the device exposes any; empty list otherwise. |
 | `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
 | `ping` | Ping an address from the device; `address` is validated as IPv4/IPv6/hostname before use. |
+| `traceroute` | Traceroute to an address from the device; returns the list of hops. `address` validated like `ping`'s; `count`/`max_hops` are capped low (and a fixed short per-hop timeout used internally) so the command can't run long enough to hit RouterOS's own API command timeout. Diagnostic only - not gated by `MIKROTIK_ALLOW_WRITE`. |
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 
 ### Write (guarded)
@@ -117,6 +123,8 @@ model" below for the full guard mechanism.
 | `set_client_bandwidth` | Limit a client's bandwidth via a Simple Queue targeting an IP/subnet (`target`). Updates the existing queue's `max-limit`/`limit-at` if one already targets it, otherwise creates one with a name derived from `target`. **FastTrack gotcha**: if the device has a FastTrack firewall rule, fasttracked traffic bypasses queues entirely - this may have no visible effect until FastTrack is adjusted. See "Limiting a client's bandwidth" below. |
 | `add_static_dhcp_lease` | Create a static DHCP lease pinning an IP `address` to a `mac_address` (useful to give a client a stable target before limiting it). Refuses to create a second lease for a MAC that already has one. |
 | `remove_simple_queue` | Remove a Simple Queue by `target` or `name` - undoes a bandwidth limit. |
+| `add_to_address_list` | Add an IP/subnet `address` to a named firewall `list_name`. **Only manages the list** - see "Blocking/allowing a client via address lists" below for why this alone doesn't block/allow anything. Refuses to create a duplicate `list_name`+`address` pair. |
+| `remove_from_address_list` | Remove the `list_name`+`address` entry from a firewall address-list. Same "list only" caveat as `add_to_address_list`. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
@@ -143,6 +151,36 @@ on a client whose traffic is already being fasttracked. If a limit doesn't
 seem to be taking effect, check `firewall_filter` for a FastTrack rule and
 adjust/disable it for the traffic you're trying to limit. `mcp-mikrotik`
 does not modify firewall rules itself (see "Roadmap / non-goals" below).
+
+### Blocking/allowing a client via address lists (v0.4)
+
+`add_to_address_list`/`remove_from_address_list` manage entries in a named
+`/ip/firewall/address-list` - nothing more. **Adding an address to a list has
+no effect on traffic by itself.** It only blocks or allows anything if a
+`/ip/firewall/filter` (or NAT) rule on the device already references that
+same list name, e.g.:
+
+```
+/ip firewall filter add chain=forward src-address-list=blocked-clients action=drop
+```
+
+`mcp-mikrotik` does not create, modify, or inspect that rule for you (see
+"Roadmap / non-goals" below for why firewall filter writes aren't exposed at
+all yet) - use `firewall_filter` to check whether a rule referencing your
+list already exists on the device before relying on `add_to_address_list` to
+actually block or allow anyone. The typical flow:
+
+1. Confirm (once, out of band - e.g. via WinBox/CLI, or just by reading
+   `firewall_filter`) that a filter rule referencing your list name exists,
+   e.g. `src-address-list=blocked-clients action=drop` on the `forward`
+   chain.
+2. `dhcp_leases` / `wireless_registrations` / `neighbors` to identify the
+   client's IP.
+3. `add_to_address_list` with `confirm=false` first to preview the entry it
+   would add, then `confirm=true` to apply it. An optional `timeout` (e.g.
+   `"1d"`) auto-expires the entry instead of blocking/allowing permanently.
+4. `address_lists` to check current membership; `remove_from_address_list`
+   to lift a block/allow later.
 
 ## Security model
 
@@ -178,15 +216,17 @@ Three independent controls apply to every write tool, all centralized in
 On top of the write guard:
 
 - **Never creates the target.** Write tools that operate on a named resource
-  (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`)
-  look it up by name first. If no interface/wireless network/queue with that
-  name (or `target`) exists on the device, the tool raises a clear error
-  instead of creating one - a typo in `interface_name`/`target` can never
-  silently provision something new.
+  (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
+  `remove_from_address_list`) look it up by name first. If no interface/
+  wireless network/queue/address-list entry with that name (or `target`, or
+  `list_name`+`address` pair) exists on the device, the tool raises a clear
+  error instead of creating one - a typo can never silently provision
+  something new.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
-  existing lease on the given `mac_address` first and raises
-  `ResourceAlreadyExistsError` instead of creating a second one - both for
-  `confirm=false` previews and `confirm=true` applies.
+  existing lease on the given `mac_address` first, and `add_to_address_list`
+  checks for an existing entry with the same `list_name`+`address` pair
+  first, each raising `ResourceAlreadyExistsError` instead of creating a
+  second one - both for `confirm=false` previews and `confirm=true` applies.
 - **Structured API, not shell commands.** All device communication goes
   through [`librouteros`](https://github.com/luqasz/librouteros)'s
   structured API (`path().select()/.add()/.update()/.remove()`, and the

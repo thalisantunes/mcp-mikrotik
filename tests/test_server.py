@@ -27,12 +27,17 @@ EXPECTED_TOOLS = {
     "neighbors",
     "dhcp_leases",
     "simple_queues",
+    "address_lists",
+    "firewall_nat",
+    "scheduler",
+    "ip_pools",
     "wireless_registrations",
     "dns_cache",
     "firewall_filter",
     "system_health",
     "logs",
     "ping",
+    "traceroute",
     "list_write_operations",
     "set_identity",
     "enable_interface",
@@ -41,6 +46,8 @@ EXPECTED_TOOLS = {
     "set_client_bandwidth",
     "add_static_dhcp_lease",
     "remove_simple_queue",
+    "add_to_address_list",
+    "remove_from_address_list",
 }
 
 
@@ -102,6 +109,37 @@ async def test_simple_queues_happy_path(settings: Settings, fake_connection: Fak
     _content, result = await mcp.call_tool("simple_queues", {"device_name": "core-switch"})
     assert result["result"][0]["target"] == "10.0.0.50/32"
     assert result["result"][0]["max-limit"] == "10M/5M"
+
+
+@pytest.mark.asyncio
+async def test_address_lists_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("address_lists", {"device_name": "core-switch"})
+    assert result["result"][0]["list"] == "blocked-clients"
+    assert result["result"][0]["address"] == "10.0.0.60"
+
+
+@pytest.mark.asyncio
+async def test_firewall_nat_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("firewall_nat", {"device_name": "core-switch"})
+    assert result["result"][0]["chain"] == "srcnat"
+    assert result["result"][0]["action"] == "masquerade"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("scheduler", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "backup-daily"
+
+
+@pytest.mark.asyncio
+async def test_ip_pools_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ip_pools", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "dhcp-pool"
+    assert result["result"][0]["ranges"] == "10.0.0.100-10.0.0.200"
 
 
 @pytest.mark.asyncio
@@ -200,6 +238,60 @@ async def test_ping_happy_path(settings: Settings, fake_connection: FakeConnecti
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("ping", {"device_name": "core-switch", "address": "8.8.8.8"})
     assert result["result"][0]["host"] == "8.8.8.8"
+
+
+# --- traceroute (v0.4, diagnostic - not gated by MIKROTIK_ALLOW_WRITE) -----
+
+
+@pytest.mark.asyncio
+async def test_traceroute_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("traceroute", {"device_name": "core-switch", "address": "8.8.8.8"})
+    assert result["result"][0]["address"] == "10.0.0.254"
+    assert result["result"][1]["address"] == "8.8.8.8"
+
+
+@pytest.mark.asyncio
+async def test_traceroute_rejects_invalid_address_before_touching_device(settings: Settings):
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("traceroute", {"device_name": "core-switch", "address": "8.8.8.8; reboot"})
+    assert "not a valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_traceroute_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    """Diagnostic, read-only tool: must work even with MIKROTIK_ALLOW_WRITE=false."""
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("traceroute", {"device_name": "core-switch", "address": "8.8.8.8"})
+    assert result["result"]
+
+
+@pytest.mark.asyncio
+async def test_traceroute_caps_count_and_max_hops_sent_to_device(settings: Settings):
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    await mcp.call_tool(
+        "traceroute",
+        {"device_name": "core-switch", "address": "8.8.8.8", "count": 999, "max_hops": 999},
+    )
+    cmd, kwargs = fake.calls[-1]
+    assert cmd == "/tool/traceroute"
+    assert kwargs["count"] == "2"  # MAX_TRACEROUTE_COUNT
+    assert kwargs["max-hops"] == "10"  # MAX_TRACEROUTE_MAX_HOPS
+    assert kwargs["timeout"] == "00:00:01"  # fixed short per-hop timeout
+
+
+@pytest.mark.asyncio
+async def test_traceroute_rejects_non_positive_count(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("traceroute", {"device_name": "core-switch", "address": "8.8.8.8", "count": 0})
+    assert "positive" in str(exc_info.value).lower()
 
 
 @pytest.mark.asyncio
@@ -530,6 +622,101 @@ async def test_remove_simple_queue_unknown_raises_clear_error(device: Device, fa
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
             "remove_simple_queue", {"device_name": "core-switch", "target": "10.0.0.99", "confirm": True}
+        )
+    assert "10.0.0.99" in str(exc_info.value)
+
+
+# --- add_to_address_list / remove_from_address_list (v0.4) ------------------
+
+
+@pytest.mark.asyncio
+async def test_add_to_address_list_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_to_address_list",
+            {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.61", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_to_address_list_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_to_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.61", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "add_to_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.61", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "address-list")._rows
+    assert any(row["list"] == "blocked-clients" and row["address"] == "10.0.0.61" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_add_to_address_list_rejects_duplicate(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_to_address_list",
+            {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.60", "confirm": True},
+        )
+    assert "already exists" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_from_address_list_blocked_read_only_by_default(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_from_address_list",
+            {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.60", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_from_address_list_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_from_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.60", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("ip", "firewall", "address-list")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "remove_from_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.60", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake_connection.path("ip", "firewall", "address-list")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_from_address_list_unknown_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_from_address_list",
+            {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.99", "confirm": True},
         )
     assert "10.0.0.99" in str(exc_info.value)
 

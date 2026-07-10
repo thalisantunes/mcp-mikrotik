@@ -57,11 +57,13 @@ class FakeConnection:
         self,
         data: dict[tuple[str, ...], list[dict[str, Any]]] | None = None,
         ping_replies: list[dict[str, Any]] | None = None,
+        traceroute_replies: list[dict[str, Any]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
     ):
         self._data: dict[tuple[str, ...], list[dict[str, Any]]] = dict(data or {})
         self._ping_replies = ping_replies if ping_replies is not None else []
+        self._traceroute_replies = traceroute_replies if traceroute_replies is not None else []
         self._on_call = on_call
         # Simulates a RouterOS menu that doesn't exist on this device/version
         # (e.g. /interface/wifi on a ROS6-only box, or /system/health on a
@@ -84,6 +86,8 @@ class FakeConnection:
             self._on_call(cmd, kwargs)
         if cmd == "/ping":
             return list(self._ping_replies)
+        if cmd == "/tool/traceroute":
+            return list(self._traceroute_replies)
         return []
 
     def close(self) -> None:

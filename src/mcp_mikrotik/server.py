@@ -2,10 +2,11 @@
 
 Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
-add_static_dhcp_lease, remove_simple_queue - see guard.py's ALLOWLIST for the
-full write-tool inventory). Transport is stdio only - this process is meant
-to run on the operator's own machine, launched by an MCP client (e.g.
-Claude Code) over stdio, with no network exposure at all.
+add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
+remove_from_address_list - see guard.py's ALLOWLIST for the full write-tool
+inventory). Transport is stdio only - this process is meant to run on the
+operator's own machine, launched by an MCP client (e.g. Claude Code) over
+stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -38,6 +39,14 @@ MAX_LOG_LIMIT = 500
 DEFAULT_PING_COUNT = 4
 MAX_PING_COUNT = 20
 MAX_ROUTE_LIMIT = 500
+# Traceroute is capped tightly (count, max_hops, and a fixed 1s per-hop
+# timeout baked into MikrotikClient.traceroute) so the worst case - every
+# hop timing out - stays well under RouterOS's own ~60s API command timeout:
+# MAX_TRACEROUTE_MAX_HOPS * MAX_TRACEROUTE_COUNT * 1s = 20s.
+DEFAULT_TRACEROUTE_COUNT = 1
+MAX_TRACEROUTE_COUNT = 2
+DEFAULT_TRACEROUTE_MAX_HOPS = 10
+MAX_TRACEROUTE_MAX_HOPS = 10
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
@@ -176,6 +185,43 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
+    def address_lists(device_name: str) -> list[dict[str, Any]]:
+        """List firewall address-list entries (/ip/firewall/address-list):
+        list, address, timeout, dynamic, disabled. See who's currently in
+        which named list (e.g. a "blocked-clients" list a firewall rule
+        drops), before adding/removing entries with add_to_address_list /
+        remove_from_address_list.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "firewall", "address-list"))
+
+    @mcp.tool()
+    @_safe
+    def firewall_nat(device_name: str) -> list[dict[str, Any]]:
+        """List IPv4 firewall NAT rules (/ip/firewall/nat): chain, action,
+        to-addresses, etc. Read-only - does not add/modify/remove rules.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "firewall", "nat"))
+
+    @mcp.tool()
+    @_safe
+    def scheduler(device_name: str) -> list[dict[str, Any]]:
+        """List scheduled tasks (/system/scheduler): name, on-event,
+        interval, next-run, disabled. Read-only.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("system", "scheduler"))
+
+    @mcp.tool()
+    @_safe
+    def ip_pools(device_name: str) -> list[dict[str, Any]]:
+        """List IP pools (/ip/pool): name, ranges. Read-only."""
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "pool"))
+
+    @mcp.tool()
+    @_safe
     def wireless_registrations(device_name: str) -> list[dict[str, Any]]:
         """List wireless clients currently associated to the device (mac, signal, interface, uptime).
 
@@ -265,6 +311,32 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         capped_count = validate_positive_limit(count, MAX_PING_COUNT, "count")
         client = _client(device_name)
         return client.ping(validated_address, count=capped_count)
+
+    @mcp.tool()
+    @_safe
+    def traceroute(
+        device_name: str,
+        address: str,
+        count: int = DEFAULT_TRACEROUTE_COUNT,
+        max_hops: int = DEFAULT_TRACEROUTE_MAX_HOPS,
+    ) -> list[dict[str, Any]]:
+        """Traceroute to an address from a device; returns the list of hops.
+
+        `address` must be a valid IPv4/IPv6 address or hostname (validated
+        exactly like `ping`'s). `count` (probes per hop) and `max_hops` are
+        both capped low (see MAX_TRACEROUTE_COUNT/MAX_TRACEROUTE_MAX_HOPS)
+        and a fixed short per-hop timeout is used internally, so the command
+        can't run long enough to hit RouterOS's own ~60s API command
+        timeout.
+
+        Diagnostic only - this never changes device state, so it is not
+        gated by MIKROTIK_ALLOW_WRITE and needs no confirm/preview.
+        """
+        validated_address = validate_ping_address(address)
+        capped_count = validate_positive_limit(count, MAX_TRACEROUTE_COUNT, "count")
+        capped_max_hops = validate_positive_limit(max_hops, MAX_TRACEROUTE_MAX_HOPS, "max_hops")
+        client = _client(device_name)
+        return client.traceroute(validated_address, count=capped_count, max_hops=capped_max_hops)
 
     @mcp.tool()
     @_safe
@@ -439,6 +511,70 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.remove_simple_queue(client, settings, target=target, name=name, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_to_address_list(
+        device_name: str,
+        list_name: str,
+        address: str,
+        comment: str | None = None,
+        timeout: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Add `address` (an IP or subnet) to a named firewall address-list
+        (/ip/firewall/address-list).
+
+        IMPORTANT: this only manages the *list* - it does NOT create or
+        modify any firewall rule. Adding an address here only blocks or
+        allows traffic if a `/ip/firewall/filter` (or NAT) rule on the
+        device already references `list_name` (e.g.
+        `src-address-list=list_name`, action=drop). See README's
+        "Blocking/allowing a client via address lists" section.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if this exact `list_name`+`address` pair
+        already exists on the device - it never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_to_address_list(
+            client,
+            settings,
+            list_name=list_name,
+            address=address,
+            comment=comment,
+            timeout=timeout,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_from_address_list(
+        device_name: str, list_name: str, address: str, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove the entry matching `list_name`+`address` from a firewall
+        address-list (/ip/firewall/address-list).
+
+        Like add_to_address_list, this only manages the *list* - see that
+        tool's docstring and README's "Blocking/allowing a client via
+        address lists" section for why this alone doesn't guarantee a
+        change in blocking/allowing behavior.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be removed; call again with
+        confirm=True to actually remove it. Errors clearly if no entry
+        matches `list_name`+`address`.
+        """
+        client = _client(device_name)
+        preview = guard.remove_from_address_list(
+            client, settings, list_name=list_name, address=address, confirm=confirm
+        )
         return asdict(preview)
 
     return mcp

@@ -3,6 +3,51 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- Read tools: `address_lists` (`/ip/firewall/address-list` - list, address,
+  timeout, dynamic, disabled), `firewall_nat` (`/ip/firewall/nat`),
+  `scheduler` (`/system/scheduler`), `ip_pools` (`/ip/pool`).
+- `traceroute`: diagnostic tool (`/tool/traceroute`), returning the list of
+  hops. `address` is validated exactly like `ping`'s; `count` and `max_hops`
+  are capped low (`MAX_TRACEROUTE_COUNT`/`MAX_TRACEROUTE_MAX_HOPS` in
+  `src/mcp_mikrotik/server.py`), and a fixed short per-hop timeout is always
+  sent to the device (`src/mcp_mikrotik/client.py`), so the command can't
+  run long enough to hit RouterOS's own ~60s API command timeout. Not a
+  write - not gated by `MIKROTIK_ALLOW_WRITE`.
+- Guarded write tool `add_to_address_list`: adds an IP/subnet to a named
+  firewall address-list. Refuses to create a duplicate `list_name`+`address`
+  pair - raises `ResourceAlreadyExistsError` instead. Optional `comment`/
+  `timeout` fields. **Only manages the list** - it does not create or modify
+  any firewall rule; see README's new "Blocking/allowing a client via
+  address lists" section for why a filter rule referencing the list is
+  still required for this to actually block/allow anything.
+- Guarded write tool `remove_from_address_list`: removes a `list_name`+
+  `address` entry from a firewall address-list. Raises `ResourceNotFoundError`
+  if no such entry exists.
+- Validation (`src/mcp_mikrotik/validation.py`): `validate_address_list_name`
+  (firewall address-list `list` name), `validate_comment` (free-text
+  `comment`, rejects control characters/newlines), `validate_timeout`
+  (RouterOS `w/d/h/m/s` duration or `HH:MM:SS` clock value).
+
+### Fixed
+
+- `remove_simple_queue` (`src/mcp_mikrotik/guard.py`): `target` is now
+  validated *before* the device is read (`client.path(...)`), matching
+  every other write tool's validate-before-touch order. Previously an
+  invalid `target` still triggered a device read before the validation
+  error was raised.
+
+### Notes
+
+- **Address-list is not a firewall rule.** `add_to_address_list`/
+  `remove_from_address_list` manage list membership only; blocking/allowing
+  traffic requires a separate `/ip/firewall/filter` (or NAT) rule that
+  references the list name (e.g. `src-address-list=list_name action=drop`).
+  See README's "Blocking/allowing a client via address lists" section.
+
 ## [0.3.0] - Unreleased
 
 ### Added

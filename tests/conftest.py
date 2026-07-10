@@ -73,10 +73,45 @@ def fake_connection() -> FakeConnection:
                     "disabled": "false",
                 }
             ],
+            ("ip", "firewall", "address-list"): [
+                {
+                    ".id": "*1",
+                    "list": "blocked-clients",
+                    "address": "10.0.0.60",
+                    "timeout": "0s",
+                    "dynamic": "false",
+                    "disabled": "false",
+                }
+            ],
+            ("ip", "firewall", "nat"): [
+                {
+                    ".id": "*1",
+                    "chain": "srcnat",
+                    "action": "masquerade",
+                    "out-interface": "ether1",
+                }
+            ],
+            ("system", "scheduler"): [
+                {
+                    ".id": "*1",
+                    "name": "backup-daily",
+                    "on-event": "backup",
+                    "interval": "1d",
+                    "next-run": "jan/01/2030 00:00:00",
+                    "disabled": "false",
+                }
+            ],
+            ("ip", "pool"): [
+                {".id": "*1", "name": "dhcp-pool", "ranges": "10.0.0.100-10.0.0.200"}
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
             {"seq": "1", "host": "8.8.8.8", "time": "4ms"},
+        ],
+        traceroute_replies=[
+            {"address": "10.0.0.254", "hop": "1", "status": "", "loss": "0%", "time": "1ms"},
+            {"address": "8.8.8.8", "hop": "2", "status": "", "loss": "0%", "time": "5ms"},
         ],
     )
 

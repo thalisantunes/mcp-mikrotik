@@ -165,6 +165,95 @@ def validate_mac_address(mac: str) -> str:
     return mac.upper()
 
 
+# --- v0.4: address-list access control ---------------------------------
+
+# Firewall address-list `list` name: letters/digits plus '.', '_', '-'
+# (RouterOS itself is more permissive - e.g. it allows spaces - but this
+# package restricts to a conservative, unambiguous charset rather than
+# trying to enumerate everything RouterOS happens to accept).
+_LIST_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+# Control characters (including newline/tab/CR) are rejected from free-text
+# `comment` fields so a comment can't be used to smuggle multi-line content
+# into router state. Like every other validator here, this is not an
+# injection defense (see module docstring) - device communication is always
+# structured - it just keeps comments to plain, single-line text.
+_COMMENT_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_COMMENT_LENGTH = 255
+
+# RouterOS address-list/queue `timeout` value: either a duration made of
+# w/d/h/m/s components in that order (e.g. "1d", "2h30m", "1w2d3h4m5s"), or a
+# plain "HH:MM:SS"-style clock value (e.g. "01:30:00", "0:05"). This is a
+# best-effort format check, not an exhaustive RouterOS grammar - see
+# https://help.mikrotik.com/docs/spaces/ROS/pages/328088/Queues for the
+# canonical reference.
+_TIMEOUT_DURATION = re.compile(r"^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+_TIMEOUT_CLOCK = re.compile(r"^\d{1,3}(:[0-5]?\d){1,2}$")
+_MAX_TIMEOUT_LENGTH = 32
+
+
+def validate_address_list_name(name: str) -> str:
+    """Validate a firewall address-list `list` name (the named list an entry
+    belongs to, e.g. "blocked-clients"). Used by add_to_address_list and
+    remove_from_address_list.
+
+    Returns the (stripped) name on success, raises ValidationError otherwise.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError("Address-list name must be a non-empty string.")
+
+    name = name.strip()
+    if not _LIST_NAME.match(name):
+        raise ValidationError(
+            f"Address-list name {name!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return name
+
+
+def validate_comment(comment: str, field_name: str = "comment") -> str:
+    """Validate a free-text `comment` field: a plain string, no control
+    characters (including newlines), within a sane length cap.
+
+    Returns `comment` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(comment, str):
+        raise ValidationError(f"{field_name} must be a string.")
+    if len(comment) > _MAX_COMMENT_LENGTH:
+        raise ValidationError(f"{field_name} is too long (max {_MAX_COMMENT_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(comment):
+        raise ValidationError(f"{field_name} contains control characters, which are not allowed.")
+    return comment
+
+
+def validate_timeout(value: str, field_name: str = "timeout") -> str:
+    """Validate a RouterOS `timeout` value (address-list entry expiry), as
+    either a w/d/h/m/s duration (e.g. "1d", "2h30m") or an "HH:MM:SS"-style
+    clock value (e.g. "01:30:00"). See _TIMEOUT_DURATION/_TIMEOUT_CLOCK above
+    for the exact (best-effort) grammar accepted.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_TIMEOUT_LENGTH:
+        raise ValidationError(f"{field_name} is too long.")
+
+    if _TIMEOUT_CLOCK.match(value):
+        return value
+
+    match = _TIMEOUT_DURATION.match(value)
+    if match and any(match.groups()):
+        return value
+
+    raise ValidationError(
+        f"{field_name} value {value!r} is not a valid RouterOS timeout "
+        '(expected a duration like "1d"/"2h30m", or "HH:MM:SS").'
+    )
+
+
 def validate_rate_pair(value: str, field_name: str) -> str:
     """Validate a RouterOS rate-pair string, as used by Simple Queue's
     `max-limit` and `limit-at` fields. RouterOS's own format is

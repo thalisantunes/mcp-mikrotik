@@ -42,7 +42,15 @@ from .exceptions import (
     ValidationError,
     WriteDisabledError,
 )
-from .validation import validate_ip_address, validate_mac_address, validate_rate_pair, validate_target
+from .validation import (
+    validate_address_list_name,
+    validate_comment,
+    validate_ip_address,
+    validate_mac_address,
+    validate_rate_pair,
+    validate_target,
+    validate_timeout,
+)
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,18 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("queue", "simple"),
         action="remove",
         description="Remove a Simple Queue by target or name (undoes a bandwidth limit).",
+    ),
+    "add_to_address_list": WriteOperation(
+        name="add_to_address_list",
+        path=("ip", "firewall", "address-list"),
+        action="add",
+        description="Add an IP/subnet to a named firewall address-list entry.",
+    ),
+    "remove_from_address_list": WriteOperation(
+        name="remove_from_address_list",
+        path=("ip", "firewall", "address-list"),
+        action="remove",
+        description="Remove an IP/subnet entry from a named firewall address-list.",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -463,14 +483,125 @@ def remove_simple_queue(
     if not target and not name:
         raise ValidationError("remove_simple_queue requires 'target' or 'name'.")
 
+    # Validate `target` (if given) BEFORE touching the device at all, same
+    # as every other write tool's validation - previously this ran after
+    # client.path(*op.path), so an invalid target still triggered a device
+    # read before failing.
+    validated_target = validate_target(target) if target else None
+
     rows = client.path(*op.path)
     row = _find_row_by_field(rows, "name", name) if name else None
-    if row is None and target:
-        validated_target = validate_target(target)
+    if row is None and validated_target:
         row = _find_row_by_field(rows, "target", validated_target)
 
     if row is None:
         raise ResourceNotFoundError(client.device.name, "Simple queue", name or target or "")
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.4: address-list based access control --------------------------------
+
+
+def _find_address_list_row(rows: list[dict[str, Any]], list_name: str, address: str) -> dict[str, Any] | None:
+    """First row whose `list`+`address` both match, or None. An address-list
+    entry is identified by that pair, not by name/target alone - the same
+    `address` can legitimately appear in more than one list."""
+    for row in rows:
+        if row.get("list") == list_name and row.get("address") == address:
+            return row
+    return None
+
+
+def add_to_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    list_name: str,
+    address: str,
+    confirm: bool,
+    comment: str | None = None,
+    timeout: str | None = None,
+) -> WritePreview:
+    """Add `address` (an IP or subnet) to a named firewall address-list
+    (/ip/firewall/address-list). This only manages the *list* - it does NOT
+    create or modify any firewall rule. Blocking or allowing traffic based on
+    this list requires a separate `/ip/firewall/filter` (or NAT) rule that
+    references `list_name` (e.g. `src-address-list=blocked-clients`,
+    action=drop); that rule is not created here and must already exist on
+    the device - see README's "Blocking/allowing a client via address lists"
+    section.
+
+    Refuses to add a duplicate (same `list_name`+`address` pair already
+    present) - raises ResourceAlreadyExistsError instead of creating a
+    second entry. This tool only ever adds; it never updates or removes an
+    existing entry.
+    """
+    op = _require_allowed(settings, "add_to_address_list")
+
+    validated_list = validate_address_list_name(list_name)
+    validated_address = validate_target(address)
+    validated_comment = validate_comment(comment) if comment is not None else None
+    validated_timeout = validate_timeout(timeout) if timeout is not None else None
+
+    rows = client.path(*op.path)
+    existing = _find_address_list_row(rows, validated_list, validated_address)
+    if existing is not None:
+        raise ResourceAlreadyExistsError(
+            client.device.name, "Address-list entry", f"{validated_list}:{validated_address}"
+        )
+
+    payload: dict[str, Any] = {"list": validated_list, "address": validated_address}
+    if validated_comment:
+        payload["comment"] = validated_comment
+    if validated_timeout:
+        payload["timeout"] = validated_timeout
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def remove_from_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    list_name: str,
+    address: str,
+    confirm: bool,
+) -> WritePreview:
+    """Remove the entry matching `list_name`+`address` from a firewall
+    address-list (/ip/firewall/address-list). Raises ResourceNotFoundError if
+    no such entry exists - never removes more than the one matching row.
+
+    Like add_to_address_list, this only manages the *list* - removing an
+    entry stops that specific list membership, but has no effect on
+    traffic unless a firewall rule referencing `list_name` also changes or
+    is removed separately.
+    """
+    op = _require_allowed(settings, "remove_from_address_list")
+
+    validated_list = validate_address_list_name(list_name)
+    validated_address = validate_target(address)
+
+    rows = client.path(*op.path)
+    row = _find_address_list_row(rows, validated_list, validated_address)
+    if row is None:
+        raise ResourceNotFoundError(
+            client.device.name, "Address-list entry", f"{validated_list}:{validated_address}"
+        )
 
     before = dict(row)
     after: dict[str, Any] = {}

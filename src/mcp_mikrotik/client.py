@@ -137,6 +137,29 @@ class MikrotikClient:
         except (LibRouterosError, OSError) as exc:
             raise DeviceCommandError(self.device.name, "ping", str(exc)) from exc
 
+    def traceroute(self, address: str, count: int = 1, max_hops: int = 10) -> list[dict[str, Any]]:
+        """Run /tool/traceroute from the device. `address` is expected to already
+        be validated (see validation.validate_ping_address), and `count`/`max_hops`
+        already capped by the caller (see server.py's `traceroute` tool) - this
+        method just forwards them as structured parameters, never as part of a
+        command string.
+
+        A fixed short per-hop `timeout` ("00:00:01") is always sent too, so the
+        worst case (max_hops * count unanswered probes) stays comfortably under
+        RouterOS's own ~60s API command timeout regardless of what the caller
+        passed for count/max_hops.
+        """
+        try:
+            replies = self._conn()(
+                "/tool/traceroute",
+                address=address,
+                count=str(count),
+                **{"max-hops": str(max_hops), "timeout": "00:00:01"},
+            )
+            return [dict(reply) for reply in replies]
+        except (LibRouterosError, OSError) as exc:
+            raise DeviceCommandError(self.device.name, "traceroute", str(exc)) from exc
+
     # --- Write primitives -------------------------------------------------
     # These are intentionally NOT exposed as MCP tools directly. The only
     # caller allowed to invoke them is guard.py, which maps each write

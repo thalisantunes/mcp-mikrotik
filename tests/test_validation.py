@@ -4,11 +4,14 @@ import pytest
 
 from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
+    validate_address_list_name,
+    validate_comment,
     validate_ip_address,
     validate_mac_address,
     validate_ping_address,
     validate_rate_pair,
     validate_target,
+    validate_timeout,
 )
 
 
@@ -175,3 +178,78 @@ def test_validate_rate_pair_rejects_non_string():
 def test_validate_rate_pair_error_message_includes_field_name():
     with pytest.raises(ValidationError, match="max_limit"):
         validate_rate_pair("bad", "max_limit")
+
+
+# --- validate_address_list_name (v0.4) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["blocked-clients", "allowed_clients", "list.1", "A", "9-clients", "a" * 64]
+)
+def test_validate_address_list_name_accepts_valid(name: str):
+    assert validate_address_list_name(name) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "   ", "blocked clients", "blocked;clients", "blocked/clients", "blocked$clients", "a" * 65],
+)
+def test_validate_address_list_name_rejects_invalid(name: str):
+    with pytest.raises(ValidationError):
+        validate_address_list_name(name)
+
+
+def test_validate_address_list_name_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_address_list_name(None)  # type: ignore[arg-type]
+
+
+def test_validate_address_list_name_strips_whitespace():
+    assert validate_address_list_name("  blocked-clients  ") == "blocked-clients"
+
+
+# --- validate_comment (v0.4) -------------------------------------------------
+
+
+@pytest.mark.parametrize("comment", ["", "reserved for guest wifi", "a" * 255])
+def test_validate_comment_accepts_valid(comment: str):
+    assert validate_comment(comment) == comment
+
+
+@pytest.mark.parametrize("comment", ["bad\ncomment", "bad\tcomment", "bad\rcomment", "a" * 256])
+def test_validate_comment_rejects_invalid(comment: str):
+    with pytest.raises(ValidationError):
+        validate_comment(comment)
+
+
+def test_validate_comment_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_comment(None)  # type: ignore[arg-type]
+
+
+def test_validate_comment_error_message_includes_field_name():
+    with pytest.raises(ValidationError, match="comment"):
+        validate_comment("a" * 300, "comment")
+
+
+# --- validate_timeout (v0.4) -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value", ["1d", "2h30m", "1w2d3h4m5s", "10s", "0s", "01:30:00", "0:05", "00:00:10"]
+)
+def test_validate_timeout_accepts_valid(value: str):
+    assert validate_timeout(value) == value
+
+
+@pytest.mark.parametrize(
+    "value", ["", "   ", "not-a-timeout", "1x", "10s; reboot", "a" * 40, "1h2w"]
+)
+def test_validate_timeout_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_timeout(value)
+
+
+def test_validate_timeout_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_timeout(None)  # type: ignore[arg-type]
