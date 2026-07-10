@@ -539,6 +539,65 @@ def fake_connection() -> FakeConnection:
                     "dst-active": False,
                 }
             ],
+            # v1.9: IPv6 read parity - mirrors the equivalent ("ip", ...)
+            # fixtures above, field-for-field, on the ("ipv6", ...) paths.
+            # `disabled`/`dynamic`/`advertise`/`active` are real Python
+            # bools (or omitted, ROS6-style implicit-false), never the
+            # strings "true"/"false" - same coerce_ros_bool shape every
+            # other bool-bearing fixture in this file already uses. The
+            # device-with-ipv6-package-disabled case (path raises) is
+            # exercised via dedicated FakeConnection(raise_for=...)
+            # instances in test_server.py, not this shared fixture.
+            ("ipv6", "address"): [
+                {
+                    ".id": "*1",
+                    "address": "2001:db8::1/64",
+                    "interface": "ether1",
+                    "advertise": True,
+                    "disabled": False,
+                    "dynamic": False,
+                }
+            ],
+            ("ipv6", "route"): [
+                {
+                    ".id": "*1",
+                    "dst-address": "::/0",
+                    "gateway": "fe80::1",
+                    "distance": "1",
+                    "active": True,
+                    "disabled": False,
+                },
+                {
+                    ".id": "*2",
+                    "dst-address": "2001:db8:20::/64",
+                    "gateway": "ether1",
+                    "distance": "0",
+                    "active": True,
+                    "dynamic": True,
+                },
+            ],
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established", "disabled": False}
+            ],
+            ("ipv6", "neighbor"): [
+                {
+                    ".id": "*1",
+                    "address": "2001:db8::70",
+                    "mac-address": "AA:BB:CC:DD:EE:70",
+                    "interface": "ether1",
+                    "status": "reachable",
+                    "dynamic": True,
+                }
+            ],
+            ("ipv6", "firewall", "address-list"): [
+                {
+                    ".id": "*1",
+                    "list": "blocked-clients-v6",
+                    "address": "2001:db8::60/128",
+                    "dynamic": False,
+                    "disabled": False,
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},

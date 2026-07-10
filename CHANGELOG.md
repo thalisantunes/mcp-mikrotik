@@ -3,6 +3,43 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.9.0] - 2026-07-10
+
+**IPv6 read parity - opens up `ROADMAP.md`'s Tier 3.** Five read-only
+tools, each mirroring an existing IPv4 read tool field-for-field on the
+equivalent `/ipv6/*` path. IPv6 writes (firewall rule toggle, route add/
+remove) are explicitly deferred to a later release - see `ROADMAP.md`'s
+Tier 3 entry.
+
+- `ipv6_addresses` (`/ipv6/address`): mirrors `ip_addresses`. address,
+  interface, advertise, disabled, dynamic.
+- `ipv6_routes` (`/ipv6/route`): mirrors `ip_routes`, including its
+  optional `limit` (capped at `MAX_ROUTE_LIMIT`, same 500 cap). dst-address,
+  gateway, distance, active, dynamic, disabled.
+- `ipv6_firewall_filter` (`/ipv6/firewall/filter`): mirrors
+  `firewall_filter`. Read-only - does not add/modify/remove rules.
+- `ipv6_neighbors` (`/ipv6/neighbor`): mirrors `arp_table` - IPv6's
+  neighbor-discovery equivalent of the IPv4 ARP table. address,
+  mac-address, interface, status, dynamic.
+- `ipv6_firewall_address_lists` (`/ipv6/firewall/address-list`): mirrors
+  `address_lists`. list, address, dynamic, disabled.
+
+**Trap this release specifically guards against**: the whole `/ipv6/*`
+menu subtree raises if the `ipv6` package is disabled on the device (a
+common, fully supported state) - all five tools above catch
+`DeviceCommandError` and return `[]` instead of propagating, the same
+skip-if-missing pattern already established by `wireguard_peers`,
+`ppp_active`, `bgp_sessions`, `ospf_neighbors`, and others. Like the IPv4
+reads they mirror, these tools return RouterOS's rows as-is (raw passthrough,
+no server-side boolean coercion); the fixtures/tests use real Python `bool`
+values, matching what librouteros returns. 102 tools total, 100% line
+coverage maintained.
+
+Hardware-verified both sides: skip-if-missing confirmed on real ROS6 (`.254`,
+`ipv6` package OFF - all five paths raise `DeviceCommandError`, tools return
+`[]`); happy path confirmed on real ROS7 (`.237`, `ipv6` ON - real addresses,
+routes, and 23 neighbor entries; field shapes match).
+
 ## [1.8.0] - 2026-07-10
 
 **NTP client + clock - closes out `ROADMAP.md`'s Tier 2.** Two read tools

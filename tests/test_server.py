@@ -117,6 +117,11 @@ EXPECTED_TOOLS = {
     "ntp_client",
     "system_clock",
     "set_ntp_servers",
+    "ipv6_addresses",
+    "ipv6_routes",
+    "ipv6_firewall_filter",
+    "ipv6_neighbors",
+    "ipv6_firewall_address_lists",
 }
 
 
@@ -4958,3 +4963,127 @@ async def test_set_ntp_servers_requires_at_least_one_server(device: Device):
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("set_ntp_servers", {"device_name": "core-switch", "servers": [], "confirm": True})
     assert "at least one" in str(exc_info.value).lower()
+
+
+# --- IPv6 read parity (v1.9, read-only) --------------------------------------
+#
+# Mirrors ip_addresses/ip_routes/firewall_filter/arp_table/address_lists
+# field-for-field on the /ipv6/* paths. TRAP (see ROADMAP.md "IPv6 parity"):
+# /ipv6/* raises if the `ipv6` package is disabled on the device - every
+# tool below is tested both against the shared fixture's happy-path data
+# AND against a dedicated FakeConnection whose /ipv6/* path raises, proving
+# the skip-if-missing behaviour (empty list, never an error) documented in
+# each tool's docstring.
+
+
+@pytest.mark.asyncio
+async def test_ipv6_addresses_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipv6_addresses", {"device_name": "core-switch"})
+    assert result["result"][0]["address"] == "2001:db8::1/64"
+    assert result["result"][0]["interface"] == "ether1"
+    assert result["result"][0]["advertise"] is True
+    assert result["result"][0]["disabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_ipv6_addresses_returns_empty_when_ipv6_package_disabled(settings: Settings):
+    fake = FakeConnection(raise_for={("ipv6", "address"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_addresses", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ipv6_routes_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipv6_routes", {"device_name": "core-switch"})
+    assert len(result["result"]) == 2
+    assert result["result"][0]["dst-address"] == "::/0"
+    assert result["result"][0]["gateway"] == "fe80::1"
+    assert result["result"][0]["active"] is True
+    assert result["result"][1]["dynamic"] is True
+
+
+@pytest.mark.asyncio
+async def test_ipv6_routes_limit_caps_returned_rows(settings: Settings):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "::/0"},
+                {".id": "*2", "dst-address": "2001:db8:10::/64"},
+                {".id": "*3", "dst-address": "2001:db8:20::/64"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_routes", {"device_name": "core-switch", "limit": 2})
+    assert len(result["result"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_ipv6_routes_rejects_non_positive_limit(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("ipv6_routes", {"device_name": "core-switch", "limit": 0})
+    assert "positive" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_ipv6_routes_returns_empty_when_ipv6_package_disabled(settings: Settings):
+    fake = FakeConnection(raise_for={("ipv6", "route"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_routes", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ipv6_firewall_filter_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipv6_firewall_filter", {"device_name": "core-switch"})
+    assert result["result"][0]["chain"] == "input"
+    assert result["result"][0]["action"] == "accept"
+    assert result["result"][0]["disabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_ipv6_firewall_filter_returns_empty_when_ipv6_package_disabled(settings: Settings):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "filter"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_firewall_filter", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ipv6_neighbors_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipv6_neighbors", {"device_name": "core-switch"})
+    assert result["result"][0]["address"] == "2001:db8::70"
+    assert result["result"][0]["mac-address"] == "AA:BB:CC:DD:EE:70"
+    assert result["result"][0]["status"] == "reachable"
+    assert result["result"][0]["dynamic"] is True
+
+
+@pytest.mark.asyncio
+async def test_ipv6_neighbors_returns_empty_when_ipv6_package_disabled(settings: Settings):
+    fake = FakeConnection(raise_for={("ipv6", "neighbor"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_neighbors", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ipv6_firewall_address_lists_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipv6_firewall_address_lists", {"device_name": "core-switch"})
+    assert result["result"][0]["list"] == "blocked-clients-v6"
+    assert result["result"][0]["address"] == "2001:db8::60/128"
+    assert result["result"][0]["dynamic"] is False
+
+
+@pytest.mark.asyncio
+async def test_ipv6_firewall_address_lists_returns_empty_when_ipv6_package_disabled(settings: Settings):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "address-list"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipv6_firewall_address_lists", {"device_name": "core-switch"})
+    assert result["result"] == []

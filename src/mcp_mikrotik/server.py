@@ -22,7 +22,10 @@ one more read-only tool - firewall_mangle - (v1.6) four more read-only
 tools - certificates, users, user_active, radius - see "AAA/PKI visibility"
 below - (v1.7) five more read-only tools - interface_monitor, dhcp_servers,
 dhcp_networks, bridge_ports, bridge_vlans - and (v1.8) two more read-only
-tools - ntp_client, system_clock - closing out ROADMAP.md's Tier 2.
+tools - ntp_client, system_clock - closing out ROADMAP.md's Tier 2. (v1.9)
+five more read-only tools - ipv6_addresses, ipv6_routes,
+ipv6_firewall_filter, ipv6_neighbors, ipv6_firewall_address_lists - IPv6
+READ parity (ROADMAP.md's Tier 3); IPv6 writes are left for a later release.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -2637,6 +2640,109 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         client = _client(device_name)
         preview = guard.set_ntp_servers(client, settings, servers=servers, confirm=confirm)
         return asdict(preview)
+
+    # --- v1.9: IPv6 read parity ------------------------------------------
+    # Tier 3's largest single coverage gap (see ROADMAP.md "IPv6 parity"):
+    # five read tools mirroring the equivalent /ip/* menu field-for-field,
+    # READ-ONLY only - IPv6 writes (firewall toggle, route add/remove) are
+    # left for a later release. TRAP: the whole /ipv6/* subtree raises if
+    # the `ipv6` package is disabled on the device (a common, fully
+    # supported state - not every deployment runs IPv6), so every tool
+    # below uses the same skip-if-missing pattern already established for
+    # other optional features (wireguard_peers, ppp_active, bgp_sessions,
+    # ospf_neighbors, ...): catch DeviceCommandError and return [] rather
+    # than propagate.
+
+    @mcp.tool()
+    @_safe
+    def ipv6_addresses(device_name: str) -> list[dict[str, Any]]:
+        """List IPv6 addresses configured on a device (`/ipv6/address`):
+        address, interface, advertise, disabled, dynamic, plus whatever
+        other fields RouterOS's own reply carries (e.g. its global/
+        link-local classification). Mirrors `ip_addresses` for IPv6.
+
+        Returns an empty list (never an error) if the `ipv6` package is
+        disabled on the device - see "IPv6 read parity (v1.9)" in the
+        README.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ipv6", "address"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def ipv6_routes(device_name: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """List the IPv6 routing table of a device (`/ipv6/route`):
+        dst-address, gateway, distance, active, dynamic, disabled. Mirrors
+        `ip_routes` for IPv6, including its optional `limit` (capped at
+        500, same MAX_ROUTE_LIMIT); omit it to get the full table.
+
+        Returns an empty list (never an error) if the `ipv6` package is
+        disabled on the device - see "IPv6 read parity (v1.9)" in the
+        README.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("ipv6", "route"))
+        except DeviceCommandError:
+            return []
+        if limit is not None:
+            capped_limit = validate_positive_limit(limit, MAX_ROUTE_LIMIT, "limit")
+            rows = rows[:capped_limit]
+        return rows
+
+    @mcp.tool()
+    @_safe
+    def ipv6_firewall_filter(device_name: str) -> list[dict[str, Any]]:
+        """List IPv6 firewall filter rules (`/ipv6/firewall/filter`): chain,
+        action, etc. Mirrors `firewall_filter` for IPv6. Read-only - does
+        not add/modify/remove rules.
+
+        Returns an empty list (never an error) if the `ipv6` package is
+        disabled on the device - see "IPv6 read parity (v1.9)" in the
+        README.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ipv6", "firewall", "filter"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def ipv6_neighbors(device_name: str) -> list[dict[str, Any]]:
+        """List the IPv6 neighbor discovery table (`/ipv6/neighbor`):
+        address, mac-address, interface, status, dynamic. IPv6's neighbor-
+        discovery equivalent of `arp_table`'s IPv4 ARP table.
+
+        Returns an empty list (never an error) if the `ipv6` package is
+        disabled on the device - see "IPv6 read parity (v1.9)" in the
+        README.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ipv6", "neighbor"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def ipv6_firewall_address_lists(device_name: str) -> list[dict[str, Any]]:
+        """List IPv6 firewall address-list entries
+        (`/ipv6/firewall/address-list`): list, address, dynamic, disabled.
+        Mirrors `address_lists` for IPv6.
+
+        Returns an empty list (never an error) if the `ipv6` package is
+        disabled on the device - see "IPv6 read parity (v1.9)" in the
+        README.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ipv6", "firewall", "address-list"))
+        except DeviceCommandError:
+            return []
 
     return mcp
 

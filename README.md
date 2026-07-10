@@ -34,22 +34,25 @@ each of those is avoided here.
 
 ## Status
 
-**1.4.0.** Every planned tool round has shipped: the full read-tool
-inventory (interfaces, VLANs, routing, DHCP, wireless, VPN/WireGuard/PPP,
+**1.9.0.** Every planned tool round through Tier 2 has shipped, plus the
+first Tier 3 item: the full read-tool inventory (interfaces, VLANs, routing
+IPv4 **and IPv6**, DHCP servers/leases/networks, wireless, VPN/WireGuard/PPP,
 containers, LTE/5G, USB, hotspot, live traffic, backups, firewall
-filter/NAT/mangle, a heuristic security audit), guarded writes across
-identity/interfaces/wifi/bandwidth/DHCP/address-lists/PoE/containers/
-failover-routing/Netwatch/DNS/Wake-on-LAN/firewall-filter-rule-toggle/
-firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/VLANs/PPP-PPPoE-
-secrets/NAT-rule-toggle/mangle-rule-toggle, and the production-hardening
+filter/NAT/mangle IPv4 **and IPv6**, bridge ports & VLAN filtering, SFP/optical
+monitor, certificates, users/RADIUS, NTP/clock, a heuristic security audit),
+guarded writes across identity/interfaces/wifi/bandwidth/DHCP/address-lists/
+PoE/containers/failover-routing/Netwatch/DNS/Wake-on-LAN/firewall-rule-toggle
+(filter/NAT/mangle)/firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/
+VLANs/PPP-PPPoE-secrets/static-routes/NTP-servers, and the production-hardening
 layers this needs to run unattended against a real fleet - audit journal,
 correlation IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
-version-by-version history (what shipped in each round), and "Roadmap &
-non-goals" below for what's deliberately still out of scope, and why.
+version-by-version history, and `ROADMAP.md` for what's next (and what's
+deliberately out of scope, and why).
 
-The full pytest suite currently has 1340 tests, all passing against an
-in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
-a 95% floor) - see "Development & CI" below.
+The full pytest suite currently has 1476 tests (102 tools), all passing against
+an in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
+a 95% floor) - see "Development & CI" below. Many tools are additionally
+smoke-tested against real ROS6/ROS7 hardware before release.
 
 ## Installation
 
@@ -243,6 +246,11 @@ representative exchanges:
 | `bridge_vlans` | List the bridge VLAN filtering table (`/interface/bridge/vlan`): bridge, vlan-ids, tagged, untagged, comment, plus current-tagged/current-untagged when present - completes the VLAN story for a managed switch (bridge VLAN filtering), distinct from the standalone `/interface/vlan` interfaces `list_vlans`/`add_vlan` manage. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
 | `ntp_client` | NTP client configuration/status (`/system/ntp/client`): enabled, mode, plus whichever of ROS7's `servers`/`freq-drift`/`status`/`synced-server`/`synced-stratum` or ROS6's `primary-ntp`/`secondary-ntp`/`server-dns-names` the device actually returns - nothing invented. `enabled` normalized to `bool \| None`. See "NTP client + clock" below. |
 | `system_clock` | Device clock (`/system/clock`): time, date, time-zone-name, time-zone-autodetect, gmt-offset, dst-active. `time-zone-autodetect`/`dst-active` normalized to `bool \| None`. See "NTP client + clock" below. |
+| `ipv6_addresses` | List IPv6 addresses (`/ipv6/address`): address, interface, advertise, disabled, dynamic. Mirrors `ip_addresses` for IPv6. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
+| `ipv6_routes` | List the IPv6 routing table (`/ipv6/route`): dst-address, gateway, distance, active, dynamic, disabled. Mirrors `ip_routes` for IPv6, including its optional `limit` (capped at 500). Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
+| `ipv6_firewall_filter` | List IPv6 firewall filter rules (`/ipv6/firewall/filter`): chain, action, etc. Mirrors `firewall_filter` for IPv6. Read-only - does not add/modify/remove rules. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
+| `ipv6_neighbors` | List the IPv6 neighbor discovery table (`/ipv6/neighbor`): address, mac-address, interface, status, dynamic. Mirrors `arp_table` for IPv6. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
+| `ipv6_firewall_address_lists` | List IPv6 firewall address-list entries (`/ipv6/firewall/address-list`): list, address, dynamic, disabled. Mirrors `address_lists` for IPv6. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
 
 ### Write (guarded)
 
@@ -541,6 +549,34 @@ plus one guarded write:
     RouterOS connection (`tests/fakes.py`), not real ROS6 hardware - the
     ROS6 field shapes and the "older firmware rejects a hostname" claim are
     unverified on an actual device. See `CHANGELOG.md`.
+
+### IPv6 read parity (v1.9)
+
+`ROADMAP.md`'s Tier 3 "IPv6 parity" item, **READ-ONLY** for now - IPv6
+writes (firewall rule toggle, route add/remove) are a later release. Five
+read tools, each mirroring an existing IPv4 read field-for-field on the
+`/ipv6/*` equivalent of its path:
+
+| IPv6 tool | Mirrors |
+|---|---|
+| `ipv6_addresses` | `ip_addresses` |
+| `ipv6_routes` | `ip_routes` (same optional `limit`, capped at 500) |
+| `ipv6_firewall_filter` | `firewall_filter` |
+| `ipv6_neighbors` | `arp_table` |
+| `ipv6_firewall_address_lists` | `address_lists` |
+
+**Trap this release specifically guards against**: the entire `/ipv6/*`
+menu subtree raises if the `ipv6` package is disabled on the device - a
+common, fully supported state, not every deployment runs IPv6. All five
+tools above use the same **skip-if-missing** pattern already established
+for other optional features (`wireguard_peers`, `ppp_active`,
+`bgp_sessions`, `ospf_neighbors`, ...): a `DeviceCommandError` from the
+`/ipv6/*` path is caught and an empty list is returned, never propagated as
+an error. Like the IPv4 reads they mirror (`ip_addresses`/`firewall_filter`/
+`arp_table`/...), these tools pass RouterOS's rows through as-is - no
+server-side boolean coercion. The fixtures/tests use real Python `bool`
+values for `disabled`/`dynamic`/`advertise`/`active` (matching what
+librouteros actually returns), so the tests exercise the real shape.
 
 ### VPN & routing diagnostics (v0.8)
 

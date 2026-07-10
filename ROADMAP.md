@@ -23,7 +23,23 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** NTP client + clock — `ntp_client`, `system_clock`
+**Recently shipped:** IPv6 read parity — `ipv6_addresses`, `ipv6_routes`,
+`ipv6_firewall_filter`, `ipv6_neighbors`, `ipv6_firewall_address_lists`
+(all read-only) — landed in **v1.9**, opening up Tier 3. Each mirrors an
+existing IPv4 read tool field-for-field on the equivalent `/ipv6/*` path
+(`ip_addresses`, `ip_routes` including its `limit`, `firewall_filter`,
+`arp_table`, `address_lists`, respectively). Handles the trap this item was
+flagged for below: the whole `/ipv6/*` subtree raises if the `ipv6` package
+is disabled on the device, so every tool uses the same skip-if-missing
+pattern `security_audit`/`wireguard_peers`/`ppp_active`/etc. already use —
+catch `DeviceCommandError`, return `[]`, never propagate. **IPv6 WRITES are
+explicitly NOT in this release** — firewall rule toggle and route add/
+remove for IPv6 are a follow-up, scoped the same way their IPv4
+counterparts (`enable_firewall_rule`/`disable_firewall_rule`, `add_route`/
+`remove_route`) already are, once this read groundwork has had time to
+prove itself.
+
+Before that: NTP client + clock — `ntp_client`, `system_clock`
 (read), `set_ntp_servers` (guarded write) — landed in **v1.8**, closing out
 Tier 2 entirely (see the note below). `ntp_client`/`system_clock` read
 `/system/ntp/client` and `/system/clock`, returning every field the device's
@@ -131,7 +147,8 @@ shipped in **v1.7**; NTP client + clock (read plus guarded `set_ntp_servers`)
 shipped in **v1.8**, closing out everything this tier ever named — see
 "Recently shipped" above for all three rounds. Tier 3 (IPv6 parity, advanced
 queuing, richer ROS7 Wi-Fi, CAPsMAN, RouterOS CVE check, API-only config
-snapshot & diff) is now next.
+snapshot & diff) is now next — IPv6 reads shipped in **v1.9** (see
+"Recently shipped" above); IPv6 writes and the rest of Tier 3 remain open.
 
 Guarded writes for bridge VLAN filtering (assigning a port's `pvid` /
 `tagged`/`untagged` membership) are a natural Tier 2/3 follow-up now that the
@@ -139,11 +156,17 @@ read side exists, but are not yet scoped — see "How items graduate" below.
 
 ## Tier 3 — larger or design-gated
 
-- **IPv6 parity** — addresses, routes, firewall, neighbor discovery. Today IPv6
-  is only incidental (validators accept `::/0` etc., no dedicated tools). The
-  largest single coverage gap. Trap: `/ipv6/*` errors if the `ipv6` package is
-  disabled — reads must use the same skip-if-missing pattern `security_audit`
-  already uses, not fail.
+- **IPv6 parity — READS shipped in v1.9** (`ipv6_addresses`, `ipv6_routes`,
+  `ipv6_firewall_filter`, `ipv6_neighbors`, `ipv6_firewall_address_lists`;
+  see "Recently shipped" above). **IPv6 WRITES are the remaining follow-up**
+  — a firewall rule toggle and route add/remove for IPv6, mirroring
+  `enable_firewall_rule`/`disable_firewall_rule` and `add_route`/
+  `remove_route`'s existing IPv4 scope and safety properties (e.g.
+  `remove_route`'s refusal to delete a dynamic route) — not yet scoped
+  beyond that intent. The `/ipv6/*` package-disabled trap that motivated
+  the skip-if-missing read pattern applies equally to writes and needs its
+  own handling (e.g. a clear error rather than a confusing failure) when
+  that follow-up is scoped.
 - **Advanced queuing** (`/queue/tree`, PCQ) — extends simple-queue bandwidth to
   real QoS hierarchies. Read first; guarded writes later.
 - **Richer ROS7 Wi-Fi** (`/interface/wifi`) — today only `set_wifi_ssid`.
