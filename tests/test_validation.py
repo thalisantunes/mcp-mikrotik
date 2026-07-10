@@ -7,12 +7,15 @@ from mcp_mikrotik.validation import (
     validate_address_list_name,
     validate_comment,
     validate_container_identifier,
+    validate_dst_address,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
     validate_ping_address,
     validate_poe_out,
     validate_rate_pair,
+    validate_route_distance,
+    validate_route_gateway,
     validate_target,
     validate_timeout,
 )
@@ -334,3 +337,84 @@ def test_validate_container_identifier_rejects_invalid(value: str):
 def test_validate_container_identifier_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_container_identifier(None)  # type: ignore[arg-type]
+
+
+# --- validate_dst_address (v0.9) ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0.0.0.0/0", "10.0.0.0/24", "10.0.0.5", "192.168.1.0/24", "::/0", "2001:db8::/64", "2001:db8::1"],
+)
+def test_validate_dst_address_accepts_valid(value: str):
+    assert validate_dst_address(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "not-an-ip", "10.0.0.0/33", "10.0.0.0/-1", "2001:db8::/129", "999.1.1.1", "10.0.0.0/abc"],
+)
+def test_validate_dst_address_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_dst_address(value)
+
+
+def test_validate_dst_address_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_dst_address(None)  # type: ignore[arg-type]
+
+
+def test_validate_dst_address_strips_whitespace():
+    assert validate_dst_address("  0.0.0.0/0  ") == "0.0.0.0/0"
+
+
+# --- validate_route_gateway (v0.9) --------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["10.0.0.254", "192.168.1.1", "2001:db8::1", "ether1", "pppoe-out1", "vlan100"])
+def test_validate_route_gateway_accepts_valid(value: str):
+    assert validate_route_gateway(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", "gateway with spaces", "gateway;drop", "gateway/slash"])
+def test_validate_route_gateway_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_route_gateway(value)
+
+
+def test_validate_route_gateway_accepts_dotted_digit_string_as_interface_shape():
+    """"999.1.1.1" is not a valid IPv4 (999 is out of range), but it IS a
+    valid interface-name shape (letters/digits/'.'/'_'/'-') - gateway is
+    validated as "IP OR interface name" (see validate_route_gateway's
+    docstring: RouterOS accepts a gateway expressed as an outgoing
+    interface), so this is accepted here. A gateway that's actually wrong
+    (a typo'd IP, or a name that doesn't match any real interface) is
+    rejected by RouterOS itself as a clear device-side error when the write
+    is applied - not silently accepted as correct, just not rejected by this
+    shape-only check."""
+    assert validate_route_gateway("999.1.1.1") == "999.1.1.1"
+
+
+def test_validate_route_gateway_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_route_gateway(None)  # type: ignore[arg-type]
+
+
+# --- validate_route_distance (v0.9) -------------------------------------------
+
+
+@pytest.mark.parametrize("value", [1, 2, 100, 255])
+def test_validate_route_distance_accepts_valid(value: int):
+    assert validate_route_distance(value) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 256, 1000])
+def test_validate_route_distance_rejects_out_of_range(value: int):
+    with pytest.raises(ValidationError):
+        validate_route_distance(value)
+
+
+@pytest.mark.parametrize("value", ["1", None, 1.5, True, False])
+def test_validate_route_distance_rejects_non_int(value):
+    with pytest.raises(ValidationError):
+        validate_route_distance(value)  # type: ignore[arg-type]

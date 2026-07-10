@@ -13,27 +13,24 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.8: everything from v0.7 (the core read-tool inventory, `ping`/
-`traceroute` diagnostics, a set of guarded write tools - `set_identity`,
-`enable_interface`/`disable_interface`, `set_wifi_ssid`,
-`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`,
-`add_to_address_list`/`remove_from_address_list`, `set_poe_out`,
-`start_container`/`stop_container` - all going through the same write-guard
-mechanism, plus the production-hardening layers around it: audit journal,
-correlation ids, read retry, circuit breaker; physical layer / L2
-observability - `interface_traffic`, `poe_status`; LTE/5G, containers, USB),
-plus a VPN/routing/failover diagnostics round: six new **read-only** tools -
-`wireguard_peers`, `ppp_active`, `ipsec_active_peers` (VPN sessions/peers),
-`bgp_sessions`, `ospf_neighbors` (routing-protocol status), and `netwatch`
-(RouterOS's own gateway/peer reachability monitor - the key input for
-failover). None of the six touches the write guard or `MIKROTIK_ALLOW_WRITE`
-- see "VPN & routing diagnostics" below; the failover *write* tools (route
-distance, Netwatch entries) are deliberately left for a future round. None
-of this changes the security model - see "Production features" and
-"Security model" below. See `CHANGELOG.md` for what changed since v0.1.0,
-and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
+v0.9: everything from v0.8 (the core read-tool inventory, `ping`/
+`traceroute` diagnostics, guarded write tools through `stop_container`,
+production-hardening layers - audit journal, correlation ids, read retry,
+circuit breaker; physical layer / L2 observability; LTE/5G, containers,
+USB; six read-only VPN/routing/Netwatch diagnostics tools), plus the
+failover **write** round this built toward: five new guarded write tools -
+`set_route_distance`, `enable_route`/`disable_route` (adjust/flip an
+`/ip/route` row, resolved by the STABLE `dst-address`+`gateway` pair, never
+a dynamic `.id`/index), `add_netwatch`/`remove_netwatch` (a Netwatch host
+monitor - deliberately **never** accepting an up-script/down-script
+parameter). `disable_route`'s preview carries a `warning` field whenever
+the route being disabled is the default route (`0.0.0.0/0`/`::/0`) - see
+"Failover control" below. All five go through the exact same write-guard
+mechanism as every other write tool - see "Security model" below. See
+`CHANGELOG.md` for what changed since v0.1.0, and `src/mcp_mikrotik/guard.py`
+for how to add the next write tool.
 
-The full pytest suite currently has 515 tests, all passing against the
+The full pytest suite currently has 627 tests, all passing against the
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
@@ -159,6 +156,11 @@ model" below for the full guard mechanism.
 | `set_poe_out` | Set a PoE-capable ethernet port's `poe-out` mode (`auto-on`/`forced-on`/`off`). Errors if `interface_name` doesn't exist, or exists but isn't PoE-capable; never creates/coerces anything. See "Physical layer & PoE control" below. |
 | `start_container` | Start a container by `name` or `tag` (`/container/start`). Errors if `container` doesn't match any container; never creates one. See "Container management" below. |
 | `stop_container` | Stop a container by `name` or `tag` (`/container/stop`). Errors if `container` doesn't match any container; never creates one. See "Container management" below. |
+| `set_route_distance` | Adjust an existing route's `distance` (failover priority - lower wins). Resolved by the stable `dst_address`+`gateway` pair - never a dynamic `.id`/index. Errors if no route matches, or if more than one still does after that pair (`AmbiguousResourceError`). See "Failover control" below. |
+| `enable_route` | Enable a route (`disabled=no`). Resolved by `dst_address`, narrowed by optional `gateway`/`comment` when more than one route shares it. |
+| `disable_route` | Disable a route (`disabled=yes`). Same resolution as `enable_route`. **The returned preview's `warning` field is non-null whenever the route is the default route (`0.0.0.0/0`/`::/0`)** - disabling it cuts outbound traffic through that gateway. See "Failover control" below. |
+| `add_netwatch` | Create a Netwatch host monitor (`host`, optional `interval`/`comment`). **Never accepts an up-script/down-script** - see "Failover control" below. Refuses a duplicate `host`. |
+| `remove_netwatch` | Remove a Netwatch host monitor by `host` or `comment`. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
@@ -336,11 +338,76 @@ Six **read-only** tools for VPN, routing-protocol, and failover diagnostics
   changes, credential changes, ...) that don't belong in a read tool's
   output.
 
-These six are the **read-only foundation** for failover tooling, not
-failover itself: nothing in this round can change a route's `distance`,
-add/edit a Netwatch entry, or otherwise cause an actual failover to happen.
-The corresponding **write** tools are deliberately left for a future round
-- see `CHANGELOG.md`'s `[0.8.0]` entry and "Roadmap / non-goals" below.
+These six were the **read-only foundation** v0.8 shipped for failover
+tooling; v0.9 (below) adds the corresponding **write** tools.
+
+### Failover control (v0.9)
+
+Five guarded write tools - `set_route_distance`, `enable_route`/
+`disable_route`, `add_netwatch`/`remove_netwatch` - are the **atomic
+building blocks** for adjusting a RouterOS failover setup. Deliberately
+small, composable steps, **not** one black-box "do a failover" command: an
+LLM caller (or a human operator) combines them, previewing each one before
+applying it.
+
+**Recommended flow:**
+
+1. `netwatch` (read) and `ip_routes` (read) to see the current setup - which
+   gateways are being watched, and which routes/distances currently
+   determine which one wins.
+2. `add_netwatch` (`confirm=false` first to preview, then `confirm=true`) to
+   start watching a gateway/peer's reachability, if not already monitored.
+   **This tool never accepts an up-script/down-script parameter** (see
+   below) - it only creates the observable host/status/interval/comment
+   row. RouterOS's own up/down-script mechanism (configured manually,
+   out-of-band, on the device - WinBox/CLI) is what actually *reacts* to a
+   Netwatch status change; this package deliberately does not create or
+   modify a script for you, e.g. by generating one that calls
+   `set_route_distance`/`disable_route` on transition - see "Netwatch
+   scripts are never accepted" below for why.
+3. To actually switch which route wins, either:
+   - `set_route_distance` (preview, then confirm) to change a route's
+     priority (lower `distance` wins) relative to another route with the
+     same `dst-address` - the non-destructive way to fail over: both routes
+     stay present and enabled, only their relative priority changes.
+   - `disable_route`/`enable_route` (preview, then confirm) to take a route
+     out of/back into consideration entirely.
+4. `ip_routes` (read) again afterward to confirm the routing table now
+   reflects what you intended.
+
+**RISK - the default route.** `disable_route`'s returned preview carries a
+non-null `warning` field whenever the route being disabled is the default
+route (`dst-address` = `0.0.0.0/0` or `::/0`) - disabling it cuts **all**
+outbound traffic that relies on that gateway, not just traffic to one
+destination. This is set on both the `confirm=false` preview and the
+`confirm=true` applied result, so a caller reading only `applied`/`after`
+still cannot miss it. Always read the `warning` field before calling again
+with `confirm=true` - and prefer `set_route_distance` over
+`disable_route`/`enable_route` for the default route specifically when
+possible: changing which of two already-enabled default routes has the
+lower `distance` fails over without ever leaving the device with *zero*
+enabled default routes at any point in between.
+
+**Route resolution: stable identifiers, never an index.** All three route
+tools resolve the target row by its `dst-address`, narrowed by `gateway`
+and/or `comment` when more than one route shares that `dst-address` -
+exactly the failover shape (e.g. two `0.0.0.0/0` routes to different
+gateways). Never by a RouterOS `.id` (reassigned as routes are added/
+removed elsewhere on the device) or a list index (even less stable). If
+nothing matches, `ResourceNotFoundError`. If more than one route still
+matches after narrowing, `AmbiguousResourceError` - the tool never guesses;
+the caller must add (or correct) `gateway`/`comment`.
+
+**Netwatch scripts are never accepted.** `add_netwatch` has no
+`up_script`/`down_script` parameter at all - not validated-and-rejected,
+genuinely absent from the tool's signature - because a Netwatch script body
+can run arbitrary RouterOS commands (route changes, credential changes,
+...), exactly the class of caller-controlled-arbitrary-command vector this
+package's write guard exists to rule out (see "Security model" below and
+`guard.py`'s module docstring). Configure up/down scripts manually on the
+device (WinBox/CLI) once the monitor exists. The read-only `netwatch` tool
+already only ever surfaces `has-up-script`/`has-down-script` as presence
+booleans, never a script body, for the same reason.
 
 ## Security model
 
@@ -410,20 +477,27 @@ On top of the write guard:
 
 - **Never creates the target.** Write tools that operate on a named resource
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
-  `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`)
-  look it up by name first. If no interface/wireless network/queue/
-  address-list entry/container with that name (or `target`, `list_name`+
-  `address` pair, or `name`/`tag`) exists on the device, the tool raises a
-  clear error instead of creating one - a typo can never silently provision
-  something new. `set_poe_out` additionally requires the matched interface
-  to actually have a `poe-out` field (i.e. be PoE-capable hardware) - a name
-  that exists but isn't a PoE port raises the same clear error rather than
-  doing nothing silently.
+  `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`/
+  `set_route_distance`/`enable_route`/`disable_route`/`remove_netwatch`)
+  look it up first - by name, or, for the v0.9 route tools, by the stable
+  `dst-address` (+`gateway`/`comment`) identifier described in "Failover
+  control" above. If nothing matches, the tool raises a clear error instead
+  of creating one - a typo can never silently provision something new.
+  `set_poe_out` additionally requires the matched interface to actually
+  have a `poe-out` field (i.e. be PoE-capable hardware) - a name that
+  exists but isn't a PoE port raises the same clear error rather than doing
+  nothing silently. The v0.9 route tools additionally never resolve by a
+  RouterOS `.id` or a list index (both can shift as routes are added/
+  removed elsewhere on the device); if a route's identifier still matches
+  more than one row after narrowing, `AmbiguousResourceError` is raised
+  instead of guessing which one to touch.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
-  existing lease on the given `mac_address` first, and `add_to_address_list`
+  existing lease on the given `mac_address` first, `add_to_address_list`
   checks for an existing entry with the same `list_name`+`address` pair
-  first, each raising `ResourceAlreadyExistsError` instead of creating a
-  second one - both for `confirm=false` previews and `confirm=true` applies.
+  first, and `add_netwatch` checks for an existing monitor on the given
+  `host` first - each raising `ResourceAlreadyExistsError` instead of
+  creating a second one - both for `confirm=false` previews and
+  `confirm=true` applies.
 - **Structured API, not shell commands.** All device communication goes
   through [`librouteros`](https://github.com/luqasz/librouteros)'s
   structured API (`path().select()/.add()/.update()/.remove()`, and the
@@ -542,14 +616,11 @@ Python 3.11 and 3.12.
 
 ## Roadmap / non-goals
 
-- **Failover write tools** (adjusting a route's `distance` to fail over
-  between gateways, adding/editing a Netwatch entry) are planned for a
-  future round, building on this round's six read-only VPN/routing/
-  Netwatch diagnostics (see "VPN & routing diagnostics" above). Unlike a
-  simple `set`, a failover write is not a single atomic RouterOS operation
-  - it needs its own design pass (what "atomic" means when it may involve
-  more than one route/Netwatch row, and how the before/after preview
-  represents that) before it goes into `guard.ALLOWLIST`.
+- **Failover write tools** (`set_route_distance`, `enable_route`/
+  `disable_route`, `add_netwatch`/`remove_netwatch`) shipped in v0.9 -
+  see "Failover control" above. Netwatch up/down-script configuration
+  itself remains deliberately out of scope (manual, on the device) - see
+  "Netwatch scripts are never accepted" above for why.
 - Two write operations are deliberately **not** exposed yet, each because
   the standard guard/confirm/preview mechanism isn't sufficient protection
   on its own - see the comment above `ALLOWLIST` in `guard.py`:

@@ -3,6 +3,118 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.9.0] - Unreleased
+
+Failover **write** round: the five atomic write tools v0.8's read-only
+VPN/routing/Netwatch diagnostics were the foundation for -
+`set_route_distance`, `enable_route`/`disable_route`, `add_netwatch`/
+`remove_netwatch`. Deliberately small, composable steps an LLM caller
+combines to build or adjust a failover setup - never one black-box "do a
+failover" command. These writes touch **routing**: a wrong `disable_route`
+call on the wrong route can cut a device's outbound traffic, so this round's
+whole design is aimed at making that mistake hard to make -
+resolution-by-stable-identifier (never a dynamic `.id`/index) and an
+explicit default-route risk callout in the preview, on top of the unchanged
+write-guard invariants (read-only default, central allowlist, confirm/
+preview, audit journal, no secrets logged).
+
+### Added
+
+- **`set_route_distance`** (write, guarded, `src/mcp_mikrotik/guard.py` +
+  `server.py`): adjusts an existing `/ip/route` row's `distance` (failover
+  priority - the lower distance wins) via `set distance=<distance>`.
+  Resolved by the STABLE `(dst_address, gateway)` pair - never a dynamic
+  `.id`/list index, which can silently shift as routes are added/removed
+  elsewhere on the device between a preview and the confirmed apply (see
+  "Route resolution: stable identifiers, never an index" below). `distance`
+  is validated 1-255 (`validation.validate_route_distance`) before the
+  device is ever touched.
+- **`enable_route`/`disable_route`** (write, guarded): flip an `/ip/route`
+  row's `disabled` field, resolved by `dst_address` - narrowed by optional
+  `gateway`/`comment` when more than one route shares that `dst_address`
+  (exactly the failover shape: two default routes to different gateways).
+  **`disable_route`'s preview carries a `warning` field** (a new, optional
+  `WritePreview.warning: str | None` on `guard.WritePreview`, `None` for
+  every write that has no equivalent risk) whenever the resolved route's
+  `dst-address` is a default route (`0.0.0.0/0`/`::/0`) - a plain-language
+  callout that disabling it cuts outbound traffic through that gateway, set
+  on both the `confirm=false` preview and the `confirm=true` applied result
+  so a caller reading only `applied`/`after` still cannot miss it.
+  `enable_route` never carries a warning - re-enabling restores traffic
+  rather than cutting it.
+- **`add_netwatch`** (write, guarded): creates a `/tool/netwatch` host
+  monitor - `host` (validated as a plain IP, `validate_ip_address`),
+  optional `interval` (a RouterOS duration, reuses `validate_timeout`) and
+  optional `comment`. **SECURITY: does NOT accept an up-script/down-script
+  parameter at all** - there is no parameter on this tool a caller could
+  even attempt to pass one through (see "Netwatch scripts are never
+  accepted" below). Refuses to create a second monitor for a `host` that
+  already has one (`ResourceAlreadyExistsError`).
+- **`remove_netwatch`** (write, guarded): removes a `/tool/netwatch` row by
+  `host` or `comment` (`host` tried first if both given). Requires at least
+  one of the two; `ResourceNotFoundError` if neither matches.
+- `exceptions.AmbiguousResourceError` (new): raised when a write tool's
+  identifier matches more than one row on the device instead of the tool
+  guessing which to touch - see "Route resolution" below. Mirrors the
+  existing `ResourceNotFoundError`/`ResourceAlreadyExistsError` shape
+  (device name, resource kind/name, plus the list of ambiguous candidates).
+- `validation.validate_dst_address`/`validate_route_gateway`/
+  `validate_route_distance` (new): route `dst-address` (IPv4/IPv6, optional
+  `/prefix`), `gateway` (IPv4/IPv6 address OR a bare interface name -
+  RouterOS also accepts a gateway expressed as an outgoing interface), and
+  `distance` (integer 1-255). `add_netwatch`/`remove_netwatch` reuse the
+  existing `validate_ip_address` (host) and `validate_timeout` (interval) -
+  no new validators needed for those two fields.
+
+### Route resolution: stable identifiers, never an index
+
+All three route write tools share one resolver, `guard._resolve_route`:
+match `/ip/route` rows by `dst-address`, then narrow further by `gateway`
+and/or `comment` if given. **Never** by `.id` (RouterOS reassigns `.id`s as
+routes are added/removed elsewhere on the device - stale between a preview
+and a later confirmed apply) and never by a list index (even less stable -
+shifts on every unrelated route change). If nothing matches after
+narrowing, `ResourceNotFoundError`. If **more than one** row still matches
+- the common real case is two routes sharing a `dst-address` for failover,
+e.g. two `0.0.0.0/0` default routes pointing at different gateways -
+`AmbiguousResourceError` is raised instead of silently picking the first
+match; the caller must add (or correct) `gateway`/`comment` to disambiguate.
+`set_route_distance` requires `gateway` up front (you're always adjusting a
+*specific* gateway's priority); `enable_route`/`disable_route` accept it
+(and `comment`) as optional narrowers, since sometimes `dst_address` alone
+is already unambiguous.
+
+### Netwatch scripts are never accepted
+
+`add_netwatch`'s function signature (`guard.py` and its `server.py` tool
+wrapper) has no `up_script`/`down_script` parameter at all - not "rejected
+if given", genuinely absent, so there is no code path through which a
+caller can smuggle an executable RouterOS script (which can run arbitrary
+commands, including route or credential changes) onto a device via this
+tool. See `test_add_netwatch_never_accepts_up_script_or_down_script`
+(`tests/test_guard.py`, asserts `TypeError` for either kwarg) and
+`test_add_netwatch_tool_schema_has_no_up_script_or_down_script_parameter`
+(`tests/test_server.py`, asserts the MCP tool's own JSON parameter schema
+has no such property). Up/down scripts remain a manual, out-of-band
+operator step (WinBox/CLI) once the monitor exists - see README's
+"Failover control".
+
+### Tests
+
+112 new tests (515 → 627, full suite green): `validate_dst_address`/
+`validate_route_gateway`/`validate_route_distance` (accept/reject,
+including the deliberate "999.1.1.1 is accepted as an interface-name shape,
+not a malformed IP" edge case - see its test's docstring); guard-level
+coverage for all five new writes (blocked when read-only, read-only gate
+before touching the device, preview vs confirm, resolution by
+`dst-address`+`gateway`, ambiguity → `AmbiguousResourceError`, not-found,
+netwatch duplicate → `ResourceAlreadyExistsError`, the default-route
+warning present/absent, `ALLOWLIST.action`-driven dispatch); audit-journal
+coverage (preview/applied/error outcomes, no password leak, folded into the
+existing cross-tool sweep); server-level `call_tool` coverage mirroring the
+guard-level cases end to end through `FastMCP`, plus the netwatch
+schema-inspection test above.
+
 ## [0.8.0] - Unreleased
 
 VPN, routing, and failover diagnostics round: six new read tools covering

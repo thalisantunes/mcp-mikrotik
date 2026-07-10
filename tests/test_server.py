@@ -66,6 +66,11 @@ EXPECTED_TOOLS = {
     "set_poe_out",
     "start_container",
     "stop_container",
+    "set_route_distance",
+    "enable_route",
+    "disable_route",
+    "add_netwatch",
+    "remove_netwatch",
 }
 
 
@@ -1351,6 +1356,302 @@ async def test_stop_container_rejects_invalid_container_before_touching_device(s
             "stop_container", {"device_name": "core-switch", "container": "grafana\nrm -rf /", "confirm": True}
         )
     assert "not valid" in str(exc_info.value) or "control characters" in str(exc_info.value)
+
+
+# --- set_route_distance / enable_route / disable_route (v0.9) ---------------
+
+
+@pytest.mark.asyncio
+async def test_set_route_distance_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_route_distance",
+            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert "distance" not in fake_connection.path("ip", "route")._rows[0]
+
+
+@pytest.mark.asyncio
+async def test_set_route_distance_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "set_route_distance",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["after"]["distance"] == "5"
+    assert "distance" not in fake_connection.path("ip", "route")._rows[0]
+
+    _content, applied = await mcp.call_tool(
+        "set_route_distance",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake_connection.path("ip", "route")._rows[0]["distance"] == "5"
+
+
+@pytest.mark.asyncio
+async def test_set_route_distance_unknown_route_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_route_distance",
+            {"device_name": "core-switch", "dst_address": "10.10.10.0/24", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+        )
+    assert "10.10.10.0/24" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_route_distance_ambiguous_route_raises_clear_error(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "dup"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_route_distance",
+            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+        )
+    assert "ambiguous" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_set_route_distance_rejects_invalid_distance_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_route_distance",
+            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 999, "confirm": True},
+        )
+    assert "1-255" in str(exc_info.value) or "out of range" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_disable_route_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "disable_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["after"]["disabled"] == "yes"
+
+    _content, applied = await mcp.call_tool(
+        "disable_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake_connection.path("ip", "route")._rows[0]["disabled"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_disable_route_default_route_preview_carries_warning(device: Device, fake_connection: FakeConnection):
+    """CRITICAL for this round: disabling the default route (dst 0.0.0.0/0
+    - the fixture device's only route) is the dangerous case this write
+    exists to flag - the preview's `warning` field must be non-null and
+    mention the default route, so a caller can't miss it before confirming."""
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "disable_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": False},
+    )
+    assert preview["warning"] is not None
+    assert "0.0.0.0/0" in preview["warning"]
+    assert "default" in preview["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_disable_route_non_default_route_preview_has_no_warning(device: Device):
+    fake = FakeConnection(
+        data={("ip", "route"): [{".id": "*1", "dst-address": "10.10.0.0/24", "gateway": "10.0.0.254"}]}
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "disable_route",
+        {"device_name": "core-switch", "dst_address": "10.10.0.0/24", "gateway": "10.0.0.254", "confirm": False},
+    )
+    assert preview["warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_enable_route_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    await mcp.call_tool(
+        "disable_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": True},
+    )
+    _content, applied = await mcp.call_tool(
+        "enable_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert applied["warning"] is None
+    assert fake_connection.path("ip", "route")._rows[0]["disabled"] == "no"
+
+
+@pytest.mark.asyncio
+async def test_enable_route_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_route",
+            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_disable_route_ambiguous_without_disambiguator_raises_clear_error(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "primary"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253", "comment": "backup"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "disable_route", {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "confirm": True}
+        )
+    assert "ambiguous" in str(exc_info.value).lower()
+
+
+# --- add_netwatch / remove_netwatch (v0.9) -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_netwatch_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("add_netwatch", {"device_name": "core-switch", "host": "1.1.1.1", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "1.1.1.1" not in hosts
+
+
+@pytest.mark.asyncio
+async def test_add_netwatch_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_netwatch",
+        {"device_name": "core-switch", "host": "1.1.1.1", "interval": "30s", "comment": "secondary", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["after"] == {"host": "1.1.1.1", "interval": "30s", "comment": "secondary"}
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "1.1.1.1" not in hosts
+
+    _content, applied = await mcp.call_tool(
+        "add_netwatch",
+        {"device_name": "core-switch", "host": "1.1.1.1", "interval": "30s", "comment": "secondary", "confirm": True},
+    )
+    assert applied["applied"] is True
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "1.1.1.1" in hosts
+
+
+@pytest.mark.asyncio
+async def test_add_netwatch_rejects_duplicate_host(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("add_netwatch", {"device_name": "core-switch", "host": "8.8.8.8", "confirm": True})
+    assert "8.8.8.8" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_netwatch_rejects_invalid_host_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_netwatch", {"device_name": "core-switch", "host": "not-an-ip", "confirm": True}
+        )
+    assert "not a valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_netwatch_tool_schema_has_no_up_script_or_down_script_parameter(settings: Settings):
+    """SECURITY: the add_netwatch MCP tool's own parameter schema must never
+    expose an up_script/down_script field - there is no way for a caller to
+    even attempt to pass an executable RouterOS script through this tool,
+    let alone have it accepted (see guard.add_netwatch's docstring)."""
+    mcp = build_server(settings=settings, client_factory=lambda s, n: None)
+    tools = {t.name: t for t in await mcp.list_tools()}
+    properties = tools["add_netwatch"].inputSchema.get("properties", {})
+    assert "up_script" not in properties
+    assert "down_script" not in properties
+    assert set(properties) == {"device_name", "host", "interval", "comment", "confirm"}
+
+
+@pytest.mark.asyncio
+async def test_remove_netwatch_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_netwatch", {"device_name": "core-switch", "host": "8.8.8.8", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" in hosts
+
+
+@pytest.mark.asyncio
+async def test_remove_netwatch_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_netwatch", {"device_name": "core-switch", "host": "8.8.8.8", "confirm": False}
+    )
+    assert preview["applied"] is False
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" in hosts
+
+    _content, applied = await mcp.call_tool(
+        "remove_netwatch", {"device_name": "core-switch", "host": "8.8.8.8", "confirm": True}
+    )
+    assert applied["applied"] is True
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" not in hosts
+
+
+@pytest.mark.asyncio
+async def test_remove_netwatch_unknown_host_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_netwatch", {"device_name": "core-switch", "host": "9.9.9.9", "confirm": True})
+    assert "9.9.9.9" in str(exc_info.value)
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------

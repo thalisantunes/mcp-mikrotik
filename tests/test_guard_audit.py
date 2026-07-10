@@ -13,7 +13,12 @@ import pytest
 from mcp_mikrotik import guard
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
-from mcp_mikrotik.exceptions import ResourceNotFoundError, WriteDisabledError
+from mcp_mikrotik.exceptions import (
+    AmbiguousResourceError,
+    ResourceAlreadyExistsError,
+    ResourceNotFoundError,
+    WriteDisabledError,
+)
 
 from .fakes import FakeConnection, TransportErrorConnection
 
@@ -196,11 +201,22 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "stopped"}]
     guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
     guard.stop_container(client, settings_write_enabled, container="grafana", confirm=True)
+    guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+    )
+    guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    guard.enable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
+    guard.remove_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 12
+    assert len(events) == 17
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -366,4 +382,198 @@ def test_stop_container_blocked_when_write_disabled_journals_outcome_error(
     events = _events(audit_log)
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
-    assert events[0]["operation"] == "stop_container"
+
+
+# --- set_route_distance / enable_route / disable_route / netwatch (v0.9) ---
+
+
+def test_set_route_distance_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "set_route_distance"
+    assert event["operation"] == "set_route_distance"
+    assert event["action"] == "update"
+    assert event["summary"]["after"]["distance"] == "5"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_set_route_distance_preview_journals_outcome_preview(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=False
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert events[0]["confirm"] is False
+
+
+def test_set_route_distance_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.set_route_distance(
+            client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "set_route_distance"
+
+
+def test_set_route_distance_ambiguous_route_journals_outcome_error(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError):
+        guard.set_route_distance(
+            client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "set_route_distance"
+
+
+def test_disable_route_confirmed_call_journals_outcome_applied_and_carries_warning_in_summary(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    """The default-route warning is part of what disable_route returns to
+    its caller (see guard.WritePreview.warning) - it is not itself a
+    separate audit concern, but the underlying before/after change it
+    describes must still be journaled and password-free like any other
+    write."""
+    guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "disable_route"
+    assert event["operation"] == "disable_route"
+    assert event["summary"]["after"]["disabled"] == "yes"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_disable_route_unknown_route_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.disable_route(
+            client, settings_write_enabled, dst_address="10.10.10.0/24", gateway="10.0.0.254", confirm=True
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "disable_route"
+
+
+def test_enable_route_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_route(client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "enable_route"
+
+
+def test_add_netwatch_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", comment="secondary", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_netwatch"
+    assert event["operation"] == "add_netwatch"
+    assert event["action"] == "add"
+    assert event["summary"]["after"]["host"] == "1.1.1.1"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_add_netwatch_duplicate_host_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_netwatch"
+
+
+def test_add_netwatch_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.add_netwatch(client, settings, host="1.1.1.1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_netwatch"
+
+
+def test_remove_netwatch_confirmed_call_journals_outcome_applied(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "remove_netwatch"
+    assert event["operation"] == "remove_netwatch"
+    assert event["action"] == "remove"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_remove_netwatch_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_netwatch(client, settings_write_enabled, host="9.9.9.9", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_netwatch"

@@ -359,3 +359,84 @@ def validate_rate_pair(value: str, field_name: str) -> str:
             '(expected "upload/download", e.g. "10M/5M").'
         )
     return value
+
+
+# --- v0.9: failover route + Netwatch writes ---------------------------------
+
+
+def validate_dst_address(value: str) -> str:
+    """Validate a RouterOS route `dst-address` (IPv4/IPv6, optionally with a
+    "/prefix-length" subnet, e.g. "0.0.0.0/0", "10.0.0.0/24", "::/0"). Used
+    by set_route_distance/enable_route/disable_route (guard.py) as (part of)
+    the STABLE identifier used to resolve one specific `/ip/route` row -
+    never a dynamic `.id`/list index. Same shape as `validate_target`, kept
+    as its own function since it validates a different field on a different
+    RouterOS menu (route `dst-address` vs Simple Queue `target`), not to be
+    confused with one another.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("dst_address must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("dst_address is too long.")
+
+    address_part, sep, prefix_part = value.partition("/")
+    prefix: int | None = None
+    if sep:
+        if not prefix_part.isdigit():
+            raise ValidationError(f"dst_address {value!r} has an invalid subnet prefix.")
+        prefix = int(prefix_part)
+
+    if _IPV4.match(address_part):
+        if prefix is not None and not (0 <= prefix <= 32):
+            raise ValidationError(f"dst_address {value!r} has an invalid IPv4 subnet prefix (expected 0-32).")
+        return value
+    if _IPV6.match(address_part):
+        if prefix is not None and not (0 <= prefix <= 128):
+            raise ValidationError(f"dst_address {value!r} has an invalid IPv6 subnet prefix (expected 0-128).")
+        return value
+
+    raise ValidationError(f"dst_address {value!r} is not a valid IPv4/IPv6 address or subnet.")
+
+
+def validate_route_gateway(value: str) -> str:
+    """Validate a RouterOS route `gateway`: an IPv4/IPv6 address (the common
+    case), or a bare interface name - RouterOS also accepts a gateway
+    expressed as an outgoing interface (e.g. for point-to-point/PPP links,
+    "gateway=ether1" rather than an address). Interface-name shape reuses
+    the same conservative charset as `_INTERFACE_NAME`
+    (`validate_interface_name`).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("gateway must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("gateway is too long.")
+
+    if _IPV4.match(value):
+        return value
+    if _IPV6.match(value):
+        return value
+    if _INTERFACE_NAME.match(value):
+        return value
+
+    raise ValidationError(f"gateway {value!r} is not a valid IPv4/IPv6 address or interface name.")
+
+
+def validate_route_distance(value: int) -> int:
+    """Validate a RouterOS route `distance` (failover priority - the lower
+    distance wins): an integer 1-255, RouterOS's own accepted range.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"distance must be an integer, got {value!r}.")
+    if not (1 <= value <= 255):
+        raise ValidationError(f"distance {value!r} is out of range (expected 1-255).")
+    return value

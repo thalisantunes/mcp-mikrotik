@@ -110,6 +110,33 @@ class ResourceAlreadyExistsError(MikrotikMCPError):
         self.resource_name = resource_name
 
 
+class AmbiguousResourceError(MikrotikMCPError):
+    """A write tool's caller-supplied identifier matched more than one row
+    on the device.
+
+    Raised by guard.py write functions instead of guessing which matching
+    row to act on - e.g. two `/ip/route` entries can legitimately share the
+    same `dst-address` (that is exactly the failover shape: two default
+    routes to different gateways with different `distance`), so a route
+    write tool resolves by `dst-address` narrowed by `gateway`/`comment`
+    (see guard._resolve_route) and raises this if more than one row still
+    matches after narrowing - the caller must supply (or correct) an
+    additional identifier rather than have the tool pick one arbitrarily.
+    """
+
+    def __init__(self, device_name: str, resource_kind: str, resource_name: str, candidates: list[str]):
+        candidate_text = ", ".join(repr(c) for c in candidates if c) or "no further detail available"
+        super().__init__(
+            f"{resource_kind} {resource_name!r} is ambiguous on device {device_name!r}: "
+            f"{len(candidates)} rows match ({candidate_text}); "
+            "disambiguate with an additional identifier (e.g. gateway/comment)."
+        )
+        self.device_name = device_name
+        self.resource_kind = resource_kind
+        self.resource_name = resource_name
+        self.candidates = candidates
+
+
 class GuardViolationError(MikrotikMCPError):
     """A write operation was requested that is not present in the write allowlist.
 

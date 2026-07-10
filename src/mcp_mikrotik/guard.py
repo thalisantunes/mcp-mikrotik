@@ -38,6 +38,7 @@ from .client import MikrotikClient
 from .config import Settings
 from .correlation import current as current_correlation_id
 from .exceptions import (
+    AmbiguousResourceError,
     DeviceCommandError,
     GuardViolationError,
     ResourceAlreadyExistsError,
@@ -49,11 +50,14 @@ from .validation import (
     validate_address_list_name,
     validate_comment,
     validate_container_identifier,
+    validate_dst_address,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
     validate_poe_out,
     validate_rate_pair,
+    validate_route_distance,
+    validate_route_gateway,
     validate_target,
     validate_timeout,
 )
@@ -183,6 +187,50 @@ ALLOWLIST: dict[str, WriteOperation] = {
         action="stop",
         description="Stop a container by name/tag (/container/stop).",
     ),
+    # v0.9: atomic failover writes. Each of these adjusts one piece of a
+    # RouterOS failover setup (route priority, a route's enabled state, a
+    # Netwatch monitor) - deliberately small, composable, individually
+    # previewable steps rather than one black-box "do a failover" command.
+    # See set_route_distance/_resolve_route below for why routes are
+    # resolved by (dst-address, gateway) - stable RouterOS identifiers -
+    # rather than a dynamic .id/index, and why that resolution can raise
+    # AmbiguousResourceError instead of guessing.
+    "set_route_distance": WriteOperation(
+        name="set_route_distance",
+        path=("ip", "route"),
+        action="update",
+        description="Adjust an existing route's distance (failover priority - lower wins); resolved by dst-address+gateway.",
+    ),
+    "enable_route": WriteOperation(
+        name="enable_route",
+        path=("ip", "route"),
+        action="update",
+        description="Enable a route (disabled=no); resolved by dst-address, narrowed by gateway/comment if ambiguous.",
+    ),
+    "disable_route": WriteOperation(
+        name="disable_route",
+        path=("ip", "route"),
+        action="update",
+        description=(
+            "Disable a route (disabled=yes); resolved by dst-address, narrowed by gateway/comment if ambiguous. "
+            "Disabling the default route (0.0.0.0/0 or ::/0) cuts outbound traffic through that gateway."
+        ),
+    ),
+    "add_netwatch": WriteOperation(
+        name="add_netwatch",
+        path=("tool", "netwatch"),
+        action="add",
+        description=(
+            "Create a Netwatch host monitor (host/interval/comment only - never accepts an "
+            "up-script/down-script; those are configured manually on the device)."
+        ),
+    ),
+    "remove_netwatch": WriteOperation(
+        name="remove_netwatch",
+        path=("tool", "netwatch"),
+        action="remove",
+        description="Remove a Netwatch host monitor by host or comment.",
+    ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
     #   * reboot ("system/reboot"): no before/after preview is meaningful for
@@ -207,6 +255,14 @@ class WritePreview:
     before: dict[str, Any]
     after: dict[str, Any]
     applied: bool
+    # v0.9: optional risk callout surfaced alongside before/after - e.g.
+    # disable_route sets this when the route being disabled is the default
+    # route (0.0.0.0/0 / ::/0), so a caller reading only `applied`/`after`
+    # still can't miss that this write cuts outbound traffic. None for
+    # every write that carries no special risk (i.e. every write before
+    # v0.9, and most of v0.9's own writes too) - existing callers/tests that
+    # construct or compare a WritePreview without `warning` are unaffected.
+    warning: str | None = None
 
 
 def _require_allowed(settings: Settings, operation_name: str) -> WriteOperation:
@@ -934,3 +990,299 @@ def stop_container(client: MikrotikClient, settings: Settings, container: str, c
     return _set_container_running(
         client, settings, "stop_container", container, target_status="stopping", confirm=confirm
     )
+
+
+# --- v0.9: atomic failover writes -------------------------------------------
+#
+# Three routing tools (set_route_distance/enable_route/disable_route) plus
+# two Netwatch tools (add_netwatch/remove_netwatch) - each a small, atomic
+# step an LLM caller composes to build or adjust a failover setup, not one
+# black-box "do a failover" command. See README's "Failover control" for the
+# recommended step-by-step flow (netwatch observes a gateway; distance/
+# enable/disable actually switches traffic to a different route).
+#
+# All three route writes share _resolve_route below: a route is identified
+# by the STABLE (dst-address, gateway) pair (optionally narrowed further by
+# `comment`) - never by a dynamic `.id` or a list index, both of which can
+# silently shift as routes are added/removed elsewhere on the device between
+# a preview (confirm=False) and the confirmed apply (confirm=True). This
+# matters more here than for any other write tool in this package: routes
+# govern where traffic actually goes, so resolving the wrong row - or
+# guessing among several equally-matching ones - is the one mistake this
+# round cannot afford to make silently.
+
+_DEFAULT_ROUTE_DST_ADDRESSES = frozenset({"0.0.0.0/0", "::/0"})
+
+
+def _resolve_route(
+    client: MikrotikClient,
+    op: WriteOperation,
+    dst_address: str,
+    gateway: str | None = None,
+    comment: str | None = None,
+) -> dict[str, Any]:
+    """Resolve exactly one /ip/route row by its STABLE identifiers -
+    `dst-address`, optionally narrowed by `gateway` and/or `comment`.
+
+    Raises ResourceNotFoundError if nothing matches `dst_address` (further
+    narrowed by `gateway`/`comment`, if given). Raises AmbiguousResourceError
+    if MORE THAN ONE row still matches after narrowing - the most common
+    real case is two routes sharing the same `dst-address` for failover
+    (e.g. two `0.0.0.0/0` default routes pointing at different gateways with
+    different `distance`), which is exactly why `gateway`/`comment` exist as
+    disambiguators here instead of this function falling back to "just use
+    the first match".
+    """
+    rows = client.path(*op.path)
+    matches = [row for row in rows if row.get("dst-address") == dst_address]
+    if gateway is not None:
+        matches = [row for row in matches if row.get("gateway") == gateway]
+    if comment is not None:
+        matches = [row for row in matches if row.get("comment") == comment]
+
+    if not matches:
+        identifier = dst_address if gateway is None else f"{dst_address} via {gateway}"
+        raise ResourceNotFoundError(client.device.name, "Route", identifier)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "Route",
+            dst_address,
+            [row.get("gateway", "") for row in matches],
+        )
+    return matches[0]
+
+
+@_audited("set_route_distance")
+def set_route_distance(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    gateway: str,
+    distance: int,
+    confirm: bool,
+) -> WritePreview:
+    """Adjust a route's `distance` (failover priority - the lower distance
+    wins) via `/ip/route set distance=<distance>`.
+
+    Resolved by the STABLE (`dst_address`, `gateway`) pair - see
+    _resolve_route. Raises ResourceNotFoundError if no route matches that
+    pair, or AmbiguousResourceError if more than one still does (a
+    duplicate dst-address+gateway pair on the device itself - rare, but
+    never silently guessed).
+    """
+    op = _require_allowed(settings, "set_route_distance")
+
+    validated_dst = validate_dst_address(dst_address)
+    validated_gateway = validate_route_gateway(gateway)
+    validated_distance = validate_route_distance(distance)
+
+    row = _resolve_route(client, op, validated_dst, gateway=validated_gateway)
+
+    before = dict(row)
+    after = dict(row)
+    after["distance"] = str(validated_distance)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "distance": str(validated_distance)})
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def _set_route_disabled(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    dst_address: str,
+    disabled: bool,
+    confirm: bool,
+    gateway: str | None,
+    comment: str | None,
+) -> WritePreview:
+    """Shared implementation behind enable_route/disable_route - both
+    resolve `dst_address` (narrowed by `gateway`/`comment` - see
+    _resolve_route) to one /ip/route row and flip its `disabled` field.
+
+    When `disabled=True` and the resolved route's `dst-address` is a default
+    route (`0.0.0.0/0` or `::/0` - see _DEFAULT_ROUTE_DST_ADDRESSES), the
+    returned WritePreview's `warning` field is set to a clear, non-null
+    message: disabling the default route cuts outbound traffic through that
+    gateway. This is set on BOTH the preview (`confirm=False`) and the
+    applied result (`confirm=True`) - a caller reading only `applied`/`after`
+    still cannot miss it. No warning is generated for re-enabling
+    (`disabled=False`) a route - that direction restores traffic rather than
+    cutting it.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_dst = validate_dst_address(dst_address)
+    validated_gateway = validate_route_gateway(gateway) if gateway is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    row = _resolve_route(client, op, validated_dst, gateway=validated_gateway, comment=validated_comment)
+
+    before = dict(row)
+    after = dict(row)
+    after["disabled"] = "yes" if disabled else "no"
+
+    warning: str | None = None
+    if disabled and validated_dst in _DEFAULT_ROUTE_DST_ADDRESSES:
+        warning = (
+            f"{validated_dst} is the DEFAULT ROUTE - disabling it will cut outbound traffic that "
+            f"relies on gateway {row.get('gateway', '?')!r}. Confirm a working alternate route/gateway "
+            "is already active before applying this with confirm=true."
+        )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "disabled": after["disabled"]})
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+@_audited("enable_route")
+def enable_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    confirm: bool,
+    gateway: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Enable a route (sets disabled=no), resolved by `dst_address` -
+    narrowed by `gateway`/`comment` when more than one route shares that
+    `dst_address`. Raises ResourceNotFoundError if nothing matches, or
+    AmbiguousResourceError if the match is still ambiguous after narrowing."""
+    return _set_route_disabled(
+        client, settings, "enable_route", dst_address, disabled=False, confirm=confirm, gateway=gateway, comment=comment
+    )
+
+
+@_audited("disable_route")
+def disable_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    confirm: bool,
+    gateway: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Disable a route (sets disabled=yes), resolved by `dst_address` -
+    narrowed by `gateway`/`comment` when more than one route shares that
+    `dst_address`. Raises ResourceNotFoundError if nothing matches, or
+    AmbiguousResourceError if the match is still ambiguous after narrowing.
+
+    RISK: if the resolved route's `dst-address` is the default route
+    (`0.0.0.0/0`/`::/0`), the returned preview's `warning` field explains
+    that applying this cuts outbound traffic - see _set_route_disabled.
+    """
+    return _set_route_disabled(
+        client, settings, "disable_route", dst_address, disabled=True, confirm=confirm, gateway=gateway, comment=comment
+    )
+
+
+@_audited("add_netwatch")
+def add_netwatch(
+    client: MikrotikClient,
+    settings: Settings,
+    host: str,
+    confirm: bool,
+    interval: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Create a Netwatch host monitor (`/tool/netwatch add`): `host`
+    (validated as a plain IPv4/IPv6 address - see `validate_ip_address`),
+    optional `interval` (a RouterOS duration, e.g. "10s"/"00:00:10" -
+    reuses `validate_timeout`) and optional `comment`.
+
+    SECURITY: this deliberately does NOT accept an up-script/down-script
+    parameter - a Netwatch script body can run arbitrary RouterOS commands
+    (route changes, credential changes, ...), exactly the class of
+    caller-controlled-arbitrary-command vector this package's write guard
+    exists to rule out (see module docstring). This round only creates the
+    observable host/status/interval/comment row; up/down scripts are
+    configured manually on the device (WinBox/CLI) once the monitor exists
+    - see README's "Failover control". The read-only `netwatch` tool already
+    only ever surfaces `has-up-script`/`has-down-script` as presence
+    booleans, never a script body, for the same reason.
+
+    Refuses to create a second monitor for a `host` that already has one -
+    raises ResourceAlreadyExistsError instead of creating a duplicate. This
+    tool only ever adds; it never updates or removes an existing monitor.
+    """
+    op = _require_allowed(settings, "add_netwatch")
+
+    validated_host = validate_ip_address(host)
+    validated_interval = validate_timeout(interval, "interval") if interval is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    rows = client.path(*op.path)
+    existing = _find_row_by_field(rows, "host", validated_host)
+    if existing is not None:
+        raise ResourceAlreadyExistsError(client.device.name, "Netwatch host monitor", validated_host)
+
+    payload: dict[str, Any] = {"host": validated_host}
+    if validated_interval:
+        payload["interval"] = validated_interval
+    if validated_comment:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_netwatch")
+def remove_netwatch(
+    client: MikrotikClient,
+    settings: Settings,
+    confirm: bool,
+    host: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Remove a Netwatch host monitor by `host` or `comment`
+    (`/tool/netwatch remove`). At least one of `host`/`comment` must be
+    given and must resolve to an existing monitor (`host` is tried first if
+    both are given); raises ResourceNotFoundError otherwise. Never removes
+    more than the one matching row.
+    """
+    op = _require_allowed(settings, "remove_netwatch")
+
+    if not host and not comment:
+        raise ValidationError("remove_netwatch requires 'host' or 'comment'.")
+
+    # Validate `host` (if given) BEFORE touching the device at all, same as
+    # every other write tool's validation (see remove_simple_queue's
+    # equivalent comment).
+    validated_host = validate_ip_address(host) if host else None
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "host", validated_host) if validated_host else None
+    if row is None and comment:
+        row = _find_row_by_field(rows, "comment", comment)
+
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "Netwatch host monitor", host or comment or "")
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

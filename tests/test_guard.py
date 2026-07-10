@@ -9,6 +9,7 @@ from mcp_mikrotik import guard
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
 from mcp_mikrotik.exceptions import (
+    AmbiguousResourceError,
     DeviceCommandError,
     GuardViolationError,
     ResourceAlreadyExistsError,
@@ -1054,3 +1055,458 @@ def test_start_container_dispatch_follows_allowlist_action(
     guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {"id": "*1"}}
+
+
+# --- set_route_distance / enable_route / disable_route (v0.9) ---------------
+#
+# The fixture device's ("ip", "route") table (see conftest.fake_connection)
+# has exactly one row: dst-address "0.0.0.0/0" via gateway "10.0.0.254", no
+# `distance` field set yet. Ambiguity tests below build their own two-route
+# FakeConnection instead, mirroring set_wifi_ssid's pattern for scenarios
+# the shared fixture doesn't cover.
+
+
+def test_set_route_distance_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.set_route_distance(
+            client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=10, confirm=True
+        )
+
+
+def test_set_route_distance_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_route_distance(
+            guarded_client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=10, confirm=True
+        )
+
+
+def test_set_route_distance_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}
+    assert preview.after["distance"] == "5"
+    # Nothing was written to the fake device.
+    assert "distance" not in fake_connection.path("ip", "route")._rows[0]
+
+
+def test_set_route_distance_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+    )
+    assert preview.applied is True
+    assert fake_connection.path("ip", "route")._rows[0]["distance"] == "5"
+
+
+def test_set_route_distance_resolves_by_dst_and_gateway_never_by_index(
+    settings_write_enabled: Settings, device: Device
+):
+    """Two routes share the same dst-address; only the one whose gateway
+    also matches must be touched - never row 0 / a positional index."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.253", distance=20, confirm=True
+    )
+    rows = {row["gateway"]: row.get("distance") for row in fake.path("ip", "route")._rows}
+    assert rows == {"10.0.0.254": None, "10.0.0.253": "20"}
+
+
+def test_set_route_distance_unknown_dst_and_gateway_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.set_route_distance(
+            client, settings_write_enabled, dst_address="10.10.10.0/24", gateway="10.0.0.254", distance=5, confirm=True
+        )
+    assert "10.10.10.0/24" in str(exc_info.value)
+
+
+def test_set_route_distance_ambiguous_dst_and_gateway_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Even (dst-address, gateway) together can, in principle, match more
+    than one row (a genuine duplicate) - this is never silently resolved to
+    the first match."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.set_route_distance(
+            client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
+        )
+    assert "0.0.0.0/0" in str(exc_info.value)
+
+
+def test_set_route_distance_rejects_invalid_distance_before_touching_device(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ValidationError):
+        guard.set_route_distance(
+            client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=999, confirm=True
+        )
+    assert "distance" not in fake_connection.path("ip", "route")._rows[0]
+
+
+def test_set_route_distance_rejects_invalid_dst_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_route_distance(
+            guarded_client, settings_write_enabled, dst_address="not-an-ip", gateway="10.0.0.254", distance=5, confirm=True
+        )
+
+
+def test_set_route_distance_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_route_distance"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_route_distance", patched_op)
+
+    guard.set_route_distance(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=7, confirm=True
+    )
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*1", "distance": "7"}}
+
+
+def test_enable_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_route(client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+
+
+def test_disable_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.disable_route(client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+
+
+def test_enable_route_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.enable_route(guarded_client, settings, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+
+
+def test_disable_route_preview_then_confirm(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.after["disabled"] == "yes"
+    assert "disabled" not in fake_connection.path("ip", "route")._rows[0] or (
+        fake_connection.path("ip", "route")._rows[0].get("disabled") != "yes"
+    )
+
+    applied = guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    assert applied.applied is True
+    assert fake_connection.path("ip", "route")._rows[0]["disabled"] == "yes"
+
+
+def test_enable_route_after_disable_flips_back(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+    applied = guard.enable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    assert applied.applied is True
+    assert applied.after["disabled"] == "no"
+    assert fake_connection.path("ip", "route")._rows[0]["disabled"] == "no"
+
+
+def test_disable_route_unknown_route_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.disable_route(
+            client, settings_write_enabled, dst_address="10.10.10.0/24", gateway="10.0.0.254", confirm=True
+        )
+
+
+def test_disable_route_ambiguous_without_gateway_or_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Two routes share dst-address "0.0.0.0/0" - the classic failover
+    shape (primary + backup default route). Calling without `gateway` or
+    `comment` to disambiguate must error rather than silently pick one."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "primary"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253", "comment": "backup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", confirm=True)
+    assert "0.0.0.0/0" in str(exc_info.value)
+    # Neither row was touched.
+    assert all(row.get("disabled") != "yes" for row in fake.path("ip", "route")._rows)
+
+
+def test_disable_route_disambiguated_by_comment(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "primary"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253", "comment": "backup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", comment="backup", confirm=True
+    )
+    assert applied.applied is True
+    rows = {row["comment"]: row.get("disabled") for row in fake.path("ip", "route")._rows}
+    assert rows == {"primary": None, "backup": "yes"}
+
+
+def test_disable_route_default_route_preview_carries_warning(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """dst-address "0.0.0.0/0" (the fixture device's only route) IS the
+    default route - the preview must carry a non-null, explicit warning
+    about cutting outbound traffic, both on preview and on the applied
+    result (not just one or the other)."""
+    preview = guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.warning is not None
+    assert "0.0.0.0/0" in preview.warning
+    assert "default" in preview.warning.lower()
+
+    applied = guard.disable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    assert applied.warning is not None
+
+
+def test_disable_route_non_default_route_preview_has_no_warning(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={("ip", "route"): [{".id": "*1", "dst-address": "10.10.0.0/24", "gateway": "10.0.0.254"}]}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.disable_route(
+        client, settings_write_enabled, dst_address="10.10.0.0/24", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.warning is None
+
+
+def test_enable_route_of_default_route_carries_no_warning(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Re-enabling (restoring traffic) is never the risky direction - only
+    disable_route's warning fires."""
+    guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+    preview = guard.enable_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.warning is None
+
+
+def test_enable_route_rejects_invalid_dst_address_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.enable_route(guarded_client, settings_write_enabled, dst_address="not-an-ip", confirm=True)
+
+
+# --- add_netwatch / remove_netwatch (v0.9) -----------------------------------
+#
+# The fixture device's ("tool", "netwatch") table (see conftest) has one row
+# already: host "8.8.8.8", comment "primary gateway".
+
+
+def test_add_netwatch_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_netwatch(client, settings, host="1.1.1.1", confirm=True)
+
+
+def test_add_netwatch_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_netwatch(guarded_client, settings, host="1.1.1.1", confirm=True)
+
+
+def test_add_netwatch_preview_does_not_create(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=False)
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"host": "1.1.1.1"}
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert hosts == {"8.8.8.8"}
+
+
+def test_add_netwatch_confirm_true_creates(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_netwatch(
+        client, settings_write_enabled, host="1.1.1.1", interval="30s", comment="secondary gateway", confirm=True
+    )
+    assert preview.applied is True
+    hosts = {row["host"]: row for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "1.1.1.1" in hosts
+    assert hosts["1.1.1.1"]["interval"] == "30s"
+    assert hosts["1.1.1.1"]["comment"] == "secondary gateway"
+
+
+def test_add_netwatch_rejects_duplicate_host(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+    assert "8.8.8.8" in str(exc_info.value)
+    # Still exactly one row for that host.
+    hosts = [row["host"] for row in fake_connection.path("tool", "netwatch")._rows]
+    assert hosts.count("8.8.8.8") == 1
+
+
+def test_add_netwatch_rejects_invalid_host_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_netwatch(guarded_client, settings_write_enabled, host="not-an-ip", confirm=True)
+
+
+def test_add_netwatch_rejects_invalid_interval_before_touching_device(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ValidationError):
+        guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", interval="not-a-duration", confirm=True)
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "1.1.1.1" not in hosts
+
+
+def test_add_netwatch_never_accepts_up_script_or_down_script(client: MikrotikClient, settings_write_enabled: Settings):
+    """SECURITY: add_netwatch has no up_script/down_script parameter at
+    all - passing one raises TypeError (an unexpected keyword argument),
+    proving there is no code path through which a caller can smuggle an
+    executable RouterOS script onto this monitor."""
+    with pytest.raises(TypeError):
+        guard.add_netwatch(
+            client,
+            settings_write_enabled,
+            host="1.1.1.1",
+            confirm=True,
+            up_script=":log warning \"gw down\"",  # type: ignore[call-arg]
+        )
+    with pytest.raises(TypeError):
+        guard.add_netwatch(
+            client,
+            settings_write_enabled,
+            host="1.1.1.2",
+            confirm=True,
+            down_script=":log warning \"gw down\"",  # type: ignore[call-arg]
+        )
+
+
+def test_remove_netwatch_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_netwatch(client, settings, host="8.8.8.8", confirm=True)
+
+
+def test_remove_netwatch_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_netwatch(guarded_client, settings, host="8.8.8.8", confirm=True)
+
+
+def test_remove_netwatch_requires_host_or_comment(client: MikrotikClient, settings_write_enabled: Settings):
+    with pytest.raises(ValidationError):
+        guard.remove_netwatch(client, settings_write_enabled, confirm=True)
+
+
+def test_remove_netwatch_by_host_preview_then_confirm(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=False)
+    assert preview.applied is False
+    assert preview.before["host"] == "8.8.8.8"
+    assert preview.after == {}
+    # Not removed yet.
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" in hosts
+
+    applied = guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+    assert applied.applied is True
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" not in hosts
+
+
+def test_remove_netwatch_by_comment(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.remove_netwatch(client, settings_write_enabled, comment="primary gateway", confirm=True)
+    assert applied.applied is True
+    hosts = {row["host"] for row in fake_connection.path("tool", "netwatch")._rows}
+    assert "8.8.8.8" not in hosts
+
+
+def test_remove_netwatch_unknown_host_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_netwatch(client, settings_write_enabled, host="9.9.9.9", confirm=True)
+    assert "9.9.9.9" in str(exc_info.value)
+
+
+def test_remove_netwatch_rejects_invalid_host_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_netwatch(guarded_client, settings_write_enabled, host="not-an-ip", confirm=True)
+
+
+def test_remove_netwatch_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_netwatch"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_netwatch", patched_op)
+
+    guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}

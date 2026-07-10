@@ -3,8 +3,9 @@
 Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
 add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
-remove_from_address_list, set_poe_out, start_container/stop_container - see
-guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
+remove_from_address_list, set_poe_out, start_container/stop_container,
+set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch
+- see guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
 operator's own machine, launched by an MCP client (e.g. Claude Code) over
 stdio, with no network exposure at all.
 
@@ -975,6 +976,148 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.stop_container(client, settings, container=container, confirm=confirm)
+        return asdict(preview)
+
+    # --- v0.9: atomic failover writes -----------------------------------
+
+    @mcp.tool()
+    @_safe
+    def set_route_distance(
+        device_name: str, dst_address: str, gateway: str, distance: int, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Adjust an existing route's `distance` (failover priority - lower
+        distance wins) via `/ip/route set distance=<distance>`.
+
+        Resolved by the STABLE (`dst_address`, `gateway`) pair - never a
+        dynamic `.id`/list index, which can silently shift as routes are
+        added/removed elsewhere on the device between a preview and the
+        confirmed apply. Errors clearly (without changing anything) if no
+        route matches that pair, or if more than one still does
+        (`AmbiguousResourceError`) - this never guesses which route to
+        touch.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. See README's
+        "Failover control" section for the recommended step-by-step flow.
+        """
+        client = _client(device_name)
+        preview = guard.set_route_distance(
+            client, settings, dst_address=dst_address, gateway=gateway, distance=distance, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def enable_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Enable a route (`/ip/route set disabled=no`), resolved by
+        `dst_address` - narrowed by `gateway`/`comment` when more than one
+        route shares that `dst_address` (e.g. two default routes to
+        different gateways, the standard failover shape). Errors clearly if
+        nothing matches, or if the match is still ambiguous after
+        narrowing.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it.
+        """
+        client = _client(device_name)
+        preview = guard.enable_route(
+            client, settings, dst_address=dst_address, gateway=gateway, comment=comment, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Disable a route (`/ip/route set disabled=yes`), resolved by
+        `dst_address` - narrowed by `gateway`/`comment` when more than one
+        route shares that `dst_address`. Errors clearly if nothing matches,
+        or if the match is still ambiguous after narrowing.
+
+        RISK: disabling the default route (`dst_address="0.0.0.0/0"` or
+        `"::/0"`) cuts all outbound traffic that relies on this gateway. The
+        returned preview's `warning` field is non-null whenever this is the
+        case - always check it before calling again with `confirm=true`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the `warning`
+        field) without changing anything; call again with confirm=True to
+        actually apply it.
+        """
+        client = _client(device_name)
+        preview = guard.disable_route(
+            client, settings, dst_address=dst_address, gateway=gateway, comment=comment, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_netwatch(
+        device_name: str,
+        host: str,
+        interval: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a Netwatch host monitor (`/tool/netwatch add`): `host`
+        (a plain IPv4/IPv6 address), optional `interval` (a RouterOS
+        duration, e.g. "10s"/"00:00:10") and optional `comment`.
+
+        SECURITY: this tool does NOT accept an up-script/down-script - a
+        Netwatch script body can run arbitrary RouterOS commands (route or
+        credential changes, ...), so it is deliberately outside what this
+        guarded write tool will ever send to a device. Configure up/down
+        scripts manually on the device once the monitor exists (WinBox/CLI)
+        - see README's "Failover control" section. The read-only `netwatch`
+        tool already only ever surfaces `has-up-script`/`has-down-script` as
+        presence booleans, never a script body, for the same reason.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if a monitor for `host` already exists -
+        it never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_netwatch(
+            client, settings, host=host, interval=interval, comment=comment, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_netwatch(
+        device_name: str, host: str | None = None, comment: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove a Netwatch host monitor by `host` or `comment`
+        (`/tool/netwatch remove`). At least one of `host`/`comment` must be
+        given and must match an existing monitor (`host` is tried first if
+        both are given).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be removed; call again with
+        confirm=True to actually remove it.
+        """
+        client = _client(device_name)
+        preview = guard.remove_netwatch(client, settings, host=host, comment=comment, confirm=confirm)
         return asdict(preview)
 
     return mcp
