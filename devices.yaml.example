@@ -1,0 +1,31 @@
+# Copy this file to devices.yaml and fill in real credentials.
+# devices.yaml is git-ignored - never commit it.
+#
+# Fields per device:
+#   name        - unique identifier, used as the `device_name` tool argument
+#   host        - IP or hostname
+#   port        - RouterOS API port (default 8728; use the SSL port, e.g. 8729, with use_ssl: true)
+#   use_ssl     - true to connect over api-ssl instead of the plain API
+#   username    - RouterOS API user
+#   password    - RouterOS API password
+#   disabled    - true to keep the device configured but unreachable through this server
+#   comment     - free-text note, returned to callers (unlike password)
+
+devices:
+  - name: core-switch
+    host: 192.168.88.1
+    port: 8728
+    use_ssl: false
+    username: admin
+    password: change-me
+    disabled: false
+    comment: main office core switch
+
+  - name: edge-router
+    host: 192.168.88.254
+    port: 8729
+    use_ssl: true
+    username: admin
+    password: change-me
+    disabled: false
+    comment: WAN edge router, api-ssl only
