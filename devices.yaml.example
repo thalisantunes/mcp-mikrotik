@@ -10,6 +10,21 @@
 #   password    - RouterOS API password
 #   disabled    - true to keep the device configured but unreachable through this server
 #   comment     - free-text note, returned to callers (unlike password)
+#   timeout     - connect timeout in seconds (default: MIKROTIK_TIMEOUT env var, else 10);
+#                 raise this for devices behind a slow/high-latency link
+#   tls_verify  - only used when use_ssl: true. Default true validates the device's
+#                 certificate against the system trust store (or tls_ca_cert below).
+#                 RouterOS api-ssl commonly serves a SELF-SIGNED certificate, so this
+#                 will fail out-of-the-box unless you also set tls_ca_cert. Setting
+#                 tls_verify: false skips certificate/hostname validation entirely for
+#                 that device - a deliberate, explicit, per-device trade-off (it drops
+#                 MITM protection on that connection). Never the default; opt in
+#                 per device only when you accept that trade-off. See README's
+#                 "TLS verification for api-ssl" section.
+#   tls_ca_cert - only used when use_ssl: true and tls_verify: true. Path to a CA
+#                 bundle/certificate to validate the device against, instead of the
+#                 system trust store - the safer alternative to tls_verify: false if
+#                 you can provision RouterOS with a certificate you control.
 
 devices:
   - name: core-switch
@@ -25,7 +40,18 @@ devices:
     host: 192.168.88.254
     port: 8729
     use_ssl: true
+    tls_verify: false  # RouterOS api-ssl self-signed cert; see field docs above
     username: admin
     password: change-me
     disabled: false
     comment: WAN edge router, api-ssl only
+
+  - name: slow-link-ap
+    host: 192.168.90.1
+    port: 8728
+    use_ssl: false
+    username: admin
+    password: change-me
+    timeout: 30  # this AP is behind a slow satellite/4G backhaul
+    disabled: false
+    comment: remote AP, slow uplink

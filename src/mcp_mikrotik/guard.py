@@ -96,5 +96,13 @@ def set_identity(client: MikrotikClient, settings: Settings, new_name: str, conf
     if not confirm:
         return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
 
-    client.update(*op.path, name=new_name)
+    # A1: dispatch via op.action instead of hardcoding client.update(...), so
+    # ALLOWLIST["set_identity"].action actually governs which MikrotikClient
+    # primitive is called - if a future edit points this entry at "add" or
+    # "remove" instead, this call follows it rather than silently staying on
+    # .update(). set_identity itself is (and will stay) an update, so this is
+    # a no-op behaviourally today; it only matters for the allowlist's
+    # integrity as more operations are added.
+    write = getattr(client, op.action)
+    write(*op.path, name=new_name)
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

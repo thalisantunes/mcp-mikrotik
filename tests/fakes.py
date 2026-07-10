@@ -77,3 +77,25 @@ class RaisingConnection:
 
     def close(self) -> None:
         pass
+
+
+class TransportErrorConnection:
+    """Fake connection whose every operation raises a given exception.
+
+    Used to verify MikrotikClient wraps transport-layer failures (a mid-call
+    OSError from a dropped link, or a LibRouterosError) into
+    DeviceCommandError instead of letting them escape raw or get reported as
+    an opaque "Internal error" with no device context - see N1.
+    """
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def path(self, *segments: str):
+        raise self._exc
+
+    def __call__(self, cmd: str, **kwargs: Any):
+        raise self._exc
+
+    def close(self) -> None:
+        pass

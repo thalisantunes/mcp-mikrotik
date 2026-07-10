@@ -62,3 +62,17 @@ def validate_ping_address(address: str) -> str:
         return address
 
     raise ValidationError(f"Ping address {address!r} is not a valid IPv4/IPv6 address or hostname.")
+
+
+def validate_positive_limit(value: int, max_value: int, field_name: str) -> int:
+    """Validate a caller-supplied row/count limit (R3).
+
+    `value <= 0` is a caller mistake (e.g. limit=0 or count=-1), not a
+    "give me nothing" request - reject it with a clear ValidationError
+    instead of silently clamping it up to 1, which used to hide the mistake.
+    The upper bound (`max_value`) is a legitimate server-side cap, so it is
+    still clamped rather than rejected.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValidationError(f"{field_name!r} must be a positive integer, got {value!r}.")
+    return min(value, max_value)

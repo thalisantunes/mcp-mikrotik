@@ -47,11 +47,15 @@ Configuration comes from environment variables plus an optional
    |--------------------------|----------------|------------------------------------------------------|
    | `MIKROTIK_DEVICES_FILE`  | `devices.yaml` | Path to the devices YAML file                        |
    | `MIKROTIK_ALLOW_WRITE`   | `false`        | Enable write tools (see Security model)               |
-   | `MIKROTIK_LOG_LEVEL`     | `INFO`         | Log level for the server process (stderr)             |
+   | `MIKROTIK_LOG_LEVEL`     | `INFO`         | Log level for the server process (stderr); invalid values fall back to `INFO` with a warning |
+   | `MIKROTIK_TIMEOUT`       | `10`           | Fallback connect timeout (seconds) for devices without their own `timeout` |
 
 Each device entry supports its own `port` and `use_ssl`, since a fleet is
 commonly a mix of plain API (8728) and api-ssl (8729) devices, and possibly a
-mix of RouterOS 6.x and 7.x.
+mix of RouterOS 6.x and 7.x. It can also override `timeout` (seconds; falls
+back to `MIKROTIK_TIMEOUT`, then 10s - useful for devices behind a slow
+link) and, when `use_ssl: true`, `tls_verify` (see "TLS verification for
+api-ssl" below).
 
 ## Running
 
@@ -80,10 +84,11 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `system_info` | RouterOS identity + resource info (board, version, uptime, CPU/memory). |
 | `interfaces` | List interfaces; `include_disabled` to include disabled ones (default: excluded). |
 | `ip_addresses` | List IPv4 addresses. |
-| `ip_routes` | List the IPv4 routing table. |
+| `ip_routes` | List the IPv4 routing table; optional `limit` (capped at 500). |
 | `neighbors` | List neighbors discovered via CDP/MNDP/LLDP. |
-| `logs` | Recent log entries; `limit` (capped at 500) and optional `topics` substring filter. |
+| `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
 | `ping` | Ping an address from the device; `address` is validated as IPv4/IPv6/hostname before use. |
+| `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 
 ### Write (guarded)
 
@@ -126,9 +131,29 @@ On top of the write guard:
   field entirely. Passwords are never logged.
 - **Structured errors.** All errors raised inside the package derive from
   `MikrotikMCPError` (see `src/mcp_mikrotik/exceptions.py`) and are caught at
-  the tool boundary in `server.py`, which returns a clean `{"error": ...}`
-  result. Unexpected exceptions are logged server-side and returned to the
-  caller as a generic internal-error message, never as a raw traceback.
+  the tool boundary in `server.py`. The exception is deliberately re-raised,
+  not turned into an `{"error": ...}` result dict: MCP itself turns an
+  exception propagating out of a tool into a proper `isError` tool result
+  carrying just that exception's (already-safe) message, and letting the
+  framework do that keeps every tool's declared return type honest (a
+  successful `logs` call always returns `list[dict]`, never sometimes a
+  dict-shaped error instead). Unexpected exceptions are logged server-side
+  and re-raised as a generic internal-error message, never as a raw
+  traceback.
+
+### TLS verification for api-ssl
+
+RouterOS's `api-ssl` typically serves a self-signed certificate, so the
+default `tls_verify: true` (which validates against the system trust store,
+or an explicit `tls_ca_cert` if given) will fail out-of-the-box for most
+fleets. Two ways to make an SSL device work:
+
+- Set `tls_ca_cert: /path/to/ca.pem` on the device entry, if you provision
+  RouterOS with a certificate you can pin, keeping full verification.
+- Set `tls_verify: false` on that specific device to skip certificate/hostname
+  validation entirely. This is a deliberate, explicit, per-device trade-off
+  (it drops MITM protection on that connection) - it is never the default,
+  and it is opt-in per device, not global. See `devices.yaml.example`.
 
 ## Development
 

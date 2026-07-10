@@ -27,8 +27,15 @@ def ros_bool(value: Any) -> bool:
 
 
 def rows_to_list(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize an iterable of API rows into a plain list of plain dicts."""
-    return [dict(row) for row in rows]
+    """Normalize an iterable of API rows into a plain list.
+
+    R4: MikrotikClient.path()/ping() already materialize each row as a
+    plain dict (client.py), so this used to redundantly re-copy every row
+    with a second `dict(row)`. All current callers only ever pass rows that
+    are already plain dicts (client.path() results), so this just coerces
+    the iterable to a list without a second per-row copy.
+    """
+    return list(rows)
 
 
 def filter_disabled(rows: Iterable[dict[str, Any]], include_disabled: bool) -> list[dict[str, Any]]:

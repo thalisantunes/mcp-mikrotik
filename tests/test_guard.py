@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from mcp_mikrotik import guard
@@ -58,3 +60,25 @@ def test_allowlist_only_contains_named_operations():
 def test_require_allowed_rejects_unknown_operation(settings_write_enabled: Settings):
     with pytest.raises(GuardViolationError):
         guard._require_allowed(settings_write_enabled, "delete_everything")
+
+
+def test_set_identity_dispatch_follows_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """A1: guard.set_identity must dispatch via ALLOWLIST["set_identity"].action,
+    not a hardcoded call to client.update(). Point the allowlist entry's
+    action at an arbitrary stub method and confirm THAT method gets called
+    instead of .update() - proving `action` actually governs dispatch."""
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_identity"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_identity", patched_op)
+
+    guard.set_identity(client, settings_write_enabled, new_name="renamed", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"name": "renamed"}}
