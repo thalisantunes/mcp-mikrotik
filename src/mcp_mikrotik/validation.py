@@ -497,24 +497,29 @@ def validate_dns_record_type(value: str) -> str:
 
 # --- v0.11: firewall rule toggle (by comment) + connection tracking --------
 
-# A firewall filter rule's `chain` (e.g. "input"/"forward"/"output", or a
-# custom jump-target chain) - used only as an OPTIONAL disambiguator when
-# enable_firewall_rule/disable_firewall_rule's `comment` still matches more
-# than one rule (see guard._find_firewall_rule_rows). Shape-only, same
-# conservative charset as `_INTERFACE_NAME`/`_LIST_NAME` - not restricted to
-# a fixed enum, since RouterOS allows arbitrary custom chains too.
+# A firewall rule's `chain` (e.g. filter's "input"/"forward"/"output", NAT's
+# "srcnat"/"dstnat", mangle's "prerouting"/"postrouting"/"forward"/"input"/
+# "output", or a custom jump-target chain on any of the three) - used only as
+# an OPTIONAL disambiguator when enable_firewall_rule/disable_firewall_rule
+# (filter), enable_nat_rule/disable_nat_rule (NAT), or enable_mangle_rule/
+# disable_mangle_rule (mangle)'s `comment` still matches more than one rule
+# (see guard._find_firewall_rule_rows, shared by all three menus). Shape-only,
+# same conservative charset as `_INTERFACE_NAME`/`_LIST_NAME` - not restricted
+# to a fixed enum, since RouterOS allows arbitrary custom chains on every one
+# of these menus too.
 _CHAIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def validate_firewall_rule_comment(value: str) -> str:
-    """Validate a firewall filter rule's `comment` - the STABLE, MANDATORY
-    identifier `enable_firewall_rule`/`disable_firewall_rule` resolve a rule
-    by (never a dynamic `.id`/list index - see guard.py's module docstring
-    for why that matters). Unlike `validate_comment` (used elsewhere for an
-    OPTIONAL free-text field on a write that creates something new), an
-    EMPTY comment is rejected here outright: it can never reliably identify
-    one specific EXISTING rule on a device that may have several
-    undecorated ones.
+    """Validate a firewall rule's `comment` - the STABLE, MANDATORY
+    identifier the filter/NAT/mangle rule-toggle pairs (enable_firewall_rule/
+    disable_firewall_rule, enable_nat_rule/disable_nat_rule,
+    enable_mangle_rule/disable_mangle_rule) all resolve a rule by (never a
+    dynamic `.id`/list index - see guard.py's module docstring for why that
+    matters). Unlike `validate_comment` (used elsewhere for an OPTIONAL
+    free-text field on a write that creates something new), an EMPTY comment
+    is rejected here outright: it can never reliably identify one specific
+    EXISTING rule on a device that may have several undecorated ones.
 
     Returns the (stripped) value on success, raises ValidationError otherwise.
     """
@@ -531,11 +536,12 @@ def validate_firewall_rule_comment(value: str) -> str:
 
 
 def validate_firewall_chain(value: str) -> str:
-    """Validate a firewall filter rule's `chain`, used only to narrow
-    `enable_firewall_rule`/`disable_firewall_rule`'s `comment` match when it
-    is still ambiguous after matching on `comment` alone. Shape-only (see
-    `_CHAIN_NAME`) - not restricted to the three built-in chains, since
-    RouterOS allows arbitrary custom jump-target chains too.
+    """Validate a firewall rule's `chain`, used only to narrow the
+    filter/NAT/mangle rule-toggle pairs' `comment` match when it is still
+    ambiguous after matching on `comment` alone. Shape-only (see
+    `_CHAIN_NAME`) - not restricted to a fixed set of built-in chains, since
+    RouterOS allows arbitrary custom jump-target chains on every one of these
+    menus.
 
     Returns the (stripped) value on success, raises ValidationError otherwise.
     """

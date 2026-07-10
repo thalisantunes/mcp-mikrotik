@@ -34,19 +34,20 @@ each of those is avoided here.
 
 ## Status
 
-**1.3.0.** Every planned tool round has shipped: the full read-tool
+**1.4.0.** Every planned tool round has shipped: the full read-tool
 inventory (interfaces, VLANs, routing, DHCP, wireless, VPN/WireGuard/PPP,
-containers, LTE/5G, USB, hotspot, live traffic, backups, a heuristic
-security audit), guarded writes across identity/interfaces/wifi/bandwidth/
-DHCP/address-lists/PoE/containers/failover-routing/Netwatch/DNS/
-Wake-on-LAN/firewall-rule-toggle/firewall-rule-reorder/WireGuard/
-hotspot-vouchers/backup/VLANs/PPP-PPPoE-secrets, and the production-hardening
+containers, LTE/5G, USB, hotspot, live traffic, backups, firewall
+filter/NAT/mangle, a heuristic security audit), guarded writes across
+identity/interfaces/wifi/bandwidth/DHCP/address-lists/PoE/containers/
+failover-routing/Netwatch/DNS/Wake-on-LAN/firewall-filter-rule-toggle/
+firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/VLANs/PPP-PPPoE-
+secrets/NAT-rule-toggle/mangle-rule-toggle, and the production-hardening
 layers this needs to run unattended against a real fleet - audit journal,
 correlation IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
 version-by-version history (what shipped in each round), and "Roadmap &
 non-goals" below for what's deliberately still out of scope, and why.
 
-The full pytest suite currently has 1298 tests, all passing against an
+The full pytest suite currently has 1340 tests, all passing against an
 in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
 a 95% floor) - see "Development & CI" below.
 
@@ -210,6 +211,7 @@ representative exchanges:
 | `netwatch` | List Netwatch host monitors (host, status up/down, interval, since, comment, disabled, plus `has-up-script`/`has-down-script` presence booleans - never the raw script body). The key read for diagnosing/building failover. See "VPN & routing diagnostics" below. |
 | `dns_cache` | List cached DNS records (name, type, data, ttl). |
 | `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
+| `firewall_mangle` | List IPv4 firewall mangle rules (`/ip/firewall/mangle`): chain, action, comment, disabled, plus whatever other fields RouterOS returns for a given rule - these vary a lot by `action` (e.g. `mark-connection`/`mark-packet`/`mark-routing`). Read-only - does not add/modify/remove rules. See "NAT & mangle rule toggle (by comment)" below. |
 | `connection_tracking` | List active connections from `/ip/firewall/connection`, **FILTERED** - at least one of `src_address`/`dst_address`/`dst_port`/`protocol` is required (a `ValidationError` otherwise); capped at 100 rows with a `truncated` flag. See "Connection tracking (filtered)" below. |
 | `system_health` | System health metrics (voltage, temperature, ...), if the device exposes any; empty list otherwise. |
 | `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
@@ -274,12 +276,17 @@ model" below for the full guard mechanism.
 | `move_firewall_rule` | Reorder an **EXISTING** firewall filter rule (`/ip/firewall/filter move`), resolved by its `comment` (optionally narrowed by `chain`) - same resolution as `enable_firewall_rule`/`disable_firewall_rule`. **Never creates or edits a rule's fields** - only its position changes, to either immediately before another rule (`before_comment`) or a given 0-based `position`. See "Firewall rule reorder (by comment)" below. |
 | `add_ppp_secret` | Create a PPP/PPPoE secret (`name`, `password`, `service` - one of `pppoe`/`pptp`/`l2tp`/`ovpn`/`sstp`/`any`, default `any` - optional `profile`/`remote_address`/`comment`). Refuses a duplicate `name`. **`password` DELIBERATELY appears in the result** (echoed back as confirmation) but never in the audit journal - same asymmetry as `add_hotspot_user`. See "PPP/PPPoE secrets" below. |
 | `remove_ppp_secret` | Remove a PPP/PPPoE secret by `name`. Errors if no secret matches, or if more than one somehow does (`AmbiguousResourceError`). The returned preview's `before` never includes the secret's `password`. |
+| `enable_nat_rule` | Enable an **EXISTING** firewall NAT rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain` - `srcnat`/`dstnat`). **Never creates a rule.** Same pattern as `enable_firewall_rule`. See "NAT & mangle rule toggle (by comment)" below. |
+| `disable_nat_rule` | Disable an **EXISTING** firewall NAT rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_nat_rule`. |
+| `enable_mangle_rule` | Enable an **EXISTING** firewall mangle rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** Same pattern as `enable_firewall_rule`. |
+| `disable_mangle_rule` | Disable an **EXISTING** firewall mangle rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_mangle_rule`. |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
-filter rule (only the narrow `disabled` TOGGLE of an existing,
-admin-authored rule is exposed - see "Firewall rule toggle (by comment)"
-below). See "Roadmap / non-goals" below for why.
+filter, NAT, or mangle rule (only the narrow `disabled` TOGGLE of an
+existing, admin-authored rule is exposed for all three - see "Firewall rule
+toggle (by comment)" and "NAT & mangle rule toggle (by comment)" below). See
+"Roadmap / non-goals" below for why.
 
 ### Limiting a client's bandwidth (v0.3)
 
@@ -644,6 +651,46 @@ returned preview's `before`/`after` are the **full** matched rule (every
 field RouterOS returned for it - `chain`/`action`/etc, not just
 `disabled`), so the caller can confirm WHICH rule this is before ever
 passing `confirm=true`.
+
+### NAT & mangle rule toggle (by comment) (v1.4)
+
+`enable_nat_rule`/`disable_nat_rule` and `enable_mangle_rule`/
+`disable_mangle_rule` extend the exact pattern above to the other two
+firewall menus: `/ip/firewall/nat` (already read-only since v0.4 via
+`firewall_nat`) and `/ip/firewall/mangle` (read-only tool `firewall_mangle`
+added this same round). Same reasoning, same guarantees, same resolution:
+
+- **Never creates a rule.** An admin creates the NAT/mangle rule ahead of
+  time, on the device itself, reviews it once, and leaves it disabled; an
+  LLM caller later enables it via `enable_nat_rule`/`enable_mangle_rule`
+  when it detects the condition the rule exists to guard against - e.g. a
+  port-forward left disabled until a maintenance window, or a traffic-mark
+  rule staged for a QoS change. **Why this matters just as much here as for
+  filter**: disabling the wrong NAT rule can cut a whole LAN's Internet
+  access (e.g. the `srcnat`/masquerade rule), and mangle rules commonly feed
+  routing/QoS decisions downstream - creation/free-form edit stays out of
+  scope for the same lockout reasoning "Firewall rule toggle (by comment)"
+  above explains for filter (see `ROADMAP.md`'s "Explicitly NOT on the
+  roadmap").
+- **Resolution: `comment`, never a dynamic index**, optionally narrowed by
+  `chain` (NAT: `srcnat`/`dstnat`; mangle: `prerouting`/`postrouting`/
+  `forward`/`input`/`output`, or a custom jump-target chain on either menu -
+  `chain` is shape-only, not a fixed enum, same as filter's). A `comment`
+  matching no rule raises `ResourceNotFoundError`; one still matching more
+  than one rule after narrowing raises `AmbiguousResourceError` - never
+  guesses which one to toggle.
+- **Implementation note**: both pairs share the exact same `guard.py`
+  helper the filter pair (v0.11) already used
+  (`_set_firewall_rule_disabled`), generalized with a `resource_label`
+  parameter so `ResourceNotFoundError`/`AmbiguousResourceError` name the
+  right menu ("Firewall filter rule" / "Firewall NAT rule" / "Firewall
+  mangle rule") - the resolution logic itself was already path-agnostic, so
+  nothing about it changed for filter.
+
+```
+enable_nat_rule(device_name="core-switch", comment="rdp-forward-maintenance", confirm=false)  # preview
+enable_nat_rule(device_name="core-switch", comment="rdp-forward-maintenance", confirm=true)   # apply
+```
 
 ### Connection tracking (filtered) (v0.11)
 

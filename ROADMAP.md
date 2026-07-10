@@ -23,10 +23,15 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** PPP/PPPoE secrets — `ppp_secrets` (read),
-`add_ppp_secret` / `remove_ppp_secret` (guarded) — landed in **v1.3**
-(read+add+remove verified against real ROS7 hardware; password redacted in the
-audit journal and never returned by the read).
+**Recently shipped:** NAT rule toggle + firewall mangle (read + toggle) —
+`enable_nat_rule` / `disable_nat_rule`, `firewall_mangle` (read),
+`enable_mangle_rule` / `disable_mangle_rule` — landed in **v1.4**, mirroring
+`enable_firewall_rule` / `disable_firewall_rule` (v0.11) exactly: toggle an
+EXISTING, admin-authored rule by `comment`, never create one. PPP/PPPoE
+secrets — `ppp_secrets` (read), `add_ppp_secret` / `remove_ppp_secret`
+(guarded) — landed in **v1.3** (read+add+remove verified against real ROS7
+hardware; password redacted in the audit journal and never returned by the
+read).
 
 ## Feasibility note
 
@@ -72,19 +77,10 @@ separately-argued case. The default stance is: stay API-only.
 
 The cheapest, lowest-risk wins: each just extends a pattern already shipped and
 proven (toggle-by-comment, add/remove a leaf object). All paths verified present
-on ROS7 (see caveats above). (PPP/PPPoE secrets, previously the headline item
-here, shipped in v1.3 — see "Recently shipped" above.)
+on ROS7 (see caveats above). (PPP/PPPoE secrets shipped in v1.3; NAT rule
+toggle and firewall mangle, previously the two other items here, shipped in
+v1.4 — see "Recently shipped" above.)
 
-- **NAT rule toggle by comment** (`/ip/firewall/nat`) — guarded
-  `enable_nat_rule` / `disable_nat_rule`, mirroring the already-shipped
-  `enable_firewall_rule` / `disable_firewall_rule` exactly. `firewall_nat` is
-  read-only today; toggling an admin-authored port-forward for maintenance is
-  the same proven, low-risk pattern (toggle only, never create). Near-zero
-  marginal cost — likely the first thing to land.
-- **Firewall mangle** (`/ip/firewall/mangle`) — read (`firewall_mangle`) plus
-  enable/disable-by-comment. Same pattern as filter/NAT. Mangle usually *marks*
-  rather than *drops*, so a toggle here is lower-risk than filter. No rule
-  creation (same lockout reasoning as filter).
 - **Static route add / remove** (`/ip/route`) — guarded `add_route` /
   `remove_route`. Today only *existing* routes can be manipulated
   (`set_route_distance`, `enable_route`, `disable_route`); adding a new static

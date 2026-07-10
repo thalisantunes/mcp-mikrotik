@@ -98,6 +98,11 @@ EXPECTED_TOOLS = {
     "move_firewall_rule",
     "add_ppp_secret",
     "remove_ppp_secret",
+    "firewall_mangle",
+    "enable_nat_rule",
+    "disable_nat_rule",
+    "enable_mangle_rule",
+    "disable_mangle_rule",
 }
 
 
@@ -235,6 +240,36 @@ async def test_firewall_filter_happy_path(settings: Settings, fake_connection: F
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("firewall_filter", {"device_name": "core-switch"})
     assert result["result"][0]["chain"] == "input"
+
+
+@pytest.mark.asyncio
+async def test_firewall_mangle_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("firewall_mangle", {"device_name": "core-switch"})
+    assert result["result"][0]["chain"] == "forward"
+    assert result["result"][0]["action"] == "mark-packet"
+    assert result["result"][0]["comment"] == "mark-voip"
+
+
+@pytest.mark.asyncio
+async def test_firewall_mangle_tolerates_rows_missing_common_fields(settings: Settings):
+    """A mangle rule's fields vary a lot by action - e.g. a `mark-routing`
+    rule has no `new-packet-mark`, an unlabeled row may have no `comment` at
+    all. firewall_mangle must return whatever RouterOS sent, never raise
+    (e.g. via a bare `row["comment"]` lookup) just because a common-ish
+    field is absent from one particular row."""
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "mangle"): [
+                {".id": "*1", "chain": "prerouting", "action": "mark-routing"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("firewall_mangle", {"device_name": "core-switch"})
+    assert result["result"] == [{".id": "*1", "chain": "prerouting", "action": "mark-routing"}]
+    assert "comment" not in result["result"][0]
+    assert "disabled" not in result["result"][0]
 
 
 @pytest.mark.asyncio
@@ -2442,6 +2477,239 @@ async def test_enable_firewall_rule_rejects_empty_comment_before_touching_device
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("enable_firewall_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
     assert "non-empty" in str(exc_info.value)
+
+
+# --- enable_nat_rule / disable_nat_rule (v1.4) -----------------------------
+#
+# The shared fixture's ("ip", "firewall", "nat") table (see conftest) has an
+# enabled "wan-masquerade" row (chain "srcnat") and a pre-created, disabled
+# "rdp-forward-maintenance" row (chain "dstnat") - same admin-creates/
+# LLM-enables workflow as enable_firewall_rule above, extended to NAT.
+
+
+@pytest.mark.asyncio
+async def test_enable_nat_rule_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_nat_rule", {"device_name": "core-switch", "comment": "rdp-forward-maintenance", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_nat_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "enable_nat_rule", {"device_name": "core-switch", "comment": "rdp-forward-maintenance", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["disabled"] == "true"
+    assert preview["after"]["disabled"] == "no"
+    assert preview["before"]["chain"] == "dstnat"
+    rows = fake_connection.path("ip", "firewall", "nat")._rows
+    assert next(r for r in rows if r["comment"] == "rdp-forward-maintenance")["disabled"] == "true"
+
+    _content, applied = await mcp.call_tool(
+        "enable_nat_rule", {"device_name": "core-switch", "comment": "rdp-forward-maintenance", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "nat")._rows
+    assert next(r for r in rows if r["comment"] == "rdp-forward-maintenance")["disabled"] == "no"
+    # No rule was created - still exactly the two rows the fixture started with.
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_disable_nat_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "disable_nat_rule", {"device_name": "core-switch", "comment": "wan-masquerade", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "nat")._rows
+    assert next(r for r in rows if r["comment"] == "wan-masquerade")["disabled"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_enable_nat_rule_unknown_comment_raises_clear_error_and_creates_nothing(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_nat_rule", {"device_name": "core-switch", "comment": "no-such-rule", "confirm": True}
+        )
+    assert "no-such-rule" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "nat")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_enable_nat_rule_ambiguous_comment_raises_and_disambiguated_by_chain(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "nat"): [
+                {".id": "*1", "chain": "srcnat", "action": "masquerade", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "dstnat", "action": "dst-nat", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_nat_rule", {"device_name": "core-switch", "comment": "dup", "confirm": True})
+    assert "ambiguous" in str(exc_info.value).lower()
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "nat")._rows)
+
+    _content, applied = await mcp.call_tool(
+        "enable_nat_rule",
+        {"device_name": "core-switch", "comment": "dup", "chain": "dstnat", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "nat")._rows}
+    assert rows == {"srcnat": "true", "dstnat": "no"}
+
+
+@pytest.mark.asyncio
+async def test_enable_nat_rule_rejects_empty_comment_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_nat_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
+    assert "non-empty" in str(exc_info.value)
+
+
+# --- enable_mangle_rule / disable_mangle_rule (v1.4) -----------------------
+#
+# The shared fixture's ("ip", "firewall", "mangle") table (see conftest) has
+# an enabled "mark-voip" row (chain "forward") and a pre-created, disabled
+# "Mark_Backup_Traffic" row (chain "prerouting") - same admin-creates/
+# LLM-enables workflow as enable_firewall_rule above, extended to mangle.
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_mangle_rule", {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "enable_mangle_rule", {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["disabled"] == "true"
+    assert preview["after"]["disabled"] == "no"
+    assert preview["before"]["chain"] == "prerouting"
+    rows = fake_connection.path("ip", "firewall", "mangle")._rows
+    assert next(r for r in rows if r["comment"] == "Mark_Backup_Traffic")["disabled"] == "true"
+
+    _content, applied = await mcp.call_tool(
+        "enable_mangle_rule", {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "mangle")._rows
+    assert next(r for r in rows if r["comment"] == "Mark_Backup_Traffic")["disabled"] == "no"
+    # No rule was created - still exactly the two rows the fixture started with.
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_disable_mangle_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "disable_mangle_rule", {"device_name": "core-switch", "comment": "mark-voip", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "mangle")._rows
+    assert next(r for r in rows if r["comment"] == "mark-voip")["disabled"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_unknown_comment_raises_clear_error_and_creates_nothing(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_mangle_rule", {"device_name": "core-switch", "comment": "no-such-rule", "confirm": True}
+        )
+    assert "no-such-rule" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "mangle")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_ambiguous_comment_raises_and_disambiguated_by_chain(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "mangle"): [
+                {".id": "*1", "chain": "prerouting", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_mangle_rule", {"device_name": "core-switch", "comment": "dup", "confirm": True})
+    assert "ambiguous" in str(exc_info.value).lower()
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "mangle")._rows)
+
+    _content, applied = await mcp.call_tool(
+        "enable_mangle_rule",
+        {"device_name": "core-switch", "comment": "dup", "chain": "forward", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "mangle")._rows}
+    assert rows == {"prerouting": "true", "forward": "no"}
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_rejects_empty_comment_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_mangle_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
+    assert "non-empty" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_mangle_rule_rejects_invalid_chain_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_mangle_rule",
+            {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "chain": "bad chain!", "confirm": True},
+        )
+    assert "chain" in str(exc_info.value).lower()
 
 
 # --- WireGuard management (v0.13) -------------------------------------------

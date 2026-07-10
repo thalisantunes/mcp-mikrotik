@@ -444,18 +444,63 @@ ALLOWLIST: dict[str, WriteOperation] = {
         action="remove",
         description="Remove a PPP/PPPoE secret by name (/ppp/secret remove).",
     ),
+    # v1.4: NAT & mangle rule TOGGLE - the exact same "never create, never
+    # touch any field but `disabled`" pattern v0.11's enable_firewall_rule/
+    # disable_firewall_rule established for /ip/firewall/filter, extended to
+    # the other two firewall menus. Resolved by the rule's `comment`
+    # (optionally narrowed by `chain`) - see the module comment above
+    # enable_nat_rule/enable_mangle_rule below for the full rationale.
+    "enable_nat_rule": WriteOperation(
+        name="enable_nat_rule",
+        path=("ip", "firewall", "nat"),
+        action="update",
+        description=(
+            "Enable an EXISTING firewall NAT rule (disabled=no), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
+    "disable_nat_rule": WriteOperation(
+        name="disable_nat_rule",
+        path=("ip", "firewall", "nat"),
+        action="update",
+        description=(
+            "Disable an EXISTING firewall NAT rule (disabled=yes), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
+    "enable_mangle_rule": WriteOperation(
+        name="enable_mangle_rule",
+        path=("ip", "firewall", "mangle"),
+        action="update",
+        description=(
+            "Enable an EXISTING firewall mangle rule (disabled=no), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
+    "disable_mangle_rule": WriteOperation(
+        name="disable_mangle_rule",
+        path=("ip", "firewall", "mangle"),
+        action="update",
+        description=(
+            "Disable an EXISTING firewall mangle rule (disabled=yes), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
     #   * reboot ("system/reboot"): no before/after preview is meaningful for
     #     a reboot, and a bad batch reboot across a fleet has no dry-run or
     #     rollback. Needs its own confirmation/cooldown policy first.
-    #   * firewall filter rule CREATION or general modification ("ip/firewall/
-    #     filter" add, or update of any field other than `disabled`): a
-    #     single wrong rule (e.g. one that blocks the API port itself) can
-    #     lock out all management access to the device with no remote
-    #     recovery. v0.11 deliberately only exposes toggling `disabled` on a
-    #     rule an admin already created and reviewed themselves (see
-    #     enable_firewall_rule/disable_firewall_rule above) - authoring or
+    #   * firewall filter/NAT/mangle rule CREATION or general modification
+    #     ("ip/firewall/filter|nat|mangle" add, or update of any field other
+    #     than `disabled`): a single wrong rule (e.g. one that blocks the API
+    #     port, or disables the masquerade rule providing a LAN's Internet
+    #     access) can lock out management access or connectivity with no
+    #     remote recovery. v0.11 (filter) and v1.4 (NAT/mangle) deliberately
+    #     only expose toggling `disabled` on a rule an admin already created
+    #     and reviewed themselves (see enable_firewall_rule/
+    #     disable_firewall_rule, enable_nat_rule/disable_nat_rule, and
+    #     enable_mangle_rule/disable_mangle_rule above) - authoring or
     #     otherwise editing a rule still needs staged/rollback support (e.g.
     #     RouterOS safe mode) before it belongs in this allowlist.
     #   * backup RESTORE ("system/backup/load"): same class of risk as
@@ -1896,14 +1941,31 @@ def _set_firewall_rule_disabled(
     disabled: bool,
     confirm: bool,
     chain: str | None,
+    resource_label: str = "Firewall filter rule",
 ) -> WritePreview:
     """Shared implementation behind enable_firewall_rule/disable_firewall_rule
     - see this section's module comment above for the full design rationale.
 
-    Resolves EXACTLY one /ip/firewall/filter row by `comment` (optionally
-    narrowed by `chain`). Raises ResourceNotFoundError if nothing matches -
-    NEVER creates a rule as a fallback. Raises AmbiguousResourceError if more
-    than one row still matches after narrowing.
+    v1.4: also the shared implementation behind enable_nat_rule/
+    disable_nat_rule and enable_mangle_rule/disable_mangle_rule (see the
+    "v1.4: NAT & mangle rule toggle" section further below) - the resolution
+    and toggle logic below never referenced anything filter-specific (it
+    already only ever touches `op.path`, whatever ALLOWLIST entry
+    `operation_name` names), so the SAME function is reused rather than
+    duplicated per menu. `resource_label` is the only thing that varies
+    between the three - it's what ResourceNotFoundError/AmbiguousResourceError
+    call the resolved thing in their error message (e.g. "Firewall filter
+    rule" vs "Firewall NAT rule" vs "Firewall mangle rule"), so an error for
+    one menu is never confused for another. The filter pair's own behavior is
+    UNCHANGED: `resource_label` defaults to "Firewall filter rule", exactly
+    what this function always raised before v1.4.
+
+    Resolves EXACTLY one row (in the ALLOWLIST entry's `op.path` menu -
+    /ip/firewall/filter, /ip/firewall/nat, or /ip/firewall/mangle) by
+    `comment` (optionally narrowed by `chain`). Raises ResourceNotFoundError
+    if nothing matches - NEVER creates a rule as a fallback. Raises
+    AmbiguousResourceError if more than one row still matches after
+    narrowing.
 
     The returned WritePreview's `before`/`after` are full copies of the
     matched row (every field RouterOS returned for it, not just `disabled`)
@@ -1911,7 +1973,7 @@ def _set_firewall_rule_disabled(
     (its `chain`/`action`/every other field) it is about to toggle before
     ever passing `confirm=true`, not just see the one field being written.
     That is exactly the "the operator knows which rule this is" safeguard
-    this pair of tools exists to provide.
+    this family of tools exists to provide.
     """
     op = _require_allowed(settings, operation_name)
 
@@ -1922,11 +1984,11 @@ def _set_firewall_rule_disabled(
     matches = _find_firewall_rule_rows(rows, validated_comment, validated_chain)
 
     if not matches:
-        raise ResourceNotFoundError(client.device.name, "Firewall filter rule", validated_comment)
+        raise ResourceNotFoundError(client.device.name, resource_label, validated_comment)
     if len(matches) > 1:
         raise AmbiguousResourceError(
             client.device.name,
-            "Firewall filter rule",
+            resource_label,
             validated_comment,
             [row.get("chain", "") for row in matches],
         )
@@ -1966,6 +2028,116 @@ def disable_firewall_rule(
     shares that comment. NEVER creates a rule."""
     return _set_firewall_rule_disabled(
         client, settings, "disable_firewall_rule", comment, disabled=True, confirm=confirm, chain=chain
+    )
+
+
+# --- v1.4: NAT & mangle rule toggle (by comment, never create) -----------
+#
+# enable_nat_rule/disable_nat_rule and enable_mangle_rule/disable_mangle_rule
+# extend v0.11's enable_firewall_rule/disable_firewall_rule pattern to the
+# other two firewall menus RouterOS exposes read-only today (`firewall_nat`,
+# and this round's new `firewall_mangle`): same "admin creates the rule ahead
+# of time, disabled, on the device; an LLM caller only ever flips its
+# `disabled` field later, resolved by the STABLE `comment` it was given" -
+# same lockout reasoning (a wrong NAT/mangle write can be just as disruptive
+# as a wrong filter rule - e.g. disabling the masquerade rule that provides a
+# whole LAN's Internet access), same never-guesses-which-row resolution
+# (ResourceNotFoundError / AmbiguousResourceError), same never-creates
+# guarantee. See ROADMAP.md's "Explicitly NOT on the roadmap" table entry -
+# rule creation/free-form edit stays out of scope for filter, NAT, AND mangle
+# alike, for the identical reason.
+#
+# `chain` narrows an ambiguous `comment` match exactly like the filter pair -
+# NAT's real chains are `srcnat`/`dstnat`, mangle's are `prerouting`/
+# `postrouting`/`forward`/`input`/`output` (plus custom jump-target chains on
+# either menu), but `validate_firewall_chain` is shape-only, not a fixed
+# enum, for the same reason it already isn't for filter: RouterOS allows
+# arbitrary custom chains there too.
+#
+# All four functions below are thin wrappers around the SAME
+# `_set_firewall_rule_disabled` helper the filter pair uses (see that
+# function's docstring above for why one shared implementation was kept
+# instead of copy-pasting it three times) - only `operation_name` (which
+# ALLOWLIST entry, and therefore which `op.path` menu) and `resource_label`
+# (what an error calls the resolved row) differ per menu.
+
+
+@_audited("enable_nat_rule")
+def enable_nat_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Enable an EXISTING firewall NAT rule (`disabled=no`), resolved by its
+    `comment` - optionally narrowed by `chain` (`srcnat`/`dstnat`) if more
+    than one rule shares that comment. NEVER creates a rule - see this
+    section's module comment above for the full admin-creates/LLM-enables
+    workflow (the same one enable_firewall_rule uses for /ip/firewall/filter)."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "enable_nat_rule",
+        comment,
+        disabled=False,
+        confirm=confirm,
+        chain=chain,
+        resource_label="Firewall NAT rule",
+    )
+
+
+@_audited("disable_nat_rule")
+def disable_nat_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Disable an EXISTING firewall NAT rule (`disabled=yes`), resolved by
+    its `comment` - optionally narrowed by `chain`. Same resolution/
+    never-creates guarantee as `enable_nat_rule`."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "disable_nat_rule",
+        comment,
+        disabled=True,
+        confirm=confirm,
+        chain=chain,
+        resource_label="Firewall NAT rule",
+    )
+
+
+@_audited("enable_mangle_rule")
+def enable_mangle_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Enable an EXISTING firewall mangle rule (`disabled=no`), resolved by
+    its `comment` - optionally narrowed by `chain` (e.g. `prerouting`/
+    `postrouting`/`forward`/`input`/`output`) if more than one rule shares
+    that comment. NEVER creates a rule."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "enable_mangle_rule",
+        comment,
+        disabled=False,
+        confirm=confirm,
+        chain=chain,
+        resource_label="Firewall mangle rule",
+    )
+
+
+@_audited("disable_mangle_rule")
+def disable_mangle_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Disable an EXISTING firewall mangle rule (`disabled=yes`), resolved by
+    its `comment` - optionally narrowed by `chain`. Same resolution/
+    never-creates guarantee as `enable_mangle_rule`."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "disable_mangle_rule",
+        comment,
+        disabled=True,
+        confirm=confirm,
+        chain=chain,
+        resource_label="Firewall mangle rule",
     )
 
 

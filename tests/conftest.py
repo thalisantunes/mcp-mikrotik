@@ -127,7 +127,45 @@ def fake_connection() -> FakeConnection:
                     "chain": "srcnat",
                     "action": "masquerade",
                     "out-interface": "ether1",
-                }
+                    "comment": "wan-masquerade",
+                    "disabled": "false",
+                },
+                # v1.4: a pre-created, disabled rule an admin left ready for
+                # enable_nat_rule to flip on by `comment` - the same
+                # "admin creates disabled, LLM enables" workflow
+                # ("ip", "firewall", "filter")'s "Bloqueio_Ataque_X" row
+                # above already establishes for filter.
+                {
+                    ".id": "*2",
+                    "chain": "dstnat",
+                    "action": "dst-nat",
+                    "to-addresses": "10.0.0.80",
+                    "to-ports": "3389",
+                    "comment": "rdp-forward-maintenance",
+                    "disabled": "true",
+                },
+            ],
+            # v1.4: firewall mangle - same two-row shape as
+            # ("ip", "firewall", "filter") above: one enabled row
+            # ("mark-voip", chain "forward") for disable_mangle_rule to flip
+            # off, and one pre-created disabled row ("Mark_Backup_Traffic",
+            # chain "prerouting") for enable_mangle_rule to flip on.
+            ("ip", "firewall", "mangle"): [
+                {
+                    ".id": "*1",
+                    "chain": "forward",
+                    "action": "mark-packet",
+                    "new-packet-mark": "voip",
+                    "comment": "mark-voip",
+                    "disabled": "false",
+                },
+                {
+                    ".id": "*2",
+                    "chain": "prerouting",
+                    "action": "mark-connection",
+                    "comment": "Mark_Backup_Traffic",
+                    "disabled": "true",
+                },
             ],
             ("system", "scheduler"): [
                 {

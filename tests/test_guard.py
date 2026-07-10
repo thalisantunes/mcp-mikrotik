@@ -2286,6 +2286,314 @@ def test_enable_firewall_rule_dispatches_via_allowlist_action(
     assert called == {"path": patched_op.path, "fields": {".id": "*2", "disabled": "no"}}
 
 
+def test_enable_firewall_rule_unknown_comment_error_names_filter_resource(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Regression guard for the v1.4 generalization of the shared
+    _set_firewall_rule_disabled helper (now also used by enable_nat_rule/
+    disable_nat_rule and enable_mangle_rule/disable_mangle_rule): the filter
+    pair's own resource_label default must be UNCHANGED - still "Firewall
+    filter rule", never accidentally "Firewall NAT rule"/"Firewall mangle
+    rule" from a shared default that drifted."""
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.enable_firewall_rule(client, settings_write_enabled, comment="no-such-comment", confirm=True)
+    assert "Firewall filter rule" in str(exc_info.value)
+
+
+# --- enable_nat_rule / disable_nat_rule (v1.4) -----------------------------
+#
+# The shared fixture's ("ip", "firewall", "nat") table (see conftest) has
+# two rows: "*1" (comment "wan-masquerade", chain "srcnat", enabled) and
+# "*2" (comment "rdp-forward-maintenance", chain "dstnat", pre-created
+# DISABLED - same admin-creates/LLM-enables workflow enable_firewall_rule's
+# fixture rows establish for filter).
+
+
+def test_enable_nat_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_nat_rule(client, settings, comment="rdp-forward-maintenance", confirm=True)
+
+
+def test_disable_nat_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.disable_nat_rule(client, settings, comment="wan-masquerade", confirm=True)
+
+
+def test_enable_nat_rule_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.enable_nat_rule(guarded_client, settings, comment="rdp-forward-maintenance", confirm=True)
+
+
+def test_enable_nat_rule_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.enable_nat_rule(client, settings_write_enabled, comment="rdp-forward-maintenance", confirm=False)
+    assert preview.applied is False
+    assert preview.before["disabled"] == "true"
+    assert preview.after["disabled"] == "no"
+    assert preview.before["chain"] == "dstnat"
+    row = next(
+        r for r in fake_connection.path("ip", "firewall", "nat")._rows if r["comment"] == "rdp-forward-maintenance"
+    )
+    assert row["disabled"] == "true"
+
+
+def test_enable_nat_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.enable_nat_rule(client, settings_write_enabled, comment="rdp-forward-maintenance", confirm=True)
+    assert applied.applied is True
+    row = next(
+        r for r in fake_connection.path("ip", "firewall", "nat")._rows if r["comment"] == "rdp-forward-maintenance"
+    )
+    assert row["disabled"] == "no"
+
+
+def test_disable_nat_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.disable_nat_rule(client, settings_write_enabled, comment="wan-masquerade", confirm=True)
+    assert applied.applied is True
+    row = next(r for r in fake_connection.path("ip", "firewall", "nat")._rows if r["comment"] == "wan-masquerade")
+    assert row["disabled"] == "yes"
+
+
+def test_enable_nat_rule_never_creates_a_rule(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    before_count = len(fake_connection.path("ip", "firewall", "nat")._rows)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.enable_nat_rule(client, settings_write_enabled, comment="no-such-comment", confirm=True)
+    assert "no-such-comment" in str(exc_info.value)
+    assert "Firewall NAT rule" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "nat")._rows) == before_count
+
+
+def test_disable_nat_rule_unknown_comment_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.disable_nat_rule(client, settings_write_enabled, comment="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_enable_nat_rule_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "nat"): [
+                {".id": "*1", "chain": "srcnat", "action": "masquerade", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "dstnat", "action": "dst-nat", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.enable_nat_rule(client, settings_write_enabled, comment="dup", confirm=True)
+    assert "dup" in str(exc_info.value)
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "nat")._rows)
+
+
+def test_enable_nat_rule_disambiguated_by_chain(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "nat"): [
+                {".id": "*1", "chain": "srcnat", "action": "masquerade", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "dstnat", "action": "dst-nat", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.enable_nat_rule(client, settings_write_enabled, comment="dup", chain="dstnat", confirm=True)
+    assert applied.applied is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "nat")._rows}
+    assert rows == {"srcnat": "true", "dstnat": "no"}
+
+
+def test_enable_nat_rule_rejects_empty_comment_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.enable_nat_rule(guarded_client, settings_write_enabled, comment="", confirm=True)
+
+
+def test_disable_nat_rule_rejects_invalid_chain_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.disable_nat_rule(
+            guarded_client, settings_write_enabled, comment="wan-masquerade", chain="bad chain!", confirm=True
+        )
+
+
+def test_enable_nat_rule_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["enable_nat_rule"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "enable_nat_rule", patched_op)
+
+    guard.enable_nat_rule(client, settings_write_enabled, comment="rdp-forward-maintenance", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*2", "disabled": "no"}}
+
+
+# --- enable_mangle_rule / disable_mangle_rule (v1.4) -----------------------
+#
+# The shared fixture's ("ip", "firewall", "mangle") table (see conftest) has
+# two rows: "*1" (comment "mark-voip", chain "forward", enabled) and "*2"
+# (comment "Mark_Backup_Traffic", chain "prerouting", pre-created DISABLED).
+
+
+def test_enable_mangle_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_mangle_rule(client, settings, comment="Mark_Backup_Traffic", confirm=True)
+
+
+def test_disable_mangle_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.disable_mangle_rule(client, settings, comment="mark-voip", confirm=True)
+
+
+def test_enable_mangle_rule_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.enable_mangle_rule(guarded_client, settings, comment="Mark_Backup_Traffic", confirm=True)
+
+
+def test_enable_mangle_rule_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.enable_mangle_rule(client, settings_write_enabled, comment="Mark_Backup_Traffic", confirm=False)
+    assert preview.applied is False
+    assert preview.before["disabled"] == "true"
+    assert preview.after["disabled"] == "no"
+    assert preview.before["chain"] == "prerouting"
+    row = next(
+        r for r in fake_connection.path("ip", "firewall", "mangle")._rows if r["comment"] == "Mark_Backup_Traffic"
+    )
+    assert row["disabled"] == "true"
+
+
+def test_enable_mangle_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.enable_mangle_rule(client, settings_write_enabled, comment="Mark_Backup_Traffic", confirm=True)
+    assert applied.applied is True
+    row = next(
+        r for r in fake_connection.path("ip", "firewall", "mangle")._rows if r["comment"] == "Mark_Backup_Traffic"
+    )
+    assert row["disabled"] == "no"
+
+
+def test_disable_mangle_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.disable_mangle_rule(client, settings_write_enabled, comment="mark-voip", confirm=True)
+    assert applied.applied is True
+    row = next(r for r in fake_connection.path("ip", "firewall", "mangle")._rows if r["comment"] == "mark-voip")
+    assert row["disabled"] == "yes"
+
+
+def test_enable_mangle_rule_never_creates_a_rule(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    before_count = len(fake_connection.path("ip", "firewall", "mangle")._rows)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.enable_mangle_rule(client, settings_write_enabled, comment="no-such-comment", confirm=True)
+    assert "no-such-comment" in str(exc_info.value)
+    assert "Firewall mangle rule" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "mangle")._rows) == before_count
+
+
+def test_disable_mangle_rule_unknown_comment_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.disable_mangle_rule(client, settings_write_enabled, comment="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_enable_mangle_rule_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "mangle"): [
+                {".id": "*1", "chain": "prerouting", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.enable_mangle_rule(client, settings_write_enabled, comment="dup", confirm=True)
+    assert "dup" in str(exc_info.value)
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "mangle")._rows)
+
+
+def test_enable_mangle_rule_disambiguated_by_chain(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "mangle"): [
+                {".id": "*1", "chain": "prerouting", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "mark-packet", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.enable_mangle_rule(client, settings_write_enabled, comment="dup", chain="forward", confirm=True)
+    assert applied.applied is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "mangle")._rows}
+    assert rows == {"prerouting": "true", "forward": "no"}
+
+
+def test_enable_mangle_rule_rejects_empty_comment_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.enable_mangle_rule(guarded_client, settings_write_enabled, comment="", confirm=True)
+
+
+def test_disable_mangle_rule_rejects_invalid_chain_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.disable_mangle_rule(
+            guarded_client, settings_write_enabled, comment="mark-voip", chain="bad chain!", confirm=True
+        )
+
+
+def test_enable_mangle_rule_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["enable_mangle_rule"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "enable_mangle_rule", patched_op)
+
+    guard.enable_mangle_rule(client, settings_write_enabled, comment="Mark_Backup_Traffic", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*2", "disabled": "no"}}
+
+
 # --- add_wireguard_interface / add_wireguard_peer / remove_wireguard_peer --
 # --- (v0.13) ------------------------------------------------------------
 #

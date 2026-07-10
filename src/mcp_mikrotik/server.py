@@ -9,13 +9,15 @@ add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule,
 add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
 add_hotspot_user, create_backup, add_vlan/remove_vlan, move_firewall_rule,
-add_ppp_secret/remove_ppp_secret -
+add_ppp_secret/remove_ppp_secret, enable_nat_rule/disable_nat_rule,
+enable_mangle_rule/disable_mangle_rule -
 see guard.py's ALLOWLIST for the full write-tool inventory), plus the
 read-only connection_tracking tool (v0.11), the read-only
 security_audit/security_events tools (v0.12 - see security.py), the
 read-only wireguard_interfaces tool (v0.13), three more read-only tools from
 v0.14 - hotspot_active, torch, list_backups - (v1.2) one more read-only
-tool - list_vlans - and (v1.3) one more read-only tool - ppp_secrets.
+tool - list_vlans - (v1.3) one more read-only tool - ppp_secrets - and
+(v1.4) one more read-only tool - firewall_mangle.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -518,6 +520,23 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules."""
         client = _client(device_name)
         return rows_to_list(client.path("ip", "firewall", "filter"))
+
+    @mcp.tool()
+    @_safe
+    def firewall_mangle(device_name: str) -> list[dict[str, Any]]:
+        """List IPv4 firewall mangle rules (/ip/firewall/mangle): chain
+        (e.g. prerouting/postrouting/forward/input/output, or a custom
+        jump-target chain), action (e.g. mark-connection/mark-packet/
+        mark-routing), comment, disabled, plus whatever other fields
+        RouterOS returns for a given rule (protocol, src/dst-address, etc -
+        these vary per rule/action, same as `firewall_filter`/`firewall_nat`
+        - not every rule has every field, and this returns each row as-is
+        rather than assuming a fixed shape). Read-only - does not add/
+        modify/remove rules. See "NAT & mangle rule toggle (by comment)"
+        below for the guarded enable_mangle_rule/disable_mangle_rule pair.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "firewall", "mangle"))
 
     @mcp.tool()
     @_safe
@@ -1687,6 +1706,105 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.disable_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    # --- v1.4: NAT & mangle rule toggle (by comment, never create) ------
+
+    @mcp.tool()
+    @_safe
+    def enable_nat_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Enable an EXISTING firewall NAT rule (`/ip/firewall/nat set
+        disabled=no`), resolved by its `comment` - optionally narrowed by
+        `chain` (`srcnat`/`dstnat`) if more than one rule shares that
+        comment.
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_firewall_rule` (see its docstring and README's "Firewall
+        rule toggle (by comment)" section) - extended to /ip/firewall/nat.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview - the FULL matched rule, not
+        just its `disabled` field - without changing anything; call again
+        with confirm=True to actually apply it. Errors clearly if no rule
+        matches `comment` (narrowed by `chain`), or if more than one still
+        does (`AmbiguousResourceError`) - never guesses which one to toggle.
+        """
+        client = _client(device_name)
+        preview = guard.enable_nat_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_nat_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Disable an EXISTING firewall NAT rule (`/ip/firewall/nat set
+        disabled=yes`), resolved by its `comment` - optionally narrowed by
+        `chain` (`srcnat`/`dstnat`).
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_nat_rule`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        no rule matches `comment` (narrowed by `chain`), or if more than one
+        still does (`AmbiguousResourceError`).
+        """
+        client = _client(device_name)
+        preview = guard.disable_nat_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def enable_mangle_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Enable an EXISTING firewall mangle rule (`/ip/firewall/mangle set
+        disabled=no`), resolved by its `comment` - optionally narrowed by
+        `chain` (e.g. `prerouting`/`postrouting`/`forward`/`input`/`output`)
+        if more than one rule shares that comment.
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_firewall_rule` - extended to /ip/firewall/mangle.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview - the FULL matched rule, not
+        just its `disabled` field - without changing anything; call again
+        with confirm=True to actually apply it. Errors clearly if no rule
+        matches `comment` (narrowed by `chain`), or if more than one still
+        does (`AmbiguousResourceError`) - never guesses which one to toggle.
+        """
+        client = _client(device_name)
+        preview = guard.enable_mangle_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_mangle_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Disable an EXISTING firewall mangle rule (`/ip/firewall/mangle set
+        disabled=yes`), resolved by its `comment` - optionally narrowed by
+        `chain`.
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_mangle_rule`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        no rule matches `comment` (narrowed by `chain`), or if more than one
+        still does (`AmbiguousResourceError`).
+        """
+        client = _client(device_name)
+        preview = guard.disable_mangle_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
         return asdict(preview)
 
     # --- v0.13: WireGuard VPN management ---------------------------------

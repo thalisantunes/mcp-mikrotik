@@ -3,6 +3,54 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.4.0] - 2026-07-10
+
+**NAT rule toggle + firewall mangle (read + toggle)**, extending v0.11's
+`enable_firewall_rule`/`disable_firewall_rule` pattern - resolve an EXISTING,
+admin-authored rule by its stable `comment`, flip only its `disabled` field,
+never create a rule - to the two other firewall menus this project already
+reads (`firewall_nat`) or now adds a read for (`firewall_mangle`). Same
+lockout reasoning as filter: a wrong write to NAT (e.g. disabling the
+masquerade rule providing a LAN's Internet access) or mangle can be just as
+disruptive as a wrong filter write, so rule creation/free-form edit stays out
+of scope for both, exactly like filter - see `ROADMAP.md`'s "Explicitly NOT
+on the roadmap".
+
+- `firewall_mangle` (read-only): lists `/ip/firewall/mangle` rows - chain
+  (`prerouting`/`postrouting`/`forward`/`input`/`output`, or a custom
+  jump-target chain), action, comment, disabled, plus whatever other fields
+  RouterOS returns for a given rule. Same passthrough formatting as
+  `firewall_filter`/`firewall_nat` - fields absent from a given rule (they
+  vary a lot by `action`) simply don't appear, rather than the tool
+  assuming a fixed shape.
+- `enable_nat_rule` / `disable_nat_rule` (guarded writes): toggle an
+  EXISTING `/ip/firewall/nat` rule's `disabled` field, resolved by
+  `comment` (optionally narrowed by `chain` - `srcnat`/`dstnat` - if more
+  than one rule shares that comment). `firewall_nat` itself already existed
+  (v0.4) as read-only; this round adds the write side.
+- `enable_mangle_rule` / `disable_mangle_rule` (guarded writes): same
+  toggle-by-comment pattern applied to `/ip/firewall/mangle`, optionally
+  narrowed by `chain`.
+- All four resolve **never falling back to creating a rule**: an unmatched
+  `comment` raises `ResourceNotFoundError`; a `comment` that still matches
+  more than one row after narrowing by `chain` raises
+  `AmbiguousResourceError` - never guesses which one to toggle. Identical
+  guarantee to `enable_firewall_rule`/`disable_firewall_rule`.
+- **Implementation**: `guard.py`'s private `_set_firewall_rule_disabled` -
+  the shared implementation behind the filter pair since v0.11 - is
+  GENERALIZED (one new `resource_label` keyword argument, defaulting to
+  `"Firewall filter rule"` so the filter pair's own behavior is byte-for-byte
+  unchanged) rather than copy-pasted three times; `_find_firewall_rule_rows`
+  needed no change at all, since it already only operated on an
+  already-fetched row list, never a hardcoded path. Filter's own test suite
+  passes unmodified, plus a new regression test
+  (`test_enable_firewall_rule_unknown_comment_error_names_filter_resource`)
+  pins the unchanged default. `validate_firewall_rule_comment`/
+  `validate_firewall_chain` (v0.11) are reused as-is - both were already
+  path-agnostic; `chain` stays shape-only (not a fixed enum) for NAT/mangle,
+  the same reasoning that already applied to filter's custom jump-target
+  chains.
+
 ## [1.3.0] - 2026-07-10
 
 **PPP/PPPoE secrets** (`/ppp/secret`), following the existing write-guard
