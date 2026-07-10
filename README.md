@@ -34,19 +34,19 @@ each of those is avoided here.
 
 ## Status
 
-**1.0.0.** Every planned tool round has shipped: the full read-tool
-inventory (interfaces, routing, DHCP, wireless, VPN/WireGuard, containers,
-LTE/5G, USB, hotspot, live traffic, backups, a heuristic security audit),
-guarded writes across identity/interfaces/wifi/bandwidth/DHCP/
-address-lists/PoE/containers/failover-routing/Netwatch/DNS/Wake-on-LAN/
-firewall-rule-toggle/WireGuard/hotspot-vouchers/backup, and the
-production-hardening layers this needs to run unattended against a real
-fleet - audit journal, correlation IDs, read retry, circuit breaker. See
-`CHANGELOG.md` for the full version-by-version history (what shipped in
-each v0.x round), and "Roadmap & non-goals" below for what's deliberately
-still out of scope, and why.
+**1.2.0.** Every planned tool round has shipped: the full read-tool
+inventory (interfaces, VLANs, routing, DHCP, wireless, VPN/WireGuard,
+containers, LTE/5G, USB, hotspot, live traffic, backups, a heuristic
+security audit), guarded writes across identity/interfaces/wifi/bandwidth/
+DHCP/address-lists/PoE/containers/failover-routing/Netwatch/DNS/
+Wake-on-LAN/firewall-rule-toggle/firewall-rule-reorder/WireGuard/
+hotspot-vouchers/backup/VLANs, and the production-hardening layers this
+needs to run unattended against a real fleet - audit journal, correlation
+IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
+version-by-version history (what shipped in each round), and "Roadmap &
+non-goals" below for what's deliberately still out of scope, and why.
 
-The full pytest suite currently has 1128 tests, all passing against an
+The full pytest suite currently has 1214 tests, all passing against an
 in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
 a 95% floor) - see "Development & CI" below.
 
@@ -189,6 +189,7 @@ representative exchanges:
 | `list_devices` | List configured devices (passwords never included). |
 | `system_info` | RouterOS identity + resource info (board, version, uptime, CPU/memory). |
 | `interfaces` | List interfaces; `include_disabled` to include disabled ones (default: excluded). |
+| `list_vlans` | List VLAN interfaces (`/interface/vlan`: name, vlan-id, parent interface, mtu, running, disabled, comment); `include_disabled` to include disabled ones (default: excluded), same convention as `interfaces`. See "VLAN management" below. |
 | `ip_addresses` | List IPv4 addresses. |
 | `ip_routes` | List the IPv4 routing table; optional `limit` (capped at 500). |
 | `neighbors` | List neighbors discovered via CDP/MNDP/LLDP. |
@@ -267,6 +268,9 @@ model" below for the full guard mechanism.
 | `remove_wireguard_peer` | Remove a WireGuard peer from an `interface`, resolved by `public_key` or `comment`. Errors if more than one peer still matches after narrowing (`AmbiguousResourceError`) - never guesses which one to remove. |
 | `add_hotspot_user` | Create a hotspot voucher user (`name`, `password`, optional `profile`/`limit_uptime`/`limit_bytes_total`). Refuses a duplicate `name`. **Result always includes `username`/`password`/`qr_payload`** - the plaintext password IS in the result (that's the point) but never in the audit journal. See "Hotspot vouchers" below. |
 | `create_backup` | Create a RouterOS system backup file (`name`, optional encryption `password`). Refuses to overwrite an existing `.backup` file of the same name. `password` never appears in the result or the audit journal. See "Backup" below. |
+| `add_vlan` | Create a VLAN interface (`/interface/vlan`): `name`, `vlan_id` (1-4094), parent `interface`, optional `mtu`/`comment`. Refuses a duplicate `name`. See "VLAN management" below. |
+| `remove_vlan` | Remove a VLAN interface by `name`. Errors if no VLAN interface matches. |
+| `move_firewall_rule` | Reorder an **EXISTING** firewall filter rule (`/ip/firewall/filter move`), resolved by its `comment` (optionally narrowed by `chain`) - same resolution as `enable_firewall_rule`/`disable_firewall_rule`. **Never creates or edits a rule's fields** - only its position changes, to either immediately before another rule (`before_comment`) or a given 0-based `position`. See "Firewall rule reorder (by comment)" below. |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
@@ -943,6 +947,63 @@ and reboots it, the same risk class as a remote reboot, with no meaningful
 before/after preview and no rollback if the wrong file (or the right file,
 at the wrong time) is loaded.
 
+### VLAN management (v1.2)
+
+`list_vlans` (read) lists `/interface/vlan` rows, excluding disabled ones by
+default - same `include_disabled` convention as `interfaces`. `add_vlan`
+(write, guarded) creates one: `name` (the new RouterOS interface name, e.g.
+`"vlan100"`), `vlan_id` (1-4094, the IEEE 802.1Q tag), and `interface` (the
+parent it rides on top of, e.g. `"bridge1"`/`"ether2"` - not verified to
+exist here; RouterOS itself rejects an unknown parent at write time).
+`mtu`/`comment` are optional. It refuses to create a duplicate `name`
+(`ResourceAlreadyExistsError`) rather than silently reconfiguring an
+existing VLAN interface. `remove_vlan` (write, guarded) removes one by
+`name`, erroring (`ResourceNotFoundError`) if it doesn't exist.
+
+```
+add_vlan(device_name="core-switch", name="vlan100", vlan_id=100, interface="bridge1", confirm=false)  # preview
+add_vlan(device_name="core-switch", name="vlan100", vlan_id=100, interface="bridge1", confirm=true)   # apply
+```
+
+### Firewall rule reorder (by comment) (v1.2)
+
+`move_firewall_rule` (write, guarded) reorders an **existing**
+`/ip/firewall/filter` rule - it never creates or otherwise edits a rule's
+fields (chain/action/etc); only its position in the chain's evaluation
+order changes. Same philosophy as `enable_firewall_rule`/
+`disable_firewall_rule` (v0.11) above: authoring or generally modifying a
+firewall rule stays out of scope (a wrong rule can lock out remote
+management with no way to recover it over the same connection), so this
+only exposes the narrow, safe operation of moving an admin-authored rule
+that already exists.
+
+**Resolution: `comment`, never a dynamic index** - the same STABLE,
+admin-controlled identifier `enable_firewall_rule`/`disable_firewall_rule`
+resolve a rule by, optionally narrowed by `chain` if more than one rule
+shares that comment. A `comment` that matches no rule raises
+`ResourceNotFoundError`; one that still matches more than one rule after
+narrowing raises `AmbiguousResourceError` - never guesses which one to
+move.
+
+**Destination: exactly one of two ways to say where.** `before_comment`
+moves the rule to appear immediately before an existing rule identified by
+its own comment (resolved the same way, and also subject to
+`AmbiguousResourceError` if it isn't unique); `position` moves it to a
+0-based index among the *other* rules (i.e. after the rule being moved is
+taken out of consideration) - a `position` at or beyond the end of that
+list moves it to the very end. Supplying both, or neither, raises
+`ValidationError`.
+
+```
+move_firewall_rule(device_name="core-switch", comment="Bloqueio_Ataque_X", position=0, confirm=false)  # preview
+move_firewall_rule(device_name="core-switch", comment="Bloqueio_Ataque_X", position=0, confirm=true)   # apply
+```
+
+The returned preview's `before`/`after` report the rule's `comment`/`chain`
+plus its current vs. new position - not the full row (unlike
+`enable_firewall_rule`/`disable_firewall_rule`'s preview), since no field on
+the rule itself is changing, only where it sits in the list.
+
 ## Security model
 
 This section is the single consolidated reference for every control this
@@ -1186,7 +1247,7 @@ pytest -q
 The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
-`client_factory` parameter on `build_server()`. It currently has 1128 tests,
+`client_factory` parameter on `build_server()`. It currently has 1214 tests,
 zero of which touch a real device or the network, at 100% line coverage.
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every push to `main`

@@ -61,7 +61,7 @@ def test_allowlist_only_contains_named_operations():
     for name, op in guard.ALLOWLIST.items():
         assert op.name == name
         assert isinstance(op.path, tuple) and op.path
-        assert op.action in {"update", "add", "remove", "start", "stop", "flush", "wol", "save"}
+        assert op.action in {"update", "add", "remove", "start", "stop", "flush", "wol", "save", "move"}
 
 
 def test_require_allowed_rejects_unknown_operation(settings_write_enabled: Settings):
@@ -2910,3 +2910,456 @@ def test_create_backup_dispatches_via_allowlist_action(
     guard.create_backup(client, settings_write_enabled, name="nightly-backup", confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {"name": "nightly-backup"}}
+
+
+# --- v1.2: add_vlan ----------------------------------------------------------
+
+
+def _vlan_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("interface", "vlan"): [
+                {".id": "*1", "name": "vlan100", "vlan-id": "100", "interface": "bridge1", "disabled": "false"},
+            ]
+        }
+    )
+
+
+def test_add_vlan_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_vlan(client, settings, name="vlan200", vlan_id=200, interface="bridge1", confirm=True)
+
+
+def test_add_vlan_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_vlan(guarded_client, settings, name="vlan200", vlan_id=200, interface="bridge1", confirm=True)
+
+
+def test_add_vlan_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_vlan(
+        client, settings_write_enabled, name="vlan200", vlan_id=200, interface="bridge1", confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "vlan200", "vlan-id": "200", "interface": "bridge1"}
+    names = {row["name"] for row in fake.path("interface", "vlan")._rows}
+    assert "vlan200" not in names
+
+
+def test_add_vlan_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_vlan(
+        client,
+        settings_write_enabled,
+        name="vlan200",
+        vlan_id=200,
+        interface="bridge1",
+        mtu=1500,
+        comment="guest network",
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    rows = fake.path("interface", "vlan")._rows
+    created = next(row for row in rows if row["name"] == "vlan200")
+    assert created["vlan-id"] == "200"
+    assert created["interface"] == "bridge1"
+    assert created["mtu"] == "1500"
+    assert created["comment"] == "guest network"
+
+
+def test_add_vlan_rejects_duplicate_name(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_vlan(client, settings_write_enabled, name="vlan100", vlan_id=101, interface="bridge1", confirm=True)
+    assert "vlan100" in str(exc_info.value)
+    rows = [row for row in fake.path("interface", "vlan")._rows if row["name"] == "vlan100"]
+    assert len(rows) == 1
+
+
+def test_add_vlan_rejects_invalid_vlan_id_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_vlan(
+            guarded_client, settings_write_enabled, name="vlan200", vlan_id=5000, interface="bridge1", confirm=True
+        )
+
+
+def test_add_vlan_rejects_invalid_name_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_vlan(
+            guarded_client, settings_write_enabled, name="bad name!", vlan_id=200, interface="bridge1", confirm=True
+        )
+
+
+def test_add_vlan_rejects_invalid_mtu_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_vlan(
+            guarded_client,
+            settings_write_enabled,
+            name="vlan200",
+            vlan_id=200,
+            interface="bridge1",
+            mtu=40,
+            confirm=True,
+        )
+
+
+def test_add_vlan_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_vlan"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_vlan", patched_op)
+
+    guard.add_vlan(client, settings_write_enabled, name="vlan200", vlan_id=200, interface="bridge1", confirm=True)
+
+    assert called == {
+        "path": patched_op.path,
+        "fields": {"name": "vlan200", "vlan-id": "200", "interface": "bridge1"},
+    }
+
+
+# --- v1.2: remove_vlan --------------------------------------------------------
+
+
+def test_remove_vlan_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_vlan(client, settings, name="vlan100", confirm=True)
+
+
+def test_remove_vlan_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_vlan(guarded_client, settings, name="vlan100", confirm=True)
+
+
+def test_remove_vlan_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_vlan(client, settings_write_enabled, name="vlan100", confirm=False)
+
+    assert preview.applied is False
+    assert preview.before["name"] == "vlan100"
+    assert preview.after == {}
+    names = {row["name"] for row in fake.path("interface", "vlan")._rows}
+    assert "vlan100" in names
+
+
+def test_remove_vlan_confirm_true_removes(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_vlan(client, settings_write_enabled, name="vlan100", confirm=True)
+
+    assert preview.applied is True
+    names = {row["name"] for row in fake.path("interface", "vlan")._rows}
+    assert "vlan100" not in names
+
+
+def test_remove_vlan_unknown_name_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_vlan(client, settings_write_enabled, name="ghost-vlan", confirm=True)
+    assert "ghost-vlan" in str(exc_info.value)
+
+
+def test_remove_vlan_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _vlan_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_vlan"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_vlan", patched_op)
+
+    guard.remove_vlan(client, settings_write_enabled, name="vlan100", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- v1.2: move_firewall_rule --------------------------------------------------
+
+
+def _move_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "forward", "action": "accept", "comment": "rule-a"},
+                {".id": "*2", "chain": "forward", "action": "accept", "comment": "rule-b"},
+                {".id": "*3", "chain": "forward", "action": "drop", "comment": "rule-c"},
+            ]
+        }
+    )
+
+
+def test_move_firewall_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.move_firewall_rule(client, settings, comment="rule-c", position=0, confirm=True)
+
+
+def test_move_firewall_rule_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.move_firewall_rule(guarded_client, settings, comment="rule-c", position=0, confirm=True)
+
+
+def test_move_firewall_rule_requires_exactly_one_of_before_comment_or_position(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.move_firewall_rule(guarded_client, settings_write_enabled, comment="rule-c", confirm=True)
+
+
+def test_move_firewall_rule_rejects_both_before_comment_and_position(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.move_firewall_rule(
+            guarded_client,
+            settings_write_enabled,
+            comment="rule-c",
+            before_comment="rule-a",
+            position=0,
+            confirm=True,
+        )
+
+
+def test_move_firewall_rule_by_position_preview_shows_from_to(settings_write_enabled: Settings, device: Device):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(client, settings_write_enabled, comment="rule-c", position=0, confirm=False)
+
+    assert preview.applied is False
+    assert preview.before == {"comment": "rule-c", "chain": "forward", "position": 2}
+    assert preview.after == {"comment": "rule-c", "chain": "forward", "position": 0}
+    # Nothing was reordered yet.
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-a", "rule-b", "rule-c"]
+
+
+def test_move_firewall_rule_by_position_confirm_true_reorders(settings_write_enabled: Settings, device: Device):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(client, settings_write_enabled, comment="rule-c", position=0, confirm=True)
+
+    assert preview.applied is True
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-c", "rule-a", "rule-b"]
+
+
+def test_move_firewall_rule_by_position_beyond_end_moves_to_end(settings_write_enabled: Settings, device: Device):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(client, settings_write_enabled, comment="rule-a", position=99, confirm=True)
+
+    assert preview.after["position"] == 2
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-b", "rule-c", "rule-a"]
+
+
+def test_move_firewall_rule_by_before_comment_confirm_true_reorders(settings_write_enabled: Settings, device: Device):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(
+        client, settings_write_enabled, comment="rule-c", before_comment="rule-a", confirm=True
+    )
+
+    assert preview.applied is True
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-c", "rule-a", "rule-b"]
+
+
+def test_move_firewall_rule_never_edits_rule_fields(settings_write_enabled: Settings, device: Device):
+    """The tool's ONE job is to reorder - it must never touch a rule's own
+    chain/action/etc, only its position, exactly like enable_firewall_rule/
+    disable_firewall_rule never touch anything but `disabled`."""
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    guard.move_firewall_rule(client, settings_write_enabled, comment="rule-c", position=0, confirm=True)
+
+    row = next(r for r in fake.path("ip", "firewall", "filter")._rows if r["comment"] == "rule-c")
+    assert row["action"] == "drop"
+    assert row["chain"] == "forward"
+
+
+def test_move_firewall_rule_unknown_comment_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.move_firewall_rule(client, settings_write_enabled, comment="ghost", position=0, confirm=True)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_move_firewall_rule_unknown_before_comment_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.move_firewall_rule(client, settings_write_enabled, comment="rule-a", before_comment="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+    # Nothing was reordered.
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-a", "rule-b", "rule-c"]
+
+
+def test_move_firewall_rule_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.move_firewall_rule(client, settings_write_enabled, comment="dup", position=0, confirm=True)
+    assert "dup" in str(exc_info.value)
+    # Neither row was touched.
+    order = [row[".id"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["*1", "*2"]
+
+
+def test_move_firewall_rule_disambiguated_by_chain(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup"},
+                {".id": "*2", "chain": "forward", "action": "accept", "comment": "anchor"},
+                {".id": "*3", "chain": "forward", "action": "drop", "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(
+        client, settings_write_enabled, comment="dup", chain="forward", before_comment="anchor", confirm=True
+    )
+    assert preview.applied is True
+    order = [row[".id"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["*1", "*3", "*2"]
+
+
+def test_move_firewall_rule_ambiguous_before_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "target"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup"},
+                {".id": "*3", "chain": "output", "action": "drop", "comment": "dup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.move_firewall_rule(client, settings_write_enabled, comment="target", before_comment="dup", confirm=True)
+    assert "dup" in str(exc_info.value)
+
+
+def test_move_firewall_rule_chain_disambiguates_before_comment(settings_write_enabled: Settings, device: Device):
+    # 'dup' exists in two chains; chain='forward' must narrow the DESTINATION too,
+    # not only the target rule - otherwise this would raise AmbiguousResourceError.
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*2", "chain": "forward", "action": "accept", "comment": "dup"},
+                {".id": "*3", "chain": "input", "action": "drop", "comment": "dup"},
+                {".id": "*1", "chain": "forward", "action": "drop", "comment": "target"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.move_firewall_rule(
+        client, settings_write_enabled, comment="target", chain="forward", before_comment="dup", confirm=True
+    )
+    assert preview.applied is True
+    order = [row[".id"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["*1", "*2", "*3"]
+
+
+def test_move_firewall_rule_rejects_empty_comment_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.move_firewall_rule(guarded_client, settings_write_enabled, comment="", position=0, confirm=True)
+
+
+def test_move_firewall_rule_rejects_invalid_position_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.move_firewall_rule(guarded_client, settings_write_enabled, comment="rule-c", position=-1, confirm=True)
+
+
+def test_move_firewall_rule_rejects_invalid_chain_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.move_firewall_rule(
+            guarded_client, settings_write_enabled, comment="rule-c", chain="bad chain!", position=0, confirm=True
+        )
+
+
+def test_move_firewall_rule_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _move_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["move_firewall_rule"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "move_firewall_rule", patched_op)
+
+    guard.move_firewall_rule(client, settings_write_enabled, comment="rule-c", position=0, confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"id": "*3", "destination": "*1"}}

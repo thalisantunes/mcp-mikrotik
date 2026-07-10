@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "list_devices",
     "system_info",
     "interfaces",
+    "list_vlans",
     "ip_addresses",
     "ip_routes",
     "neighbors",
@@ -91,6 +92,9 @@ EXPECTED_TOOLS = {
     "list_backups",
     "add_hotspot_user",
     "create_backup",
+    "add_vlan",
+    "remove_vlan",
+    "move_firewall_rule",
 }
 
 
@@ -3007,7 +3011,7 @@ def test_server_never_calls_write_primitives_directly():
     server_src = (Path(__file__).resolve().parent.parent / "src" / "mcp_mikrotik" / "server.py").read_text(
         encoding="utf-8"
     )
-    forbidden = re.compile(r"\.(update|add|remove|start|stop|flush|wol|save)\(")
+    forbidden = re.compile(r"\.(update|add|remove|start|stop|flush|wol|save|move)\(")
     match = forbidden.search(server_src)
     assert match is None, (
         f"server.py contains a direct write-primitive call ({match.group() if match else ''!r}) - "
@@ -3450,3 +3454,289 @@ async def test_create_backup_password_never_in_result_or_audit_journal(
     assert "file-encrypt-key" not in raw
     event = json.loads(raw.strip().splitlines()[-1])
     assert "password" not in event["summary"]["after"]
+
+
+# --- list_vlans / add_vlan / remove_vlan (v1.2) ------------------------------
+
+
+def _vlan_fake() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("interface", "vlan"): [
+                {".id": "*1", "name": "vlan100", "vlan-id": "100", "interface": "bridge1", "disabled": "false"},
+                {".id": "*2", "name": "vlan200", "vlan-id": "200", "interface": "bridge1", "disabled": "true"},
+            ]
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_vlans_filters_disabled_by_default(settings: Settings):
+    fake = _vlan_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("list_vlans", {"device_name": "core-switch"})
+    names = {row["name"] for row in result["result"]}
+    assert names == {"vlan100"}
+
+    _content, result_all = await mcp.call_tool("list_vlans", {"device_name": "core-switch", "include_disabled": True})
+    names_all = {row["name"] for row in result_all["result"]}
+    assert names_all == {"vlan100", "vlan200"}
+
+
+@pytest.mark.asyncio
+async def test_add_vlan_blocked_read_only_by_default(settings: Settings):
+    fake = _vlan_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_vlan",
+            {"device_name": "core-switch", "name": "vlan300", "vlan_id": 300, "interface": "bridge1", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_vlan_preview_then_confirm(device: Device):
+    fake = _vlan_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "add_vlan",
+        {
+            "device_name": "core-switch",
+            "name": "vlan300",
+            "vlan_id": 300,
+            "interface": "bridge1",
+            "comment": "voice",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+    _content, applied = await mcp.call_tool(
+        "add_vlan",
+        {
+            "device_name": "core-switch",
+            "name": "vlan300",
+            "vlan_id": 300,
+            "interface": "bridge1",
+            "comment": "voice",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    rows = fake.path("interface", "vlan")._rows
+    created = next(row for row in rows if row["name"] == "vlan300")
+    assert created["vlan-id"] == "300"
+    assert created["interface"] == "bridge1"
+    assert created["comment"] == "voice"
+
+
+@pytest.mark.asyncio
+async def test_add_vlan_rejects_duplicate_name(device: Device):
+    fake = _vlan_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_vlan",
+            {"device_name": "core-switch", "name": "vlan100", "vlan_id": 101, "interface": "bridge1", "confirm": True},
+        )
+    assert "already exists" in str(exc_info.value)
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_vlan_rejects_invalid_vlan_id_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_vlan",
+            {
+                "device_name": "core-switch",
+                "name": "vlan300",
+                "vlan_id": 5000,
+                "interface": "bridge1",
+                "confirm": True,
+            },
+        )
+    assert "vlan_id" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_vlan_blocked_read_only_by_default(settings: Settings):
+    fake = _vlan_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_vlan", {"device_name": "core-switch", "name": "vlan100", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_remove_vlan_preview_then_confirm(device: Device):
+    fake = _vlan_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_vlan", {"device_name": "core-switch", "name": "vlan100", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+    _content, applied = await mcp.call_tool(
+        "remove_vlan", {"device_name": "core-switch", "name": "vlan100", "confirm": True}
+    )
+    assert applied["applied"] is True
+    names = {row["name"] for row in fake.path("interface", "vlan")._rows}
+    assert names == {"vlan200"}
+
+
+@pytest.mark.asyncio
+async def test_remove_vlan_unknown_name_raises_clear_error(device: Device):
+    fake = _vlan_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_vlan", {"device_name": "core-switch", "name": "ghost-vlan", "confirm": True})
+    assert "ghost-vlan" in str(exc_info.value)
+    assert len(fake.path("interface", "vlan")._rows) == 2
+
+
+# --- move_firewall_rule (v1.2) -----------------------------------------------
+
+
+def _move_fake() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "forward", "action": "accept", "comment": "rule-a"},
+                {".id": "*2", "chain": "forward", "action": "accept", "comment": "rule-b"},
+                {".id": "*3", "chain": "forward", "action": "drop", "comment": "rule-c"},
+            ]
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_blocked_read_only_by_default(settings: Settings):
+    fake = _move_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "move_firewall_rule", {"device_name": "core-switch", "comment": "rule-c", "position": 0, "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-a", "rule-b", "rule-c"]
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_preview_then_confirm_by_position(device: Device):
+    fake = _move_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "move_firewall_rule", {"device_name": "core-switch", "comment": "rule-c", "position": 0, "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"] == {"comment": "rule-c", "chain": "forward", "position": 2}
+    assert preview["after"] == {"comment": "rule-c", "chain": "forward", "position": 0}
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-a", "rule-b", "rule-c"]
+
+    _content, applied = await mcp.call_tool(
+        "move_firewall_rule", {"device_name": "core-switch", "comment": "rule-c", "position": 0, "confirm": True}
+    )
+    assert applied["applied"] is True
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-c", "rule-a", "rule-b"]
+    # Never edited any rule's own fields - only reordered.
+    moved = next(row for row in fake.path("ip", "firewall", "filter")._rows if row["comment"] == "rule-c")
+    assert moved["action"] == "drop"
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_by_before_comment(device: Device):
+    fake = _move_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "move_firewall_rule",
+        {"device_name": "core-switch", "comment": "rule-c", "before_comment": "rule-a", "confirm": True},
+    )
+    assert applied["applied"] is True
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-c", "rule-a", "rule-b"]
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_requires_exactly_one_of_before_comment_or_position(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("move_firewall_rule", {"device_name": "core-switch", "comment": "rule-c", "confirm": True})
+    assert "exactly one" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_unknown_comment_raises_clear_error_and_creates_nothing(device: Device):
+    fake = _move_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "move_firewall_rule", {"device_name": "core-switch", "comment": "ghost", "position": 0, "confirm": True}
+        )
+    assert "ghost" in str(exc_info.value)
+    order = [row["comment"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["rule-a", "rule-b", "rule-c"]
+
+
+@pytest.mark.asyncio
+async def test_move_firewall_rule_ambiguous_comment_raises_and_disambiguated_by_chain(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup"},
+                {".id": "*2", "chain": "forward", "action": "accept", "comment": "anchor"},
+                {".id": "*3", "chain": "forward", "action": "drop", "comment": "dup"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "move_firewall_rule",
+            {"device_name": "core-switch", "comment": "dup", "before_comment": "anchor", "confirm": True},
+        )
+    assert "ambiguous" in str(exc_info.value).lower()
+
+    _content, applied = await mcp.call_tool(
+        "move_firewall_rule",
+        {
+            "device_name": "core-switch",
+            "comment": "dup",
+            "chain": "forward",
+            "before_comment": "anchor",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    order = [row[".id"] for row in fake.path("ip", "firewall", "filter")._rows]
+    assert order == ["*1", "*3", "*2"]

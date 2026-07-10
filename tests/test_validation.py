@@ -18,12 +18,14 @@ from mcp_mikrotik.validation import (
     validate_dst_address,
     validate_firewall_chain,
     validate_firewall_rule_comment,
+    validate_firewall_rule_position,
     validate_hotspot_password,
     validate_hotspot_profile,
     validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
+    validate_mtu,
     validate_ping_address,
     validate_poe_out,
     validate_port,
@@ -32,6 +34,7 @@ from mcp_mikrotik.validation import (
     validate_route_gateway,
     validate_target,
     validate_timeout,
+    validate_vlan_id,
     validate_wireguard_key,
 )
 
@@ -800,3 +803,62 @@ def test_validate_backup_password_rejects_too_long():
 def test_validate_backup_password_rejects_control_characters():
     with pytest.raises(ValidationError, match="control characters"):
         validate_backup_password("bad\npassword")
+
+
+# --- validate_vlan_id (v1.2) -------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [1, 2, 100, 4094])
+def test_validate_vlan_id_accepts_valid(value: int):
+    assert validate_vlan_id(value) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 4095, 10000])
+def test_validate_vlan_id_rejects_out_of_range(value: int):
+    with pytest.raises(ValidationError, match="out of range"):
+        validate_vlan_id(value)
+
+
+@pytest.mark.parametrize("value", ["1", None, 1.5, True, False])
+def test_validate_vlan_id_rejects_non_int(value):
+    with pytest.raises(ValidationError):
+        validate_vlan_id(value)  # type: ignore[arg-type]
+
+
+# --- validate_mtu (v1.2) -----------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [68, 1500, 9000, 65535])
+def test_validate_mtu_accepts_valid(value: int):
+    assert validate_mtu(value) == value
+
+
+@pytest.mark.parametrize("value", [0, 67, -1, 65536])
+def test_validate_mtu_rejects_out_of_range(value: int):
+    with pytest.raises(ValidationError, match="out of range"):
+        validate_mtu(value)
+
+
+@pytest.mark.parametrize("value", ["1500", None, 1.5, True, False])
+def test_validate_mtu_rejects_non_int(value):
+    with pytest.raises(ValidationError):
+        validate_mtu(value)  # type: ignore[arg-type]
+
+
+# --- validate_firewall_rule_position (v1.2) ----------------------------------
+
+
+@pytest.mark.parametrize("value", [0, 1, 100])
+def test_validate_firewall_rule_position_accepts_valid(value: int):
+    assert validate_firewall_rule_position(value) == value
+
+
+def test_validate_firewall_rule_position_rejects_negative():
+    with pytest.raises(ValidationError, match="zero or greater"):
+        validate_firewall_rule_position(-1)
+
+
+@pytest.mark.parametrize("value", ["0", None, 1.5, True, False])
+def test_validate_firewall_rule_position_rejects_non_int(value):
+    with pytest.raises(ValidationError):
+        validate_firewall_rule_position(value)  # type: ignore[arg-type]

@@ -671,6 +671,43 @@ class MikrotikClient:
 
         self._execute_once("/".join(segments) + "/save", _do)
 
+    # --- v1.2: firewall filter rule reorder (move) --------------------------
+    #
+    # /ip/firewall/filter move is another RouterOS ACTION command, in the
+    # same family as start()/stop() above: it targets specific existing
+    # row(s) rather than being a standalone one-shot command like
+    # flush()/wol()/save(), so it uses the same `path(*segments)(cmd,
+    # **kwargs)` dispatch form those two use - just with RouterOS's own
+    # `move` parameter names (`numbers` selects the row being moved,
+    # `destination` - optional - is the row it should be moved to appear
+    # immediately BEFORE; omitted entirely means "move to the end").
+    # guard.ALLOWLIST["move_firewall_rule"] names this method via its
+    # `action` field ("move"), dispatched through the same
+    # `getattr(client, op.action)` every other guarded write uses - never
+    # called directly by name from guard.py or server.py.
+
+    def move(self, *segments: str, id: str, destination: str | None = None) -> None:
+        """Run `/ip/firewall/filter move` (reorder one existing rule) - see
+        guard.move_firewall_rule. `id` (RouterOS `numbers=`) identifies the
+        rule being moved; `destination` (RouterOS `destination=`), if given,
+        is the `.id` of the rule it should end up immediately before -
+        omitted, the rule moves to the end of its chain's list. Both are
+        expected to already be resolved/validated by guard.py against rows
+        just read from the device - never caller-supplied raw text.
+
+        No retry, same reasoning as every other write primitive in this
+        section (idempotency isn't guaranteed for a reorder any more than
+        for add/update/remove).
+        """
+
+        def _do(connection: RouterosConnection) -> None:
+            kwargs: dict[str, Any] = {"numbers": id}
+            if destination is not None:
+                kwargs["destination"] = destination
+            connection.path(*segments)("move", **kwargs)
+
+        self._execute_once("/".join(segments) + "/move", _do)
+
     def close(self) -> None:
         if self._connection is not None:
             with contextlib.suppress(Exception):

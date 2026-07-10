@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.2.0] - 2026-07-10
+
+Two new feature areas, both following the existing write-guard model
+exactly (read-only by default, every write routed through `guard.py`'s
+allowlist, confirm/preview before applying, audit-journaled).
+
+- **VLAN management** (`/interface/vlan`): `list_vlans` (read-only, excludes
+  disabled VLANs by default like `interfaces`), `add_vlan` (guarded write -
+  `name`, `vlan_id` 1-4094, parent `interface`, optional `mtu`/`comment`;
+  refuses a duplicate `name`), and `remove_vlan` (guarded write - by `name`;
+  errors if it doesn't exist). Two new validators added (`validate_vlan_id`,
+  `validate_mtu`) - `name`/`interface` reuse the existing
+  `validate_interface_name`.
+- **Firewall filter rule reorder**: `move_firewall_rule` (guarded write -
+  `/ip/firewall/filter move`), resolved by the rule's `comment` (optionally
+  narrowed by `chain`, the same resolution `enable_firewall_rule`/
+  `disable_firewall_rule` use). NEVER creates or edits a rule's fields -
+  only its position in the chain's evaluation order changes, to either
+  immediately before another rule (`before_comment`) or a given 0-based
+  index (`position`). This is the first `guard.ALLOWLIST` entry whose
+  `action` is `"move"` - a fourth kind of RouterOS ACTION command alongside
+  `start`/`stop`, `flush`/`wol`, and `save` - so `MikrotikClient` gained a
+  new `move()` write primitive, and the `test_server_never_calls_write_primitives_directly`
+  meta-test's forbidden-pattern regex now also covers `.move(`.
+
 ## [Unreleased]
 
 Open-source-readiness pass: no new tool, no behavior change - CI hardening,

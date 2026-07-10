@@ -85,7 +85,15 @@ class FakePath:
         unknown id. Mutates a `status` field on the matching row so tests can
         observe the transition, exactly like update() mutates whichever
         field was set.
+
+        v1.2: `move` (client.MikrotikClient.move) is handled separately
+        below - it addresses rows via RouterOS's own `numbers`/`destination`
+        parameter names, not `.id`, and reorders `self._rows` instead of
+        mutating a field.
         """
+        if cmd == "move":
+            self._move(kwargs.get("numbers"), kwargs.get("destination"))
+            return []
         row_id = kwargs.get(".id")
         for row in self._rows:
             if row.get(".id") == row_id:
@@ -95,6 +103,29 @@ class FakePath:
                     row["status"] = "stopped"
                 return []
         raise LibRouterosError(f"no such item (id={row_id!r})")
+
+    def _move(self, numbers: str | None, destination: str | None) -> None:
+        """Reorder `self._rows` to mirror RouterOS's `/.../move
+        numbers=<id> destination=<id>` semantics: the row identified by
+        `numbers` is moved to appear immediately BEFORE the row identified by
+        `destination`; if `destination` is omitted, the row moves to the end
+        of the list instead. Raises LibRouterosError (mirroring a real
+        device) if either id doesn't match an existing row - the source row
+        is put back where it was before raising, so a failed move never
+        leaves `self._rows` in a half-reordered state.
+        """
+        source_idx = next((i for i, row in enumerate(self._rows) if row.get(".id") == numbers), None)
+        if source_idx is None:
+            raise LibRouterosError(f"no such item (id={numbers!r})")
+        row = self._rows.pop(source_idx)
+        if destination is None:
+            self._rows.append(row)
+            return
+        dest_idx = next((i for i, candidate in enumerate(self._rows) if candidate.get(".id") == destination), None)
+        if dest_idx is None:
+            self._rows.insert(source_idx, row)
+            raise LibRouterosError(f"no such item (id={destination!r})")
+        self._rows.insert(dest_idx, row)
 
 
 def _once_reply_stream(reply: dict[str, Any] | None):

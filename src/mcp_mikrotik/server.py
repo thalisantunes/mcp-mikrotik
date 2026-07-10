@@ -8,14 +8,15 @@ set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule,
 add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
-add_hotspot_user, create_backup - see guard.py's ALLOWLIST for the full
-write-tool inventory), plus the read-only connection_tracking tool (v0.11),
-the read-only security_audit/security_events tools (v0.12 - see
-security.py), the read-only wireguard_interfaces tool (v0.13), and (v0.14,
-the last feature round before 1.0) three more read-only tools -
-hotspot_active, torch, list_backups. Transport is stdio only - this process
-is meant to run on the operator's own machine, launched by an MCP client
-(e.g. Claude Code) over stdio, with no network exposure at all.
+add_hotspot_user, create_backup, add_vlan/remove_vlan, move_firewall_rule -
+see guard.py's ALLOWLIST for the full write-tool inventory), plus the
+read-only connection_tracking tool (v0.11), the read-only
+security_audit/security_events tools (v0.12 - see security.py), the
+read-only wireguard_interfaces tool (v0.13), three more read-only tools from
+v0.14 - hotspot_active, torch, list_backups - and (v1.2) one more read-only
+tool - list_vlans. Transport is stdio only - this process is meant to run on
+the operator's own machine, launched by an MCP client (e.g. Claude Code)
+over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -189,6 +190,19 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """List network interfaces on a device."""
         client = _client(device_name)
         return filter_disabled(client.path("interface"), include_disabled)
+
+    @mcp.tool()
+    @_safe
+    def list_vlans(device_name: str, include_disabled: bool = False) -> list[dict[str, Any]]:
+        """List VLAN interfaces (`/interface/vlan`): `name`, `vlan-id`,
+        `interface` (the parent interface it rides on top of), `mtu`,
+        `running`, `disabled`, `comment` (if set).
+
+        Excludes disabled VLAN interfaces by default, like `interfaces`;
+        pass `include_disabled=True` to see them too.
+        """
+        client = _client(device_name)
+        return filter_disabled(client.path("interface", "vlan"), include_disabled)
 
     @mcp.tool()
     @_safe
@@ -1849,6 +1863,105 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.create_backup(client, settings, name=name, password=password, confirm=confirm)
+        return asdict(preview)
+
+    # --- v1.2: VLAN management + firewall rule reorder -------------------
+
+    @mcp.tool()
+    @_safe
+    def add_vlan(
+        device_name: str,
+        name: str,
+        vlan_id: int,
+        interface: str,
+        mtu: int | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a VLAN interface (`/interface/vlan add`): `name` (the new
+        RouterOS interface name, e.g. "vlan100"), `vlan_id` (1-4094, the
+        IEEE 802.1Q tag), `interface` (the parent interface it rides on top
+        of, e.g. "bridge1"/"ether2" - not verified to exist here; RouterOS
+        itself rejects an unknown one at write time). `mtu`/`comment` are
+        optional.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually create it. Errors clearly
+        (without creating anything) if `name` already exists on the device -
+        it never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_vlan(
+            client,
+            settings,
+            name=name,
+            vlan_id=vlan_id,
+            interface=interface,
+            mtu=mtu,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_vlan(device_name: str, name: str, confirm: bool = False) -> dict[str, Any]:
+        """Remove a VLAN interface (`/interface/vlan remove`) by `name`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually remove it. Errors clearly
+        if no VLAN interface matches `name`.
+        """
+        client = _client(device_name)
+        preview = guard.remove_vlan(client, settings, name=name, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def move_firewall_rule(
+        device_name: str,
+        comment: str,
+        chain: str | None = None,
+        before_comment: str | None = None,
+        position: int | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Reorder an EXISTING firewall filter rule (`/ip/firewall/filter
+        move`), resolved by its `comment` - optionally narrowed by `chain`
+        if more than one rule shares that comment, same resolution
+        `enable_firewall_rule`/`disable_firewall_rule` use.
+
+        SAFE BY DESIGN: this NEVER creates or otherwise edits a rule's
+        fields - only its position in the chain's evaluation order changes.
+
+        Exactly one of `before_comment` (move the rule to appear immediately
+        before the EXISTING rule with this comment) or `position` (move the
+        rule to this 0-based index among the OTHER rules - a value at or
+        beyond the end of that list moves it to the very end) must be given.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (the rule's `comment`/`chain`
+        plus its current vs. new position) without changing anything; call
+        again with confirm=True to actually apply it. Errors clearly if no
+        rule matches `comment` (narrowed by `chain`), if `before_comment` is
+        given but matches no rule, or if either still matches more than one
+        rule (`AmbiguousResourceError`) - never guesses.
+        """
+        client = _client(device_name)
+        preview = guard.move_firewall_rule(
+            client,
+            settings,
+            comment=comment,
+            chain=chain,
+            before_comment=before_comment,
+            position=position,
+            confirm=confirm,
+        )
         return asdict(preview)
 
     return mcp

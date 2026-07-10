@@ -361,6 +361,40 @@ def test_save_wraps_transport_errors_as_device_command_error(device: Device, exc
     assert device.name in str(exc_info.value)
 
 
+# --- v1.2: move (RouterOS ACTION command, path(*segments)(cmd, **kwargs)) --
+
+
+def test_move_dispatches_with_structured_numbers_and_destination(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    fake_connection._data[("ip", "firewall", "filter")] = [
+        {".id": "*1", "comment": "rule-a"},
+        {".id": "*2", "comment": "rule-b"},
+        {".id": "*3", "comment": "rule-c"},
+    ]
+    client.move("ip", "firewall", "filter", id="*3", destination="*2")
+    rows = [row["comment"] for row in fake_connection.path("ip", "firewall", "filter")._rows]
+    assert rows == ["rule-a", "rule-c", "rule-b"]
+
+
+def test_move_without_destination_moves_to_the_end(client: MikrotikClient, fake_connection: FakeConnection):
+    fake_connection._data[("ip", "firewall", "filter")] = [
+        {".id": "*1", "comment": "rule-a"},
+        {".id": "*2", "comment": "rule-b"},
+    ]
+    client.move("ip", "firewall", "filter", id="*1")
+    rows = [row["comment"] for row in fake_connection.path("ip", "firewall", "filter")._rows]
+    assert rows == ["rule-b", "rule-a"]
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_move_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.move("ip", "firewall", "filter", id="*1")
+    assert device.name in str(exc_info.value)
+
+
 def test_close_is_idempotent(client: MikrotikClient, fake_connection: FakeConnection):
     client.close()
     assert fake_connection.closed is True

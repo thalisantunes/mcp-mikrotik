@@ -811,3 +811,69 @@ def validate_backup_password(value: str) -> str:
     if _COMMENT_UNSAFE.search(value):
         raise ValidationError("Backup password contains control characters, which are not allowed.")
     return value
+
+
+# --- v1.2: VLAN management + firewall rule reorder --------------------------
+#
+# add_vlan/remove_vlan (guard.py) manage `/interface/vlan` rows. A VLAN
+# interface `name` (the RouterOS-side interface name, e.g. "vlan100") and its
+# `interface` (the parent interface it rides on top of, e.g. "bridge1") both
+# reuse `validate_interface_name`'s conservative charset - no separate
+# validator needed, since a VLAN interface name and any other interface name
+# share the exact same RouterOS naming rules. `vlan_id`/`mtu` below are the
+# two genuinely new shapes this round introduces.
+
+# IEEE 802.1Q VLAN id range: 1-4094 (0 and 4095 are reserved/not usable as an
+# access tag).
+_VLAN_ID_MIN = 1
+_VLAN_ID_MAX = 4094
+
+
+def validate_vlan_id(value: int) -> int:
+    """Validate a RouterOS VLAN id (`/interface/vlan`'s `vlan-id` field),
+    used by `add_vlan`. Must be an integer in the IEEE 802.1Q range
+    (1-4094) - RouterOS itself rejects 0 and 4095.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"vlan_id must be an integer, got {value!r}.")
+    if not (_VLAN_ID_MIN <= value <= _VLAN_ID_MAX):
+        raise ValidationError(f"vlan_id {value!r} is out of range (expected {_VLAN_ID_MIN}-{_VLAN_ID_MAX}).")
+    return value
+
+
+# RouterOS accepts an interface MTU from 68 (the minimum guaranteed by IPv4)
+# up to 65535; `add_vlan`'s optional `mtu` is checked against the same range
+# client-side rather than forwarding an obviously invalid value.
+_MTU_MIN = 68
+_MTU_MAX = 65535
+
+
+def validate_mtu(value: int, field_name: str = "mtu") -> int:
+    """Validate an interface MTU, used by `add_vlan`'s optional `mtu`.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be an integer, got {value!r}.")
+    if not (_MTU_MIN <= value <= _MTU_MAX):
+        raise ValidationError(f"{field_name} {value!r} is out of range (expected {_MTU_MIN}-{_MTU_MAX}).")
+    return value
+
+
+def validate_firewall_rule_position(value: int) -> int:
+    """Validate `move_firewall_rule`'s optional `position`: a 0-based index
+    into the CURRENT firewall filter rule order (after the rule being moved
+    is removed from consideration) that the rule should move to. A value at
+    or beyond the end of the list is treated as "move to the end" by
+    `guard.move_firewall_rule`, not rejected here - this only rejects a
+    negative index, which can never be a valid position.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"position must be an integer, got {value!r}.")
+    if value < 0:
+        raise ValidationError(f"position {value!r} must be zero or greater.")
+    return value

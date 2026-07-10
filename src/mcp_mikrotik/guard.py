@@ -61,12 +61,14 @@ from .validation import (
     validate_dst_address,
     validate_firewall_chain,
     validate_firewall_rule_comment,
+    validate_firewall_rule_position,
     validate_hotspot_password,
     validate_hotspot_profile,
     validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
+    validate_mtu,
     validate_ping_address,
     validate_poe_out,
     validate_port,
@@ -75,6 +77,7 @@ from .validation import (
     validate_route_gateway,
     validate_target,
     validate_timeout,
+    validate_vlan_id,
     validate_wireguard_key,
 )
 
@@ -83,7 +86,7 @@ from .validation import (
 class WriteOperation:
     name: str
     path: tuple[str, ...]
-    action: str  # "update" | "add" | "remove" | "start" | "stop" | "flush" | "wol" | "save"
+    action: str  # "update" | "add" | "remove" | "start" | "stop" | "flush" | "wol" | "save" | "move"
     description: str
 
 
@@ -369,6 +372,47 @@ ALLOWLIST: dict[str, WriteOperation] = {
             "Create a RouterOS system backup file (/system/backup/save name=<name>, optional "
             "encryption password - never journaled). Refuses to overwrite an existing file of "
             "the same name."
+        ),
+    ),
+    # v1.2: VLAN management + firewall rule reorder. add_vlan/remove_vlan
+    # manage /interface/vlan rows - an ordinary named-resource add/remove
+    # pair, following add_static_dns/remove_static_dns's shape exactly (
+    # resolved by `name`, refuses a duplicate on add, refuses a missing name
+    # on remove). move_firewall_rule is the more novel one: it's the first
+    # ALLOWLIST entry whose `action` is "move" - RouterOS's own literal
+    # command word for /ip/firewall/filter move, a fourth kind of ACTION
+    # command alongside start/stop (v0.7), flush/wol (v0.10), and save
+    # (v0.14) - dispatched through the exact same `getattr(client,
+    # op.action)` mechanism as every other guarded write (see set_identity's
+    # A1 comment above), just naming client.MikrotikClient.move instead.
+    # Like enable_firewall_rule/disable_firewall_rule (v0.11), it NEVER
+    # creates or otherwise edits a rule's fields - only its position in the
+    # chain's evaluation order changes, resolved by the rule's `comment`
+    # (the same STABLE, admin-controlled identifier those two tools use),
+    # never a dynamic `.id`/list index supplied directly by a caller.
+    "add_vlan": WriteOperation(
+        name="add_vlan",
+        path=("interface", "vlan"),
+        action="add",
+        description=(
+            "Create a VLAN interface (/interface/vlan add): name, vlan-id (1-4094), parent "
+            "interface, optional mtu/comment. Refuses to create a duplicate name."
+        ),
+    ),
+    "remove_vlan": WriteOperation(
+        name="remove_vlan",
+        path=("interface", "vlan"),
+        action="remove",
+        description="Remove a VLAN interface by name (/interface/vlan remove).",
+    ),
+    "move_firewall_rule": WriteOperation(
+        name="move_firewall_rule",
+        path=("ip", "firewall", "filter"),
+        action="move",
+        description=(
+            "Reorder an EXISTING firewall filter rule (/ip/firewall/filter move), resolved by its "
+            "comment (optionally narrowed by chain) - never creates or otherwise edits a rule; only "
+            "its position in the chain's evaluation order changes."
         ),
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
@@ -2290,4 +2334,184 @@ def create_backup(
         write(*op.path, name=validated_name, password=validated_password)
     else:
         write(*op.path, name=validated_name)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v1.2: VLAN management + firewall rule reorder ---------------------------
+#
+# Three more guarded writes: add_vlan/remove_vlan (an ordinary named-resource
+# add/remove pair against /interface/vlan, following add_static_dns/
+# remove_static_dns's shape) and move_firewall_rule (a reorder-only write
+# against /ip/firewall/filter, following enable_firewall_rule/
+# disable_firewall_rule's comment-based resolution - see ALLOWLIST's own
+# comment above these three entries for the "move" action's dispatch shape).
+
+
+@_audited("add_vlan")
+def add_vlan(
+    client: MikrotikClient,
+    settings: Settings,
+    name: str,
+    vlan_id: int,
+    interface: str,
+    confirm: bool,
+    mtu: int | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Create a VLAN interface (`/interface/vlan add`): `name` (the new
+    RouterOS interface name, e.g. "vlan100"), `vlan_id` (1-4094, the IEEE
+    802.1Q tag), and `interface` (the parent interface it rides on top of,
+    e.g. "bridge1"/"ether2" - NOT verified to exist here; RouterOS itself
+    rejects an unknown parent interface at write time, same as every other
+    tool in this package that names an existing-elsewhere resource by string
+    - e.g. `add_hotspot_user`'s `profile`). `mtu`/`comment` are optional.
+
+    Refuses to create a duplicate `name` - raises ResourceAlreadyExistsError
+    instead of creating a second VLAN interface (or silently reconfiguring
+    the first one). This tool only ever adds; it never updates or removes an
+    existing VLAN interface.
+    """
+    op = _require_allowed(settings, "add_vlan")
+
+    validated_name = validate_interface_name(name)
+    validated_vlan_id = validate_vlan_id(vlan_id)
+    validated_interface = validate_interface_name(interface)
+    validated_mtu = validate_mtu(mtu) if mtu is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    rows = client.path(*op.path)
+    if _find_row_by_field(rows, "name", validated_name) is not None:
+        raise ResourceAlreadyExistsError(client.device.name, "VLAN interface", validated_name)
+
+    payload: dict[str, Any] = {
+        "name": validated_name,
+        "vlan-id": str(validated_vlan_id),
+        "interface": validated_interface,
+    }
+    if validated_mtu is not None:
+        payload["mtu"] = str(validated_mtu)
+    if validated_comment:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_vlan")
+def remove_vlan(client: MikrotikClient, settings: Settings, name: str, confirm: bool) -> WritePreview:
+    """Remove a VLAN interface (`/interface/vlan remove`) by `name`. Raises
+    ResourceNotFoundError if no VLAN interface matches - never removes more
+    than the one matching row."""
+    op = _require_allowed(settings, "remove_vlan")
+
+    validated_name = validate_interface_name(name)
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", validated_name)
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "VLAN interface", validated_name)
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("move_firewall_rule")
+def move_firewall_rule(
+    client: MikrotikClient,
+    settings: Settings,
+    comment: str,
+    confirm: bool,
+    chain: str | None = None,
+    before_comment: str | None = None,
+    position: int | None = None,
+) -> WritePreview:
+    """Reorder an EXISTING firewall filter rule (`/ip/firewall/filter move`),
+    resolved by its `comment` - optionally narrowed by `chain` - via the same
+    `_find_firewall_rule_rows` resolution `enable_firewall_rule`/
+    `disable_firewall_rule` use (see that section's module comment above for
+    the full rationale). NEVER creates or otherwise edits a rule's fields -
+    only its position in the chain's evaluation order changes.
+
+    Exactly one of `before_comment` (move the rule to appear immediately
+    before the EXISTING rule with this comment) or `position` (move the rule
+    to this 0-based index among the OTHER rules, i.e. after removing the
+    rule being moved from consideration - a `position` at or beyond the end
+    of that list moves the rule to the very end) must be given; raises
+    ValidationError if both or neither are given.
+
+    Raises ResourceNotFoundError if `comment` (narrowed by `chain`) matches
+    no rule, or if `before_comment` is given but matches no rule. Raises
+    AmbiguousResourceError if `comment` (or `before_comment`) still matches
+    more than one rule - never guesses which one to move, or which one to
+    insert before.
+    """
+    op = _require_allowed(settings, "move_firewall_rule")
+
+    validated_comment = validate_firewall_rule_comment(comment)
+    validated_chain = validate_firewall_chain(chain) if chain is not None else None
+
+    if (before_comment is None) == (position is None):
+        raise ValidationError("move_firewall_rule requires exactly one of 'before_comment' or 'position'.")
+
+    validated_before_comment = validate_firewall_rule_comment(before_comment) if before_comment is not None else None
+    validated_position = validate_firewall_rule_position(position) if position is not None else None
+
+    rows = client.path(*op.path)
+    matches = _find_firewall_rule_rows(rows, validated_comment, validated_chain)
+    if not matches:
+        raise ResourceNotFoundError(client.device.name, "Firewall filter rule", validated_comment)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "Firewall filter rule",
+            validated_comment,
+            [row.get("chain", "") for row in matches],
+        )
+
+    target_row = matches[0]
+    target_id = target_row.get(".id")
+    current_index = next(i for i, row in enumerate(rows) if row.get(".id") == target_id)
+    remaining = [row for row in rows if row.get(".id") != target_id]
+
+    destination_id: str | None
+    if validated_before_comment is not None:
+        dest_matches = _find_firewall_rule_rows(remaining, validated_before_comment, validated_chain)
+        if not dest_matches:
+            raise ResourceNotFoundError(client.device.name, "Firewall filter rule", validated_before_comment)
+        if len(dest_matches) > 1:
+            raise AmbiguousResourceError(
+                client.device.name,
+                "Firewall filter rule",
+                validated_before_comment,
+                [row.get("chain", "") for row in dest_matches],
+            )
+        destination_id = dest_matches[0].get(".id")
+        new_index = next(i for i, row in enumerate(remaining) if row.get(".id") == destination_id)
+    else:
+        assert validated_position is not None  # exactly-one check above guarantees this
+        new_index = min(validated_position, len(remaining))
+        destination_id = remaining[new_index].get(".id") if new_index < len(remaining) else None
+
+    before = {"comment": target_row.get("comment"), "chain": target_row.get("chain"), "position": current_index}
+    after = {"comment": target_row.get("comment"), "chain": target_row.get("chain"), "position": new_index}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, id=target_id, destination=destination_id)
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
