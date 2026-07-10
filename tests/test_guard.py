@@ -1494,6 +1494,50 @@ def test_remove_netwatch_rejects_invalid_host_before_touching_device(settings_wr
         guard.remove_netwatch(guarded_client, settings_write_enabled, host="not-an-ip", confirm=True)
 
 
+def test_remove_netwatch_ambiguous_host_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Two netwatch monitors sharing the same `host` (only reachable via
+    manual/WinBox configuration outside this tool - add_netwatch itself
+    refuses to create a duplicate host). remove_netwatch must never guess
+    which one to remove; it must raise instead of silently first-matching."""
+    fake = FakeConnection(
+        data={
+            ("tool", "netwatch"): [
+                {".id": "*1", "host": "8.8.8.8", "comment": "primary gateway"},
+                {".id": "*2", "host": "8.8.8.8", "comment": "duplicate probe"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
+    assert "8.8.8.8" in str(exc_info.value)
+    # Neither row was removed.
+    hosts = [row["host"] for row in fake.path("tool", "netwatch")._rows]
+    assert hosts.count("8.8.8.8") == 2
+
+
+def test_remove_netwatch_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Same ambiguity guard, but resolved by `comment` (no `host` match) -
+    two rows sharing the same `comment`."""
+    fake = FakeConnection(
+        data={
+            ("tool", "netwatch"): [
+                {".id": "*1", "host": "8.8.8.8", "comment": "shared label"},
+                {".id": "*2", "host": "1.1.1.1", "comment": "shared label"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.remove_netwatch(client, settings_write_enabled, comment="shared label", confirm=True)
+    assert "shared label" in str(exc_info.value)
+    assert len(fake.path("tool", "netwatch")._rows) == 2
+
+
 def test_remove_netwatch_dispatches_via_allowlist_action(
     monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
 ):

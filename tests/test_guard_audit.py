@@ -486,14 +486,15 @@ def test_set_route_distance_ambiguous_route_journals_outcome_error(
 def test_disable_route_confirmed_call_journals_outcome_applied_and_carries_warning_in_summary(
     audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
 ):
-    """The default-route warning is part of what disable_route returns to
-    its caller (see guard.WritePreview.warning) - it is not itself a
-    separate audit concern, but the underlying before/after change it
-    describes must still be journaled and password-free like any other
-    write."""
-    guard.disable_route(
+    """The default-route warning (see guard.WritePreview.warning) is part
+    of the journal's `summary`, not just before/after - a caller
+    reconstructing what happened from the audit journal alone must still be
+    able to see the same risk callout the tool's own caller saw. It must
+    still be journaled password-free like any other write."""
+    preview = guard.disable_route(
         client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
     )
+    assert preview.warning is not None
 
     events = _events(audit_log)
     assert len(events) == 1
@@ -502,9 +503,27 @@ def test_disable_route_confirmed_call_journals_outcome_applied_and_carries_warni
     assert event["tool"] == "disable_route"
     assert event["operation"] == "disable_route"
     assert event["summary"]["after"]["disabled"] == "yes"
+    assert event["summary"]["warning"] == preview.warning
+    assert "default" in event["summary"]["warning"].lower()
 
     raw = audit_log.read_text(encoding="utf-8")
     assert device.password not in raw
+
+
+def test_enable_route_confirmed_call_journals_null_warning_in_summary(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """The `warning` key is present in every guarded write's audit summary,
+    not only ones that happen to carry a risk callout - it is simply `null`
+    (never omitted) when WritePreview.warning is None, e.g. re-enabling a
+    route."""
+    guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+    guard.enable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 2
+    assert events[1]["operation"] == "enable_route"
+    assert events[1]["summary"]["warning"] is None
 
 
 def test_disable_route_unknown_route_journals_outcome_error(
@@ -714,6 +733,39 @@ def test_remove_dhcp_lease_confirmed_call_journals_outcome_applied_without_leaki
 
     raw = audit_log.read_text(encoding="utf-8")
     assert device.password not in raw
+
+
+def test_remove_dhcp_lease_static_lease_journals_warning_in_summary(
+    audit_log: Path, device: Device, settings_write_enabled: Settings
+):
+    """Same warning-in-summary contract as disable_route's default-route
+    callout, exercised on a second warning-carrying write: removing a
+    STATIC dhcp lease."""
+    fake = FakeConnection(
+        data={
+            ("ip", "dhcp-server", "lease"): [
+                {
+                    ".id": "*1",
+                    "address": "10.0.0.60",
+                    "mac-address": "AA:BB:CC:DD:EE:02",
+                    "dynamic": "false",
+                    "status": "bound",
+                }
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=True)
+    assert preview.warning is not None
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["operation"] == "remove_dhcp_lease"
+    assert event["summary"]["warning"] == preview.warning
+    assert "STATIC" in event["summary"]["warning"]
 
 
 def test_remove_dhcp_lease_not_found_journals_outcome_error(

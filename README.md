@@ -1,80 +1,80 @@
 # mcp-mikrotik
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for managing
-[MikroTik RouterOS](https://mikrotik.com/software) devices - read device state
-(interfaces, routes, neighbors, logs, ping) and, for a small, explicit set of
-write operations, change it, from an MCP client such as Claude Code.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for
+[MikroTik RouterOS](https://mikrotik.com/software) devices. It lets an MCP
+client (Claude Desktop, Claude Code, or any other MCP-compatible LLM tool)
+read a router's live state - interfaces, routes, DHCP, wireless, VPN,
+firewall, containers, logs, live traffic - and diagnose it (ping,
+traceroute, torch), so an operator or an LLM can answer "what's going on
+with this network" without opening WinBox. For a small, explicit,
+individually-reviewed set of changes, it can also write - every write is
+**read-only by default**, gated behind a central allowlist, and previewed
+before it's applied.
 
-This is a from-scratch implementation, not a fork. It exists to correct a set
-of concrete failures found in an earlier project during a security audit:
-an unrestricted generic "run any API command" tool, an HTTP transport bound
-to `0.0.0.0` with no auth, command injection via string-built SSH calls, and
-no tests. See "Security model" below for how each of those is avoided here.
+**Philosophy:** start read-only, make writes something you opt into and can
+review, never something an LLM reaches by accident. `MIKROTIK_ALLOW_WRITE`
+defaults to `false` - point this at a fleet and it can only ever read until
+you deliberately turn writes on. Even then there is no generic "run this
+RouterOS command" tool: every write is a dedicated, named function mapped to
+exactly one API path, and every one of them supports `confirm=false` to
+preview a change before `confirm=true` applies it. See "Security model"
+below for the full mechanism.
+
+This is a from-scratch implementation, not a fork. It exists to correct a
+set of concrete failures found in an earlier project during a security
+audit: an unrestricted generic "run any API command" tool, an HTTP
+transport bound to `0.0.0.0` with no auth, command injection via
+string-built SSH calls, and no tests. See "Security model" below for how
+each of those is avoided here.
 
 ## Status
 
-v0.11: everything from v0.10 (the core read-tool inventory, `ping`/
-`traceroute` diagnostics, guarded write tools through the v0.10
-DNS/DHCP/Wake-on-LAN round, production-hardening layers - audit journal,
-correlation ids, read retry, circuit breaker), plus a SAFE firewall control
-round: two new guarded write tools - `enable_firewall_rule`/
-`disable_firewall_rule` - and one new filtered read tool -
-`connection_tracking`.
+**1.0.0.** Every planned tool round has shipped: the full read-tool
+inventory (interfaces, routing, DHCP, wireless, VPN/WireGuard, containers,
+LTE/5G, USB, hotspot, live traffic, backups, a heuristic security audit),
+guarded writes across identity/interfaces/wifi/bandwidth/DHCP/
+address-lists/PoE/containers/failover-routing/Netwatch/DNS/Wake-on-LAN/
+firewall-rule-toggle/WireGuard/hotspot-vouchers/backup, and the
+production-hardening layers this needs to run unattended against a real
+fleet - audit journal, correlation IDs, read retry, circuit breaker. See
+`CHANGELOG.md` for the full version-by-version history (what shipped in
+each v0.x round), and "Roadmap & non-goals" below for what's deliberately
+still out of scope, and why.
 
-`enable_firewall_rule`/`disable_firewall_rule` deliberately do **not**
-create or otherwise edit a firewall rule (see "Roadmap / non-goals" below
-for why full firewall filter writes still aren't exposed): they only ever
-flip an **existing** rule's `disabled` field, resolved by its `comment` - a
-STABLE, admin-controlled identifier, never a dynamic `.id`/list index. The
-intended workflow: an admin creates a rule ahead of time, reviews it once,
-and leaves it disabled; an LLM caller enables it later when it detects the
-condition the rule exists to guard against. See "Firewall rule toggle (by
-comment)" below.
-
-`connection_tracking` reads `/ip/firewall/connection`, but - unlike every
-other read tool in this package - REQUIRES at least one filter
-(`src_address`/`dst_address`/`dst_port`/`protocol`): the full table on a
-production router can be large enough to blow past an LLM caller's
-context/token budget on its own. The result is also hard-capped at 100
-rows, with a `truncated` flag whenever more matched than were returned. See
-"Connection tracking (filtered)" below.
-
-v0.12 adds two more read-only tools, both aimed at the "look at the
-security of this router" use case: `security_audit` aggregates several
-device-config reads into a structured list of findings (an LLM caller's
-"eyes" for a security review), and `security_events` filters `/log` down
-to login/logout/authentication-failure and other security-relevant
-entries. Both are heuristic and read-only - neither one fixes anything, and
-neither requires `MIKROTIK_ALLOW_WRITE`. See "Security audit" below.
-
-v0.13 adds WireGuard VPN management - see "WireGuard management" below.
-
-**v0.14 is the last feature round before 1.0**: hotspot visitor vouchers
-(`add_hotspot_user`, with a QR-renderable payload in the result),
-`hotspot_active` (who's logged into the hotspot right now), `torch` (a live
-traffic snapshot of one interface - "who's consuming bandwidth right now"),
-and RouterOS system backups (`create_backup`/`list_backups`). One
-deliberate, documented exception to this package's usual secret-handling
-rule: a hotspot voucher's plaintext password IS returned to the caller
-(that's the whole point of a voucher) - but still never reaches the audit
-journal. See "Hotspot vouchers", "Live traffic monitoring (torch)", and
-"Backup" below.
-
-See `CHANGELOG.md` for what changed since v0.1.0, and
-`src/mcp_mikrotik/guard.py` for how to add the next write tool.
-
-The full pytest suite currently has 984 tests, all passing against the
+The full pytest suite currently has 988 tests, all passing against an
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
 
-Requires Python >= 3.11.
+**Requirements:**
+
+- Python 3.11+.
+- A MikroTik device reachable over the **RouterOS API** (not WinBox, not
+  SSH) - plain API port `8728`, or `api-ssl` port `8729`. RouterOS **6.49+**
+  (the legacy `wireless` wifi stack) or **7.x** (the `wifi` package) are
+  both supported; several read/write tools (`wireless_registrations`,
+  `set_wifi_ssid`, `bgp_sessions`) detect which generation a device speaks
+  and use the matching path automatically.
+
+With `pip`:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
+
+With [`uv`](https://docs.astral.sh/uv/):
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+Either way this installs the `mcp-mikrotik` console script (see "Running"
+below) plus `.[dev]` (`pytest`/`pytest-asyncio`/`pytest-cov`) for running the
+test suite locally.
 
 ## Configuration
 
@@ -121,10 +121,58 @@ mcp-mikrotik
 python -m mcp_mikrotik.server
 ```
 
-There is no HTTP transport in v0. If one is added later, it must default to
-binding `127.0.0.1` (never `0.0.0.0`) and require a bearer token from an
-environment variable - see the `TODO(http-transport)` note at the top of
-`src/mcp_mikrotik/server.py`.
+There is no HTTP transport at all - stdio only. If one is added in a future
+release, it must default to binding `127.0.0.1` (never `0.0.0.0`) and
+require a bearer token from an environment variable - see the
+`TODO(http-transport)` note at the top of `src/mcp_mikrotik/server.py`.
+
+## Connecting an MCP client
+
+Since `mcp-mikrotik` speaks MCP over stdio, any MCP-compatible client can
+launch it as a subprocess. For [Claude Desktop](https://claude.ai/download),
+add it to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mikrotik": {
+      "command": "mcp-mikrotik",
+      "env": {
+        "MIKROTIK_DEVICES_FILE": "/absolute/path/to/devices.yaml",
+        "MIKROTIK_ALLOW_WRITE": "false"
+      }
+    }
+  }
+}
+```
+
+For [Claude Code](https://claude.com/claude-code), the equivalent is:
+
+```bash
+claude mcp add mikrotik --env MIKROTIK_DEVICES_FILE=/absolute/path/to/devices.yaml --env MIKROTIK_ALLOW_WRITE=false -- mcp-mikrotik
+```
+
+Use an **absolute** path for `MIKROTIK_DEVICES_FILE` - an MCP client
+typically launches the server from its own working directory, not this
+project's. Leave `MIKROTIK_ALLOW_WRITE=false` (the default) until you've
+read "Security model" below and deliberately want write tools enabled.
+
+### Example interactions
+
+Once connected, an LLM caller uses the tools below directly by name. A few
+representative exchanges:
+
+- *"What's the status of my core-switch?"* → calls `system_info` and
+  `interfaces`, summarizes board/RouterOS version/uptime and which
+  interfaces are up or down.
+- *"Is there a device on 192.168.88.50?"* → calls `dhcp_leases` (and, if
+  nothing turns up there, `arp_table`) filtered to that address, to tell a
+  DHCP-assigned host from a statically-addressed one.
+- *"Limit the guest on 192.168.88.77 to 5 Mbps."* → calls
+  `set_client_bandwidth(target="192.168.88.77", max_limit="5M/5M",
+  confirm=false)` first, shows the before/after preview, and only calls it
+  again with `confirm=true` once you confirm - this requires
+  `MIKROTIK_ALLOW_WRITE=true` on the server.
 
 ## Tools
 
@@ -200,7 +248,7 @@ model" below for the full guard mechanism.
 | `enable_route` | Enable a route (`disabled=no`). Resolved by `dst_address`, narrowed by optional `gateway`/`comment` when more than one route shares it. |
 | `disable_route` | Disable a route (`disabled=yes`). Same resolution as `enable_route`. **The returned preview's `warning` field is non-null whenever the route is the default route (`0.0.0.0/0`/`::/0`)** - disabling it cuts outbound traffic through that gateway. See "Failover control" below. |
 | `add_netwatch` | Create a Netwatch host monitor (`host`, optional `interval`/`comment`). **Never accepts an up-script/down-script** - see "Failover control" below. Refuses a duplicate `host`. |
-| `remove_netwatch` | Remove a Netwatch host monitor by `host` or `comment`. |
+| `remove_netwatch` | Remove a Netwatch host monitor by `host` (tried first) or `comment`. Raises `AmbiguousResourceError` instead of guessing if more than one monitor still matches. |
 | `add_static_dns` | Create a static DNS entry (`/ip/dns/static`) resolving `name` to `address`. `record_type` is `"A"` (default, `address` a literal IP) or `"CNAME"` (`address` is itself the alias target hostname). Refuses a duplicate `name`+`record_type` pair. See "DNS management" below. |
 | `remove_static_dns` | Remove a static DNS entry by `name`, optionally narrowed by `record_type`. Errors if more than one row still matches after narrowing (`AmbiguousResourceError`) - never guesses which one to remove. |
 | `clear_dns_cache` | Flush the device's DNS resolver cache (`/ip/dns/cache/flush`, no arguments). Benign (only cached answers are cleared), but still guarded/confirm-gated. |
@@ -458,6 +506,15 @@ removed elsewhere on the device) or a list index (even less stable). If
 nothing matches, `ResourceNotFoundError`. If more than one route still
 matches after narrowing, `AmbiguousResourceError` - the tool never guesses;
 the caller must add (or correct) `gateway`/`comment`.
+
+**Netwatch resolution: same rigor as routes.** `remove_netwatch` resolves
+its target by `host` (tried first if both are given), falling back to
+`comment`, exactly like the route tools above - never a RouterOS `.id`.
+`add_netwatch` itself refuses to create a second monitor for a `host` that
+already has one, but a device can still end up with more than one row
+sharing a `host`/`comment` via manual (WinBox/CLI) configuration outside
+this tool; if so, `remove_netwatch` raises `AmbiguousResourceError` instead
+of removing the first match - never a silent guess.
 
 **Netwatch scripts are never accepted.** `add_netwatch` has no
 `up_script`/`down_script` parameter at all - not validated-and-rejected,
@@ -882,6 +939,12 @@ at the wrong time) is loaded.
 
 ## Security model
 
+This section is the single consolidated reference for every control this
+package applies - to every read, and especially to every write. The
+philosophy is simple: **read-only by default, writes are opt-in, allowlisted,
+previewed, and audited.** No tool in this package ever accepts an arbitrary
+RouterOS API path or a free-form command.
+
 Three independent controls apply to every write tool, all centralized in
 `src/mcp_mikrotik/guard.py`:
 
@@ -1030,9 +1093,9 @@ On top of the write guard:
   and re-raised as a generic internal-error message, never as a raw
   traceback.
 
-## Production features: audit log, correlation IDs, retries, circuit breaker
+### Production hardening: audit log, correlation IDs, retries, circuit breaker
 
-v0.5 adds a set of layers *around* the write-guard mechanism above, aimed at
+The remaining layers *around* the write-guard mechanism above, aimed at
 running `mcp-mikrotik` unattended against a real fleet. None of them can
 weaken or bypass the read-only gate, the central allowlist, or the
 confirm/preview flow - every write still goes through `guard.py` exactly as
@@ -1050,8 +1113,12 @@ entirely before `MikrotikClient` ever attempts a connection.
   v0.7's `start_container`/`stop_container`, v0.10's `clear_dns_cache`/
   `wake_on_lan`, and v0.14's `create_backup`), `confirm`, `outcome`
   (`preview`/`applied`/`error`), and a `summary` of the before/after change
-  (or the error). **Never includes a device password or any field that
-  looks like a secret** - see `src/mcp_mikrotik/audit.py`'s `_sanitize()`.
+  plus that write's `warning` (e.g. `disable_route`'s default-route callout,
+  `remove_dhcp_lease`'s static-lease callout - see `WritePreview.warning` in
+  `guard.py`), or the error. `summary.warning` is `null` for every write that
+  carries no special risk. **Never includes a device password or any field
+  that looks like a secret** - see `src/mcp_mikrotik/audit.py`'s
+  `_sanitize()`.
   Destination is `MIKROTIK_AUDIT_LOG` (a file path, appended to) if set,
   otherwise a plain `INFO`-level line via the standard logger (stderr).
   Writing the journal is always best-effort: a bad path or a permissions
@@ -1103,82 +1170,124 @@ fleets. Two ways to make an SSL device work:
   (it drops MITM protection on that connection) - it is never the default,
   and it is opt-in per device, not global. See `devices.yaml.example`.
 
-## Development
+## Development & CI
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest -q
 ```
 
 The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
-`client_factory` parameter on `build_server()`.
+`client_factory` parameter on `build_server()`. It currently has 988 tests,
+zero of which touch a real device or the network.
 
-CI (`.github/workflows/ci.yml`) runs the full suite on every push/PR against
-Python 3.11 and 3.12.
+CI (`.github/workflows/ci.yml`, GitHub Actions) runs the full `pytest` suite
+on every push to `main` and every pull request, against both Python 3.11 and
+3.12 - both must pass before a change is considered mergeable.
 
-## Roadmap / non-goals
+**Contributing:** a new write tool must go through `guard.py`'s
+`ALLOWLIST` pattern (one named `WriteOperation` + one dedicated function -
+see the comment block at the top of `guard.py`) - never a generic
+"run this path" tool. Add tests alongside any new behavior (both the guard
+function in `tests/test_guard.py`/`test_guard_audit.py` and the tool
+registration in `tests/test_server.py`, following existing tests as a
+template), and make sure `pytest -q` is green locally before opening a PR -
+CI runs the identical suite.
 
-- **Security audit + security-relevant log events** (`security_audit`,
-  `security_events`) shipped in v0.12 - see "Security audit" above. Both
+## Roadmap & non-goals
+
+### Delivered through 1.0
+
+Every tool round originally planned for this project has shipped - see
+`CHANGELOG.md` for the full version-by-version detail:
+
+- **Core read tools + guarded writes** (v0.1-v0.4): device/interface/route
+  reads, `set_identity`, `enable_interface`/`disable_interface`,
+  `set_wifi_ssid`, `set_client_bandwidth`, `add_static_dhcp_lease`,
+  `remove_simple_queue`, `add_to_address_list`/`remove_from_address_list`.
+- **Production hardening** (v0.5): audit journal, correlation IDs, read
+  retry, circuit breaker - see "Security model" above.
+- **Physical layer, LTE, containers, USB** (v0.6-v0.7): `set_poe_out`,
+  `lte_status`/`lte_interfaces`, `start_container`/`stop_container` +
+  `containers`/`container_config`, `usb_devices`.
+- **VPN/routing diagnostics + failover control** (v0.8-v0.9):
+  `wireguard_peers`, `ppp_active`, `ipsec_active_peers`, `bgp_sessions`,
+  `ospf_neighbors`, `netwatch` (read), plus the guarded failover write
+  tools `set_route_distance`/`enable_route`/`disable_route`/
+  `add_netwatch`/`remove_netwatch` - see "Failover control" above.
+  Netwatch up/down-script configuration itself remains deliberately out of
+  scope (manual, on the device) - see "Netwatch scripts are never accepted"
+  above for why.
+- **DNS/DHCP/Wake-on-LAN write tools** (v0.10): `add_static_dns`/
+  `remove_static_dns`, `clear_dns_cache`, `remove_dhcp_lease`,
+  `wake_on_lan` - see "DNS management", "DHCP lease removal", and
+  "Wake-on-LAN" above. Only the two simplest static DNS record types
+  (`"A"`/`"CNAME"`) are exposed; other RouterOS record types
+  (`AAAA`/`MX`/`TXT`/`NS`/...) remain a future decision, not silently
+  widened here.
+- **Firewall rule toggle + connection tracking** (v0.11):
+  `enable_firewall_rule`/`disable_firewall_rule` (a `disabled` TOGGLE only,
+  on an existing, admin-authored rule resolved by `comment` - never rule
+  creation or any other field) and `connection_tracking` (mandatory filter,
+  hard-capped at 100 rows) - see "Firewall rule toggle (by comment)" and
+  "Connection tracking (filtered)" above.
+- **Security audit + security-relevant log events** (v0.12):
+  `security_audit`, `security_events` - see "Security audit" above. Both
   are read-only and heuristic: `security_audit` does not (and will not)
   auto-remediate anything it finds - every finding exists to inform a
   human/LLM decision, not to be acted on automatically. Widening its check
   list (e.g. NAT exposure, more RouterOS-version-specific CVE checks) is a
-  future round's decision, not silently expanded here.
-- **Failover write tools** (`set_route_distance`, `enable_route`/
-  `disable_route`, `add_netwatch`/`remove_netwatch`) shipped in v0.9 -
-  see "Failover control" above. Netwatch up/down-script configuration
-  itself remains deliberately out of scope (manual, on the device) - see
-  "Netwatch scripts are never accepted" above for why.
-- **DNS/DHCP/Wake-on-LAN write tools** (`add_static_dns`/`remove_static_dns`,
-  `clear_dns_cache`, `remove_dhcp_lease`, `wake_on_lan`) shipped in v0.10 -
-  see "DNS management", "DHCP lease removal", and "Wake-on-LAN" above. Only
-  the two simplest static DNS record types (`"A"`/`"CNAME"`) are exposed;
-  other RouterOS record types (`AAAA`/`MX`/`TXT`/`NS`/...) are a future
-  round's decision, not silently widened here.
-- **Firewall rule toggle + connection tracking** (`enable_firewall_rule`/
-  `disable_firewall_rule`, `connection_tracking`) shipped in v0.11 - see
-  "Firewall rule toggle (by comment)" and "Connection tracking (filtered)"
-  above. The firewall rule tools deliberately expose only a `disabled`
-  TOGGLE on an existing, admin-authored rule (resolved by `comment`) - not
-  rule creation or any other field. `connection_tracking` deliberately
-  requires a filter and hard-caps its result at 100 rows - see its own
-  section above for why.
-- **WireGuard VPN management** (`wireguard_interfaces`,
-  `add_wireguard_interface`, `add_wireguard_peer`, `remove_wireguard_peer`)
-  shipped in v0.13 - see "WireGuard management" above.
-- **Hotspot vouchers, live traffic monitoring, and backup**
-  (`hotspot_active`, `torch`, `list_backups`, `add_hotspot_user`,
-  `create_backup`) shipped in v0.14, the last feature round before 1.0 - see
-  "Hotspot vouchers", "Live traffic monitoring (torch)", and "Backup" above.
-- Two write operations are deliberately **not** exposed, because the
-  standard guard/confirm/preview mechanism isn't sufficient protection on
-  its own - see the comment above `ALLOWLIST` in `guard.py`:
-  - **Reboot** (`system/reboot`): there's no meaningful before/after preview
-    for a reboot, and a bad batch reboot across a fleet has no dry-run or
-    rollback. Needs its own confirmation/cooldown policy first.
-  - **Backup restore** (`system/backup/load`, v0.14): same risk class as
-    reboot - loading a backup overwrites the device's entire running
-    configuration and reboots it, with no meaningful before/after preview
-    and no rollback. `create_backup`/`list_backups` (v0.14) only ever
-    create/list backups; restoring one stays a manual, on-device
-    (WinBox/CLI) operation until it has its own confirmation/cooldown
-    policy.
+  future decision, not silently expanded here.
+- **WireGuard VPN management** (v0.13): `wireguard_interfaces`,
+  `add_wireguard_interface`, `add_wireguard_peer`, `remove_wireguard_peer` -
+  see "WireGuard management" above.
+- **Hotspot vouchers, live traffic monitoring, and backup** (v0.14):
+  `hotspot_active`, `torch`, `list_backups`, `add_hotspot_user`,
+  `create_backup` - see "Hotspot vouchers", "Live traffic monitoring
+  (torch)", and "Backup" above.
+- **1.0.0**: no new tools - a polish/consolidation round (ambiguity
+  handling on `remove_netwatch`, the audit journal carrying a write's
+  `warning`, and this README).
+
+### Non-goals
+
+These are deliberately **not** exposed, not because they're technically
+hard, but because the standard guard/confirm/preview mechanism isn't
+sufficient protection for them on its own - see the comment above
+`ALLOWLIST` in `guard.py`:
+
+- **Device reboot** (`/system/reboot`): there's no meaningful before/after
+  preview for a reboot, and a bad batch reboot across a fleet has no
+  dry-run or rollback. Would need its own confirmation/cooldown policy
+  first.
+- **Backup RESTORE** (`/system/backup/load`): same risk class as reboot -
+  loading a backup overwrites the device's entire running configuration and
+  reboots it, with no meaningful before/after preview and no rollback.
+  `create_backup`/`list_backups` only ever create/list backup files;
+  restoring one stays a manual, on-device (WinBox/CLI) operation until it
+  has its own confirmation/cooldown policy.
 - **Firewall filter rule CREATION or general modification** (any
-  `ip/firewall/filter` write other than the v0.11 `disabled` toggle) remains
-  out of scope for the same reason it always has been: a single wrong rule
-  (e.g. one that blocks the API port itself) can lock out all remote
-  management access to the device, with no way to recover it over the same
-  connection. Needs staged/rollback support (e.g. RouterOS safe mode) before
-  it belongs in the allowlist - v0.11's `enable_firewall_rule`/
-  `disable_firewall_rule` sidestep that risk entirely by only ever touching
-  a rule an admin already wrote and reviewed themselves, never authoring
-  one.
-- Further write tools should be added by extending `guard.ALLOWLIST` with
-  one new named operation and function each - see the comment block at the
-  top of `guard.py`. Do not add a generic write tool.
+  `ip/firewall/filter` write other than the `disabled` toggle): a single
+  wrong rule (e.g. one that blocks the API port itself) can lock out all
+  remote management access to the device, with no way to recover it over
+  the same connection. Would need staged/rollback support (e.g. RouterOS
+  safe mode) before it belongs in the allowlist -
+  `enable_firewall_rule`/`disable_firewall_rule` sidestep that risk
+  entirely by only ever touching a rule an admin already wrote and reviewed
+  themselves, never authoring one.
+- **A generic "run this RouterOS command/path" tool**: this is not a gap to
+  be filled later - it is the exact failure mode this project exists to
+  avoid (see "Status" above). Every write will always be a dedicated, named,
+  individually-reviewed function in `guard.ALLOWLIST`, never an arbitrary
+  path+action a caller supplies.
+
+### Post-1.0 ideas
+
+- Further write tools are added by extending `guard.ALLOWLIST` with one new
+  named operation and function each - see the comment block at the top of
+  `guard.py`. Do not add a generic write tool.
 - A second entrypoint that periodically polls devices and pushes metrics to
   Firebase is planned to reuse `MikrotikClient`/`get_client` from
   `client.py`. Not implemented yet - see the `TODO(collector)` note at the

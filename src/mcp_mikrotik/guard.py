@@ -483,7 +483,16 @@ def _audited(anchor_operation: str) -> Callable[[Callable[..., WritePreview]], C
                 action=ALLOWLIST[result.operation].action,
                 confirm=confirm,
                 outcome="applied" if result.applied else "preview",
-                summary={"before": result.before, "after": result.after},
+                # `warning` (e.g. disable_route's default-route callout,
+                # remove_dhcp_lease's static-lease callout - see
+                # WritePreview.warning) is included here so the audit journal
+                # can reconstruct the same risk callout a caller saw, not
+                # just the raw before/after values. It is plain text about
+                # the OPERATION (which route/lease, why it's risky) - never a
+                # device credential - so this carries no new secret-handling
+                # risk on top of before/after, which audit.record() already
+                # sanitizes via its own key-based redaction.
+                summary={"before": result.before, "after": result.after, "warning": result.warning},
             )
             return result
 
@@ -1396,6 +1405,14 @@ def add_netwatch(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+def _find_netwatch_rows(rows: list[dict[str, Any]], field: str, value: str) -> list[dict[str, Any]]:
+    """All /tool/netwatch rows whose `field` equals `value`. Returns every
+    match (not just the first) so remove_netwatch can tell a clean single
+    match from an ambiguous one - see its AmbiguousResourceError, mirroring
+    _find_firewall_rule_rows/_find_static_dns_rows/_resolve_route above."""
+    return [row for row in rows if row.get(field) == value]
+
+
 @_audited("remove_netwatch")
 def remove_netwatch(
     client: MikrotikClient,
@@ -1407,8 +1424,17 @@ def remove_netwatch(
     """Remove a Netwatch host monitor by `host` or `comment`
     (`/tool/netwatch remove`). At least one of `host`/`comment` must be
     given and must resolve to an existing monitor (`host` is tried first if
-    both are given); raises ResourceNotFoundError otherwise. Never removes
-    more than the one matching row.
+    both are given); raises ResourceNotFoundError if nothing matches.
+
+    Raises AmbiguousResourceError if MORE THAN ONE row still matches `host`
+    (or, when no row matches `host`, `comment`) - this never falls back to
+    "just remove the first match": add_netwatch itself refuses to create a
+    second monitor for the same `host` (see ResourceAlreadyExistsError
+    there), but a device can still end up with more than one row sharing a
+    `host` or `comment` via manual (WinBox/CLI) configuration outside this
+    tool, exactly the same class of case _resolve_route/
+    _find_firewall_rule_rows/_find_static_dns_rows already guard against.
+    Never removes more than the one matching row.
     """
     op = _require_allowed(settings, "remove_netwatch")
 
@@ -1421,13 +1447,26 @@ def remove_netwatch(
     validated_host = validate_ip_address(host) if host else None
 
     rows = client.path(*op.path)
-    row = _find_row_by_field(rows, "host", validated_host) if validated_host else None
-    if row is None and comment:
-        row = _find_row_by_field(rows, "comment", comment)
+    if validated_host:
+        matches = _find_netwatch_rows(rows, "host", validated_host)
+        identifier, candidate_field = validated_host, "comment"
+    else:
+        matches, identifier, candidate_field = [], "", "host"
+    if not matches and comment:
+        matches = _find_netwatch_rows(rows, "comment", comment)
+        identifier, candidate_field = comment, "host"
 
-    if row is None:
+    if not matches:
         raise ResourceNotFoundError(client.device.name, "Netwatch host monitor", host or comment or "")
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "Netwatch host monitor",
+            identifier,
+            [row.get(candidate_field, "") for row in matches],
+        )
 
+    row = matches[0]
     before = dict(row)
     after: dict[str, Any] = {}
 

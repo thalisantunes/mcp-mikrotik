@@ -3,6 +3,59 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.0.0] - 2026-07-10
+
+The first stable release. Every tool round planned since v0.1.0 has
+shipped - see every entry below for the full detail - and this release adds
+no new tool; it is a polish/consolidation pass over what's already there:
+
+- **71 tools total** (42 read-only, 29 guarded write) across device
+  identity/interfaces, IPv4 routing + failover, DHCP, wireless (ROS6/ROS7),
+  bandwidth (Simple Queue), firewall address-lists + NAT + filter-rule
+  toggle + connection tracking, physical layer/PoE, LTE/5G, containers,
+  USB, VPN (WireGuard/PPP/IPsec) + BGP/OSPF, Netwatch, static DNS + cache,
+  Wake-on-LAN, a heuristic security audit + security-relevant log events,
+  hotspot vouchers + live sessions, live traffic monitoring (torch), and
+  RouterOS backups.
+- **The security model is unchanged and unweakened from v0.5 onward**:
+  read-only by default (`MIKROTIK_ALLOW_WRITE=false`), a central allowlist
+  with no generic "run this command" tool, explicit `confirm`/preview on
+  every write, structured-API-only device access (no shell/SSH, no command
+  injection surface), a secret-redacting audit journal, read-only retry,
+  and a per-device circuit breaker. See the consolidated "Security model"
+  section in `README.md`.
+- **`remove_netwatch` ambiguity handling** (`guard.py`): now resolves by
+  `host` (or `comment`) with the same rigor as the route/firewall-rule/DNS
+  resolvers - if more than one Netwatch monitor still matches after
+  resolution, it raises `AmbiguousResourceError` instead of silently acting
+  on the first match. Previously this was the one resolver in `guard.py`
+  still using first-match-wins.
+- **`WritePreview.warning` now reaches the audit journal** (`guard.py`,
+  `_audited`): a write's risk callout (e.g. `disable_route`'s default-route
+  warning, `remove_dhcp_lease`'s static-lease warning) is now part of the
+  journaled `summary`, not just the tool's own return value - so the audit
+  trail alone can reconstruct the same warning a caller saw at call time.
+  `summary.warning` is `null` for writes that carry no special risk. Still
+  plain text describing the operation, never a credential - covered by the
+  same `audit._sanitize()` redaction as `before`/`after`.
+- **`__version__` is now derived from installed package metadata**
+  (`src/mcp_mikrotik/__init__.py`, via `importlib.metadata.version()`, with
+  a hardcoded `"1.0.0"` fallback if the package isn't installed at all) -
+  `pyproject.toml`'s `[project] version` is now the single source of truth;
+  nothing to keep in sync by hand across two files anymore.
+- **README rewritten for a public 1.0**: a clear overview + philosophy
+  statement, `pip`/`uv` install instructions with RouterOS version
+  requirements, a complete environment-variable table, a complete
+  read/write tools reference table (all 71), a consolidated "Security
+  model" section (folding in what was a separate "Production features"
+  section), an MCP client connection example (Claude Desktop
+  `claude_desktop_config.json` + Claude Code) with example interactions, an
+  explicit "Non-goals" section, and a "Delivered through 1.0" roadmap
+  summary.
+- Test suite: 988 tests (984 carried over, plus 4 new - two
+  `remove_netwatch` ambiguity cases and two audit-journal `warning`
+  assertions), all passing against the in-memory fake device layer.
+
 ## [0.14.0] - Unreleased
 
 The last feature round before 1.0: hotspot visitor vouchers (with a
