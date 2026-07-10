@@ -3,8 +3,8 @@
 Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
 add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
-remove_from_address_list, set_poe_out - see guard.py's ALLOWLIST for the full
-write-tool inventory). Transport is stdio only - this process is meant to run on the
+remove_from_address_list, set_poe_out, start_container/stop_container - see
+guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
 operator's own machine, launched by an MCP client (e.g. Claude Code) over
 stdio, with no network exposure at all.
 
@@ -438,6 +438,94 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
+    def lte_status(device_name: str, interface: str) -> dict[str, Any]:
+        """Signal/status of one LTE/5G modem interface
+        (`/interface/lte/monitor <interface> once=yes`).
+
+        Returns a single reply dict - typically operator (`current-operator`),
+        technology (`access-technology`: 3G/LTE/5G), signal
+        (`rsrp`/`rsrq`/`sinr`/`rssi`), `band`, `registration-status`,
+        `cell-id` - or an empty dict if the device has no LTE hardware/package
+        at all, or `interface` doesn't match one (same "empty, not an error"
+        convention as `poe_status`/`system_health` for optional hardware).
+
+        `interface` is validated for shape (`validate_interface_name`) before
+        it is ever sent to the device.
+        """
+        validated_interface = validate_interface_name(interface)
+        client = _client(device_name)
+        try:
+            return client.lte_monitor(validated_interface)
+        except DeviceCommandError:
+            return {}
+
+    @mcp.tool()
+    @_safe
+    def lte_interfaces(device_name: str) -> list[dict[str, Any]]:
+        """List LTE/5G modem interfaces (`/interface/lte`): name, running,
+        disabled, apn-profiles, etc. Returns an empty list (never an error)
+        for a device with no LTE hardware/package at all.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("interface", "lte"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def containers(device_name: str) -> list[dict[str, Any]]:
+        """List containers (`/container`): name/tag, status, ram-usage,
+        root-dir, interface, os, etc. Returns an empty list (never an error)
+        for a device with no container package/hardware support at all.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("container"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def container_config(device_name: str) -> dict[str, Any]:
+        """Container subsystem configuration (`/container/config`):
+        registry-url, tmpdir, ram-high, etc - a single-row menu. Returns an
+        empty dict (never an error) for a device with no container package.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("container", "config"))
+        except DeviceCommandError:
+            return {}
+        return rows[0] if rows else {}
+
+    @mcp.tool()
+    @_safe
+    def usb_devices(device_name: str) -> dict[str, Any]:
+        """USB hardware on a device: physical USB ports
+        (`/system/routerboard/usb`, if the board exposes them) plus attached
+        storage (`/disk` - USB flash drives, and USB LTE/5G modems that
+        surface as a disk rather than under routerboard/usb). Combined into
+        one read since which of the two a given USB device shows up under
+        depends on the hardware.
+
+        Returns `{"usb_ports": [...], "disks": [...]}` - either or both
+        lists empty (never an error) if the board doesn't expose that
+        menu/hardware at all.
+        """
+        client = _client(device_name)
+        try:
+            usb_ports = rows_to_list(client.path("system", "routerboard", "usb"))
+        except DeviceCommandError:
+            usb_ports = []
+        try:
+            disks = rows_to_list(client.path("disk"))
+        except DeviceCommandError:
+            disks = []
+        return {"usb_ports": usb_ports, "disks": disks}
+
+    @mcp.tool()
+    @_safe
     def list_write_operations() -> list[dict[str, Any]]:
         """List every guarded write operation and the RouterOS path/action it maps to.
 
@@ -702,6 +790,49 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.set_poe_out(
             client, settings, interface_name=interface_name, poe_out=poe_out, confirm=confirm
         )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def start_container(device_name: str, container: str, confirm: bool = False) -> dict[str, Any]:
+        """Start a container by `name` or `tag` (`/container/start`).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if `container` doesn't match any
+        `/container` row's `name` or `tag` on the device - it is never
+        created.
+
+        The `after.status` in the preview is the status RouterOS sets
+        immediately ("starting"), not a guaranteed final state - the
+        container transitions to "running" asynchronously; use `containers`
+        again afterward to see the settled status.
+        """
+        client = _client(device_name)
+        preview = guard.start_container(client, settings, container=container, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def stop_container(device_name: str, container: str, confirm: bool = False) -> dict[str, Any]:
+        """Stop a container by `name` or `tag` (`/container/stop`).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without changing anything) if `container` doesn't match any
+        `/container` row's `name` or `tag` on the device - it is never
+        created.
+
+        The `after.status` in the preview is the status RouterOS sets
+        immediately ("stopping"), not a guaranteed final state - use
+        `containers` again afterward to see the settled status.
+        """
+        client = _client(device_name)
+        preview = guard.stop_container(client, settings, container=container, confirm=confirm)
         return asdict(preview)
 
     return mcp

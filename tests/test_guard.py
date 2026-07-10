@@ -61,7 +61,7 @@ def test_allowlist_only_contains_named_operations():
     for name, op in guard.ALLOWLIST.items():
         assert op.name == name
         assert isinstance(op.path, tuple) and op.path
-        assert op.action in {"update", "add", "remove"}
+        assert op.action in {"update", "add", "remove", "start", "stop"}
 
 
 def test_require_allowed_rejects_unknown_operation(settings_write_enabled: Settings):
@@ -769,3 +769,155 @@ def test_set_poe_out_rejects_invalid_interface_name_before_touching_device(
         guard.set_poe_out(
             guarded_client, settings_write_enabled, interface_name="ether1; reboot", poe_out="off", confirm=True
         )
+
+
+# --- start_container / stop_container (v0.7) --------------------------------
+
+
+def _containers_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("container",): [
+                {".id": "*1", "name": "grafana", "tag": "grafana/grafana:latest", "status": "stopped"},
+                {".id": "*2", "tag": "alpine:latest", "status": "running"},
+            ]
+        }
+    )
+
+
+def test_start_container_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.start_container(client, settings, container="grafana", confirm=True)
+
+
+def test_stop_container_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.stop_container(client, settings, container="grafana", confirm=True)
+
+
+def test_start_container_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    """Read-only gate must block *before* touching the device at all, regardless of confirm."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.start_container(guarded_client, settings, container="grafana", confirm=True)
+
+
+def test_stop_container_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.stop_container(guarded_client, settings, container="grafana", confirm=True)
+
+
+def test_start_container_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.start_container(client, settings_write_enabled, container="grafana", confirm=False)
+
+    assert preview.applied is False
+    assert preview.before["status"] == "stopped"
+    assert preview.after["status"] == "starting"
+    # Nothing was written to the fake device.
+    rows = {row.get("name") or row["tag"]: row["status"] for row in fake.path("container")._rows}
+    assert rows == {"grafana": "stopped", "alpine:latest": "running"}
+
+
+def test_start_container_confirm_true_applies_by_name(settings_write_enabled: Settings, device: Device):
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+
+    assert preview.applied is True
+    assert preview.before["status"] == "stopped"
+    assert preview.after["status"] == "starting"
+    rows = {row.get("name") or row["tag"]: row["status"] for row in fake.path("container")._rows}
+    # FakePath's action handler mutates the row's status to "running" once
+    # the "start" command is actually dispatched (confirm=True) - see
+    # tests/fakes.py's FakePath.__call__.
+    assert rows == {"grafana": "running", "alpine:latest": "running"}
+
+
+def test_stop_container_confirm_true_applies_by_tag(settings_write_enabled: Settings, device: Device):
+    """"alpine:latest" has no `name` field on the fixture row - resolution
+    must fall back to matching on `tag`."""
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.stop_container(client, settings_write_enabled, container="alpine:latest", confirm=True)
+
+    assert preview.applied is True
+    assert preview.operation == "stop_container"
+    rows = {row.get("name") or row["tag"]: row["status"] for row in fake.path("container")._rows}
+    assert rows == {"grafana": "stopped", "alpine:latest": "stopped"}
+
+
+def test_start_container_dispatches_via_allowlist_id_only_targeted_row_changes(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+
+    rows = {row.get("name") or row["tag"]: row["status"] for row in fake.path("container")._rows}
+    # alpine:latest (row 1, already running) must be untouched.
+    assert rows == {"grafana": "running", "alpine:latest": "running"}
+
+
+def test_start_container_unknown_container_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.start_container(client, settings_write_enabled, container="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+    # Nothing was created or changed.
+    rows = {row.get("name") or row["tag"]: row["status"] for row in fake.path("container")._rows}
+    assert rows == {"grafana": "stopped", "alpine:latest": "running"}
+
+
+def test_stop_container_unknown_container_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.stop_container(client, settings_write_enabled, container="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_start_container_rejects_invalid_identifier_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.start_container(guarded_client, settings_write_enabled, container="grafana\nrm -rf /", confirm=True)
+
+
+def test_start_container_dispatch_follows_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    """Same proof as test_set_identity_dispatch_follows_allowlist_action
+    (A1), for the new start/stop action-command dispatch: point
+    ALLOWLIST["start_container"].action at a stub method and confirm THAT
+    method gets called with the resolved `.id`, proving `action` (not a
+    hardcoded client.start(...) call) actually governs dispatch."""
+    fake = _containers_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["start_container"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "start_container", patched_op)
+
+    guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"id": "*1"}}

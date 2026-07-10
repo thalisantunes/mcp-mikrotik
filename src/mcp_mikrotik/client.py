@@ -171,7 +171,10 @@ class RouterosConnection(Protocol):
 
     def path(self, *path: str) -> Iterable[dict[str, Any]]:
         """Return an object that, when iterated, yields rows (dicts) and that
-        also supports .add(**fields) / .update(**fields) / .remove(*ids)."""
+        also supports .add(**fields) / .update(**fields) / .remove(*ids), plus
+        the callable action-command form used by MikrotikClient.start/.stop
+        (e.g. `path("container")("start", **{".id": id})`, mirroring
+        librouteros' own Path.__call__)."""
         ...
 
     def __call__(self, cmd: str, **kwargs: Any) -> Iterable[dict[str, Any]]:
@@ -410,6 +413,30 @@ class MikrotikClient:
 
         return self._run_read("interface/ethernet/poe/monitor", _do)
 
+    def lte_monitor(self, interface: str) -> dict[str, Any]:
+        """Run /interface/lte/monitor once=yes for a single LTE interface,
+        returning one reply dict (current-operator, access-technology,
+        rsrp/rsrq/sinr/rssi, band, registration-status, cell-id - see
+        server.py's `lte_status` tool for how these are surfaced).
+
+        Same "once" construction and semantics as monitor_traffic/poe_monitor
+        above, reused as instructed for this round: `once=""` gets exactly
+        one reply back instead of opening a continuous stream, and
+        `interface` is forwarded as a structured parameter (expected to
+        already be validated by validation.validate_interface_name) rather
+        than part of a command string. Retried automatically on a transient
+        network error - see _run_read. A device with no LTE interface/package
+        at all raises DeviceCommandError, same as any other unknown RouterOS
+        menu - see server.py's `lte_status`, which treats that as "no LTE
+        here" rather than a hard failure.
+        """
+
+        def _do(connection: RouterosConnection) -> dict[str, Any]:
+            replies = connection("/interface/lte/monitor", interface=interface, once="")
+            return dict(replies[0]) if replies else {}
+
+        return self._run_read("interface/lte/monitor", _do)
+
     # --- Write primitives -------------------------------------------------
     # These are intentionally NOT exposed as MCP tools directly. The only
     # caller allowed to invoke them is guard.py, which maps each write
@@ -417,8 +444,8 @@ class MikrotikClient:
     # server.py directly - go through guard.py so every write stays subject
     # to the read-only gate, the allowlist, and the confirm/preview flow.
     #
-    # No retry: idempotency isn't guaranteed for add/update/remove, so a
-    # retried write could duplicate or reapply a change. Each still goes
+    # No retry: idempotency isn't guaranteed for add/update/remove/start/stop,
+    # so a retried write could duplicate or reapply a change. Each still goes
     # through the circuit breaker (via _execute_once/_connect_guarded), so a
     # write to a known-dead device still fails fast instead of hanging on a
     # connect attempt - the breaker only ever affects the connection step,
@@ -442,6 +469,37 @@ class MikrotikClient:
             connection.path(*segments).remove(*ids)
 
         self._execute_once("/".join(segments), _do)
+
+    # --- v0.7: action commands (start/stop) --------------------------------
+    #
+    # RouterOS's /container/start and /container/stop are ACTION commands,
+    # not the update/add/remove trio above - the RouterOS console syntax is
+    # `/container start <numbers>` / `/container stop <numbers>`, not a
+    # `set`. There is no new generic "run any action" entrypoint here: each
+    # of these two methods only ever sends the one fixed command word its
+    # name says (`"start"`/`"stop"`), never a command supplied by the
+    # caller - guard.py's ALLOWLIST is the only thing that decides which of
+    # `start`/`stop` gets dispatched (via `getattr(client, op.action)`, same
+    # as update/add/remove), and it only ever does so for the fixed
+    # `("container",)` path, never an arbitrary one.
+    #
+    # `id` is forwarded as the structured `.id` parameter - the same
+    # RouterOS API convention `remove()` above already relies on for
+    # targeting one specific row by its `.id` (see librouteros' own
+    # `Path.remove()`), not part of a command string. No retry, same
+    # reasoning as update/add/remove.
+
+    def start(self, *segments: str, id: str) -> None:
+        def _do(connection: RouterosConnection) -> None:
+            connection.path(*segments)("start", **{".id": id})
+
+        self._execute_once("/".join(segments) + "/start", _do)
+
+    def stop(self, *segments: str, id: str) -> None:
+        def _do(connection: RouterosConnection) -> None:
+            connection.path(*segments)("stop", **{".id": id})
+
+        self._execute_once("/".join(segments) + "/stop", _do)
 
     def close(self) -> None:
         if self._connection is not None:

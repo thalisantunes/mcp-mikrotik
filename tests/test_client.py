@@ -87,6 +87,89 @@ def test_poe_monitor_returns_empty_dict_when_device_replies_nothing(
     assert client.poe_monitor("sfp1") == {}
 
 
+# --- v0.7: lte_monitor -------------------------------------------------
+
+
+def test_lte_monitor_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    reply = client.lte_monitor("lte1")
+    assert reply["current-operator"] == "Vivo"
+    assert reply["access-technology"] == "lte"
+    assert fake_connection.calls == [("/interface/lte/monitor", {"interface": "lte1", "once": ""})]
+
+
+def test_lte_monitor_returns_empty_dict_when_device_replies_nothing(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    assert client.lte_monitor("lte99") == {}
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_lte_monitor_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.lte_monitor("lte1")
+    assert device.name in str(exc_info.value)
+
+
+def test_lte_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    reply = client.lte_monitor("lte1")
+
+    assert reply == {}
+    assert flaky.calls_made == 2
+
+
+# --- v0.7: start/stop (RouterOS ACTION commands, not update/add/remove) ----
+
+
+def test_start_dispatches_as_action_command_with_structured_id(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "stopped"}]
+    client.start("container", id="*1")
+    rows = fake_connection.path("container")._rows
+    assert rows[0]["status"] == "running"
+
+
+def test_stop_dispatches_as_action_command_with_structured_id(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "running"}]
+    client.stop("container", id="*1")
+    rows = fake_connection.path("container")._rows
+    assert rows[0]["status"] == "stopped"
+
+
+def test_start_only_touches_the_targeted_row(client: MikrotikClient, fake_connection: FakeConnection):
+    fake_connection._data[("container",)] = [
+        {".id": "*1", "name": "grafana", "status": "stopped"},
+        {".id": "*2", "name": "alpine", "status": "stopped"},
+    ]
+    client.start("container", id="*2")
+    rows = {row["name"]: row["status"] for row in fake_connection.path("container")._rows}
+    assert rows == {"grafana": "stopped", "alpine": "running"}
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_start_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.start("container", id="*1")
+    assert device.name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_stop_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.stop("container", id="*1")
+    assert device.name in str(exc_info.value)
+
+
 def test_close_is_idempotent(client: MikrotikClient, fake_connection: FakeConnection):
     client.close()
     assert fake_connection.closed is True
@@ -408,6 +491,8 @@ def test_read_retries_env_var_zero_disables_retry_entirely(device: Device, monke
         lambda client: client.update("system", "identity", name="x"),
         lambda client: client.add("ip", "address", address="10.0.0.9/24"),
         lambda client: client.remove("ip", "address", ids=("*1",)),
+        lambda client: client.start("container", id="*1"),
+        lambda client: client.stop("container", id="*1"),
     ],
 )
 def test_writes_never_retry_on_transient_oserror(device: Device, write_call):

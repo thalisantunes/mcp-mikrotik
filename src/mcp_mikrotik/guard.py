@@ -48,6 +48,7 @@ from .exceptions import (
 from .validation import (
     validate_address_list_name,
     validate_comment,
+    validate_container_identifier,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
@@ -62,7 +63,7 @@ from .validation import (
 class WriteOperation:
     name: str
     path: tuple[str, ...]
-    action: str  # "update" | "add" | "remove"
+    action: str  # "update" | "add" | "remove" | "start" | "stop"
     description: str
 
 
@@ -149,6 +150,25 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("interface", "ethernet"),
         action="update",
         description="Set a PoE-capable ethernet port's PoE output mode (auto-on/forced-on/off).",
+    ),
+    # start_container/stop_container (v0.7) are the first ALLOWLIST entries
+    # whose `action` is neither update/add/remove: /container/start and
+    # /container/stop are RouterOS ACTION commands (see
+    # client.MikrotikClient.start/.stop), not a field `set`. Dispatch still
+    # goes through the exact same `getattr(client, op.action)` mechanism as
+    # every other write - see start_container/stop_container below - just
+    # naming a different (still fixed, still reviewed) MikrotikClient method.
+    "start_container": WriteOperation(
+        name="start_container",
+        path=("container",),
+        action="start",
+        description="Start a container by name/tag (/container/start).",
+    ),
+    "stop_container": WriteOperation(
+        name="stop_container",
+        path=("container",),
+        action="stop",
+        description="Stop a container by name/tag (/container/stop).",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -740,3 +760,87 @@ def set_poe_out(
     write = getattr(client, op.action)
     write(*op.path, **{".id": row.get(".id"), "poe-out": validated_poe_out})
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.7: LTE/5G + containers + USB -----------------------------------------
+
+
+def _find_container_row(rows: list[dict[str, Any]], identifier: str) -> dict[str, Any] | None:
+    """Resolve a container by `name` first - RouterOS only populates
+    /container's `name` field when the container was explicitly given one -
+    falling back to `tag` (the image tag, always present, e.g.
+    "alpine:latest") otherwise. Mirrors set_wifi_ssid's ROS7-then-ROS6
+    fallback shape above: two fixed, ordered candidate fields, never one
+    supplied by the caller."""
+    row = _find_row_by_field(rows, "name", identifier)
+    if row is not None:
+        return row
+    return _find_row_by_field(rows, "tag", identifier)
+
+
+def _set_container_running(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    container: str,
+    target_status: str,
+    confirm: bool,
+) -> WritePreview:
+    """Shared implementation behind start_container/stop_container - both
+    resolve `container` (by name, then tag - see _find_container_row) to one
+    /container row and dispatch through ALLOWLIST[operation_name].action
+    (`getattr(client, op.action)` - "start" or "stop", never a caller-chosen
+    command), exactly the same `op.action`-driven dispatch shape as every
+    other guarded write (see set_identity's A1 comment above) - just with a
+    fixed action-command MikrotikClient method (client.start/.stop) instead
+    of update/add/remove.
+
+    Raises ResourceNotFoundError if `container` doesn't match any row on the
+    device - this never creates a container.
+
+    `target_status` in the returned preview's `after` is the RouterOS
+    `status` value the start/stop command sets *immediately* ("starting"/
+    "stopping"), not a guaranteed final state: RouterOS transitions a
+    container's status asynchronously (image extraction, process startup) as
+    it settles into "running"/"stopped" - re-read via the `containers` tool
+    to see the settled status.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_container = validate_container_identifier(container)
+
+    rows = client.path(*op.path)
+    row = _find_container_row(rows, validated_container)
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "Container", validated_container)
+
+    before = dict(row)
+    after = dict(row)
+    after["status"] = target_status
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, id=row.get(".id"))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("start_container")
+def start_container(client: MikrotikClient, settings: Settings, container: str, confirm: bool) -> WritePreview:
+    """Start a container by `name` or `tag` (/container/start). Errors
+    (never creates anything) if `container` doesn't match any /container row
+    on the device."""
+    return _set_container_running(
+        client, settings, "start_container", container, target_status="starting", confirm=confirm
+    )
+
+
+@_audited("stop_container")
+def stop_container(client: MikrotikClient, settings: Settings, container: str, confirm: bool) -> WritePreview:
+    """Stop a container by `name` or `tag` (/container/stop). Errors (never
+    creates anything) if `container` doesn't match any /container row on the
+    device."""
+    return _set_container_running(
+        client, settings, "stop_container", container, target_status="stopping", confirm=confirm
+    )

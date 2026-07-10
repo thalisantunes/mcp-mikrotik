@@ -306,6 +306,38 @@ def validate_poe_out(value: str) -> str:
     return value
 
 
+# --- v0.7: containers ------------------------------------------------------
+
+# A container identifier (matched against /container's `name` field, then
+# its `tag` field - see guard._find_container_row) is deliberately NOT
+# restricted to the same conservative charset as _INTERFACE_NAME/_LIST_NAME:
+# a RouterOS container `tag` is a Docker-style image reference, e.g.
+# "myregistry.example.com:5000/library/alpine:latest", which legitimately
+# uses ':', '/', and '.'. This validator only rejects the same class of
+# garbage validate_comment already rejects (empty, too long, control
+# characters) - not because it's an injection defense (see module docstring:
+# every value is always sent as a structured API parameter), but to fail
+# clearly before ever touching a device rather than forwarding whatever was
+# typed.
+_MAX_CONTAINER_IDENTIFIER_LENGTH = 255
+
+
+def validate_container_identifier(value: str) -> str:
+    """Validate a container `name`/`tag` identifier, used by
+    `start_container`/`stop_container`. Returns the (stripped) value on
+    success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Container identifier must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_CONTAINER_IDENTIFIER_LENGTH:
+        raise ValidationError("Container identifier is too long.")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("Container identifier contains control characters, which are not allowed.")
+    return value
+
+
 def validate_rate_pair(value: str, field_name: str) -> str:
     """Validate a RouterOS rate-pair string, as used by Simple Queue's
     `max-limit` and `limit-at` fields. RouterOS's own format is

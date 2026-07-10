@@ -167,7 +167,11 @@ def test_journal_never_leaks_device_password_on_error(
 
 
 def test_journal_never_leaks_device_password_across_every_write_tool(
-    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+    audit_log: Path,
+    client: MikrotikClient,
+    settings_write_enabled: Settings,
+    device: Device,
+    fake_connection: FakeConnection,
 ):
     """Broad sweep: exercise every guarded write tool (preview + apply) and
     assert the device password never shows up anywhere in the journal."""
@@ -189,11 +193,14 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
         client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=True
     )
     guard.set_poe_out(client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True)
+    fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "stopped"}]
+    guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+    guard.stop_container(client, settings_write_enabled, container="grafana", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 10
+    assert len(events) == 12
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -265,3 +272,72 @@ def test_set_poe_out_unknown_interface_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "set_poe_out"
+
+
+# --- start_container / stop_container (v0.7) --------------------------------
+
+
+def test_start_container_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "name": "grafana", "status": "stopped"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "start_container"
+    assert event["operation"] == "start_container"
+    assert event["action"] == "start"
+    assert event["summary"]["before"]["status"] == "stopped"
+    assert event["summary"]["after"]["status"] == "starting"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_stop_container_preview_journals_outcome_preview(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "name": "grafana", "status": "running"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    guard.stop_container(client, settings_write_enabled, container="grafana", confirm=False)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert events[0]["confirm"] is False
+    assert events[0]["tool"] == "stop_container"
+    assert events[0]["operation"] == "stop_container"
+    assert events[0]["action"] == "stop"
+
+
+def test_start_container_unknown_container_journals_outcome_error(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("container",): []})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.start_container(client, settings_write_enabled, container="ghost", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "start_container"
+
+
+def test_stop_container_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.stop_container(client, settings, container="grafana", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "stop_container"

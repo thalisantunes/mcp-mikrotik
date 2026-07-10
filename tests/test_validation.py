@@ -6,6 +6,7 @@ from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
     validate_address_list_name,
     validate_comment,
+    validate_container_identifier,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
@@ -301,3 +302,35 @@ def test_validate_poe_out_rejects_invalid(value: str):
 def test_validate_poe_out_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_poe_out(None)  # type: ignore[arg-type]
+
+
+# --- validate_container_identifier (v0.7) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "grafana",
+        "alpine:latest",
+        "grafana/grafana:latest",
+        "myregistry.example.com:5000/library/alpine:latest",
+        "a",
+    ],
+)
+def test_validate_container_identifier_accepts_valid(value: str):
+    assert validate_container_identifier(value) == value
+
+
+def test_validate_container_identifier_strips_whitespace():
+    assert validate_container_identifier("  grafana  ") == "grafana"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "grafana\nrm -rf /", "grafana\ttag", "a" * 256])
+def test_validate_container_identifier_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_container_identifier(value)
+
+
+def test_validate_container_identifier_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_container_identifier(None)  # type: ignore[arg-type]

@@ -133,6 +133,38 @@ def fake_connection() -> FakeConnection:
                     "local": "false",
                 }
             ],
+            # v0.7: LTE/5G, containers, USB.
+            ("interface", "lte"): [
+                {".id": "*1", "name": "lte1", "running": "true", "disabled": "false", "apn-profiles": "default"}
+            ],
+            ("container",): [
+                {
+                    ".id": "*1",
+                    "name": "grafana",
+                    "tag": "grafana/grafana:latest",
+                    "status": "running",
+                    "ram-usage": "52428800",
+                    "root-dir": "usb1/grafana",
+                    "interface": "veth1",
+                    "os": "linux",
+                },
+                {
+                    ".id": "*2",
+                    "tag": "alpine:latest",
+                    "status": "stopped",
+                    "ram-usage": "0",
+                    "root-dir": "usb1/alpine",
+                    "interface": "veth2",
+                    "os": "linux",
+                },
+            ],
+            ("container", "config"): [
+                {"registry-url": "https://registry-1.docker.io", "tmpdir": "usb1/tmp", "ram-high": "0"}
+            ],
+            ("system", "routerboard", "usb"): [{".id": "*1", "port": "1", "power-reset": "auto-on"}],
+            ("disk",): [
+                {".id": "*1", "slot": "usb1", "type": "usb", "total-size": "32000000000", "free-size": "20000000000"}
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
@@ -162,6 +194,19 @@ def fake_connection() -> FakeConnection:
                 "poe-out-voltage": "0",
                 "poe-out-current": "0",
                 "poe-out-power": "0",
+            },
+        },
+        lte_monitor_replies={
+            "lte1": {
+                "current-operator": "Vivo",
+                "access-technology": "lte",
+                "rsrp": "-85",
+                "rsrq": "-10",
+                "sinr": "18",
+                "rssi": "-70",
+                "band": "B3",
+                "registration-status": "registered",
+                "cell-id": "12345678",
             },
         },
     )

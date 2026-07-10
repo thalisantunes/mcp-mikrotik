@@ -3,6 +3,147 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.7.0] - Unreleased
+
+LTE/5G + containers + USB round: read tools for cellular WAN status,
+RouterOS's container subsystem, and USB hardware, plus one new mechanic on
+the write-guard - `start_container`/`stop_container`, the first guarded
+writes whose RouterOS operation is an ACTION command (`/container/start`,
+`/container/stop`) rather than an update/add/remove `set`. Same write-guard
+mechanism as every previous round (read-only default, central allowlist,
+confirm/preview, audit journal, ROS6/ROS7 compat) - extended, not weakened
+or bypassed. See "How start/stop extends the guard" below.
+
+### Added
+
+- **`lte_status`** (read, `src/mcp_mikrotik/server.py`): signal/status of
+  one LTE/5G modem interface, via `/interface/lte/monitor <interface>
+  once=yes` - operator (`current-operator`), technology
+  (`access-technology`: 3G/LTE/5G), signal (`rsrp`/`rsrq`/`sinr`/`rssi`),
+  `band`, `registration-status`, `cell-id`. Reuses the exact same
+  "monitor-once" construction as v0.6's `interface_traffic`/`poe_status`
+  (`once=""` as a structured flag, one reply, no continuous stream - see
+  `MikrotikClient.lte_monitor` below). `interface` is validated for shape
+  (`validate_interface_name`, reused from v0.6) before use. Returns an empty
+  dict (never an error) for a device with no LTE hardware/package at all,
+  same convention as `poe_status`/`system_health` for optional hardware.
+- **`lte_interfaces`** (read): lists `/interface/lte` - name, running,
+  disabled, apn-profiles, etc. Empty list (not an error) with no LTE
+  hardware.
+- **`containers`** (read): lists `/container` - name/tag, status,
+  ram-usage, root-dir, interface, os. Empty list (not an error) with no
+  container package/hardware support.
+- **`container_config`** (read): `/container/config` (registry-url,
+  tmpdir, ram-high, ...) - a single-row menu. Empty dict (not an error)
+  with no container package.
+- **`usb_devices`** (read): combines `/system/routerboard/usb` (physical
+  USB ports, if the board exposes them) and `/disk` (attached storage - USB
+  flash drives, and USB LTE/5G modems that surface as a disk rather than
+  under routerboard/usb) into `{"usb_ports": [...], "disks": [...]}`, since
+  which of the two a given USB device shows up under depends on the
+  hardware. Either or both lists empty (never an error) if the board
+  exposes neither.
+- **`start_container`/`stop_container`** (WRITE, guarded - new `ALLOWLIST`
+  entries `src/mcp_mikrotik/guard.py`): start/stop a container by `name` or
+  `tag` (`/container/start`/`/container/stop`). Same guard mechanics as
+  every other write tool - blocked by the read-only gate unless
+  `MIKROTIK_ALLOW_WRITE=true`, `confirm=false` previews a before/after
+  without touching the device, only `confirm=true` applies it, raises
+  `ResourceNotFoundError` if `container` doesn't match any `/container`
+  row's `name` or `tag` (never creates one), and goes through the v0.5
+  audit-journal `_audited` decorator automatically - the device password
+  never appears in the journal. See "How start/stop extends the guard"
+  below for the new mechanics this round adds on top of that.
+- `MikrotikClient.lte_monitor` (`src/mcp_mikrotik/client.py`): new read
+  primitive, built exactly like `monitor_traffic`/`poe_monitor` - the
+  callable connection form, `once=""`, automatic read-retry, transport
+  failures wrapped as `DeviceCommandError`.
+- `MikrotikClient.start`/`.stop` (`src/mcp_mikrotik/client.py`, new): the
+  first *action-command* write primitives, alongside `update`/`add`/
+  `remove`. Each sends exactly one fixed command word (`"start"`/`"stop"`)
+  via the connection's `path(*segments)(cmd, **{".id": id})` callable form
+  (mirroring `librouteros.api.Path.__call__`, the same mechanism its own
+  `Path.remove()` uses for `.id`-targeted operations) - never a
+  caller-supplied command or path. No retry, same reasoning as
+  `update`/`add`/`remove` (idempotency isn't guaranteed for a repeated
+  action either).
+- `validation.validate_container_identifier` (`src/mcp_mikrotik/validation.py`):
+  shape validation for a container `name`/`tag` identifier - non-empty, no
+  control characters, length-capped. Deliberately NOT restricted to
+  `_INTERFACE_NAME`/`_LIST_NAME`'s conservative charset, since a real
+  container `tag` is a Docker-style image reference that legitimately
+  contains `:`, `/`, and `.` (e.g.
+  `"myregistry.example.com:5000/library/alpine:latest"`).
+
+### How start/stop extends the guard
+
+`start_container`/`stop_container` are the first `ALLOWLIST` entries whose
+`action` is neither `"update"`, `"add"`, nor `"remove"` - RouterOS's
+`/container/start`/`/container/stop` are ACTION commands (the CLI syntax is
+`/container start <numbers>`, not a `set`), so the guard mechanism itself
+was extended, carefully, to cover that shape without opening up anything
+new:
+
+- **Two new fixed `MikrotikClient` methods, `.start`/`.stop`**, each
+  sending exactly one hardcoded RouterOS command word - never a command or
+  path supplied by a caller (see `client.py` above). There is still no way
+  to reach an arbitrary API path or command through this package; `.start`/
+  `.stop` are exactly as narrow as `.update`/`.add`/`.remove` were before
+  them.
+- **Dispatch still goes through the same `getattr(client, op.action)`
+  mechanism** every other guarded write already used (see `set_identity`'s
+  A1 dispatch, `guard.py`) - `ALLOWLIST["start_container"].action ==
+  "start"` and `ALLOWLIST["stop_container"].action == "stop"` are what
+  actually get called, exactly as `"update"`/`"add"`/`"remove"` did for
+  every prior write. `guard._set_container_running` (the shared
+  implementation behind both) never calls `client.start`/`.stop` directly -
+  only via that same `op.action` indirection.
+- **The container is always resolved server-side, by `.id`, before the
+  action fires** - `guard._find_container_row` looks up the caller-supplied
+  `container` string against `/container`'s `name` field first, then `tag`
+  (mirroring `set_wifi_ssid`'s ROS7-then-ROS6 fallback shape), and only
+  ever passes the resolved row's own `.id` to `client.start`/`.stop`. A
+  `container` that doesn't match any row raises `ResourceNotFoundError` -
+  `start_container`/`stop_container` never create a container, same "never
+  creates the target" invariant as `enable_interface`/`set_poe_out`/etc.
+- **Same read-only gate and confirm/preview flow, unchanged.**
+  `_require_allowed` (the read-only gate + allowlist check) runs first, exactly
+  like every other write, before the device is ever touched by a
+  `container` lookup. `confirm=false` computes and returns a before/after
+  preview - `after.status` set to the *immediate* transitional status
+  RouterOS's action command sets (`"starting"`/`"stopping"`), not a
+  guaranteed final state, since starting/stopping a container is
+  RouterOS-async (image extraction, process startup) rather than the
+  synchronous field-set `enable_interface`/`set_poe_out` make - without
+  touching the device; only `confirm=true` calls `client.start`/`.stop`.
+- **Same `_audited` decorator, unchanged** - `start_container`/
+  `stop_container` are journaled exactly like every other write, with
+  `action` in the journal now correctly showing `"start"`/`"stop"` instead
+  of being forced into the old three-value enum.
+
+### Tests
+
+61 new tests (415 → 476, full suite green): `MikrotikClient.lte_monitor`
+(structured params not a command string, empty-reply handling,
+transport-error wrapping, read retry) and `.start`/`.stop` (action-command
+dispatch via the structured `.id` parameter, only the targeted row changes,
+transport-error wrapping, no retry - extending the existing
+"writes never retry" parametrized case);
+`validation.validate_container_identifier` (valid/invalid/non-string
+cases, including that a Docker-style `registry:port/repo:tag` identifier is
+accepted); `guard.start_container`/`.stop_container` (blocked read-only,
+gate-before-touch, preview/confirm, name-then-tag resolution, `.id`-targeted
+dispatch proven via the same monkeypatched-action technique as
+`set_identity`'s A1 test, unknown container, invalid identifier before
+touching the device, audit journal outcomes including the extended
+no-password-leak sweep across all twelve write tools); and `lte_status`/
+`lte_interfaces`/`containers`/`container_config`/`usb_devices`/
+`start_container`/`stop_container` exercised end to end through `server.py`'s
+`call_tool` (happy paths, the read-only-by-default and
+read-tools-never-gated cases, empty/no-hardware fallback for every new read
+tool, and the invalid-input/unknown-resource error paths for the two new
+write tools).
+
 ## [0.6.0] - Unreleased
 
 Physical layer / L2 observability round, plus PoE control: read tools to

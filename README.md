@@ -13,21 +13,26 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.6: everything from v0.5 (the core read-tool inventory, `ping`/
+v0.7: everything from v0.6 (the core read-tool inventory, `ping`/
 `traceroute` diagnostics, a set of guarded write tools - `set_identity`,
 `enable_interface`/`disable_interface`, `set_wifi_ssid`,
 `set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`,
-`add_to_address_list`/`remove_from_address_list` - all going through the
-same write-guard mechanism, plus the production-hardening layers around it:
-audit journal, correlation ids, read retry, circuit breaker), plus a
-physical layer / L2 observability round: `interface_traffic` (live rx/tx
-rate for one interface) and `poe_status` (per-port PoE configuration and
-live consumption), and one new guarded write tool, `set_poe_out` (set a
-PoE-capable port's output mode - the killer feature being a remote power
-cycle for a locked-up antenna/camera/AP). See "Physical layer & PoE control"
-below. None of this changes the security model - see "Production features"
-and "Security model" below. See `CHANGELOG.md` for what changed since
-v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
+`add_to_address_list`/`remove_from_address_list`, `set_poe_out` - all going
+through the same write-guard mechanism, plus the production-hardening
+layers around it: audit journal, correlation ids, read retry, circuit
+breaker; physical layer / L2 observability - `interface_traffic`,
+`poe_status`), plus an LTE/5G + containers + USB round: `lte_status`/
+`lte_interfaces` (cellular WAN signal/status), `containers`/
+`container_config` (RouterOS's container subsystem), `usb_devices` (USB
+ports + attached storage), and two new guarded write tools,
+`start_container`/`stop_container` - the first writes whose RouterOS
+operation is an ACTION command rather than an update/add/remove `set`; see
+"How start/stop extends the guard" in `CHANGELOG.md` for how that new shape
+was added without weakening the guard. See "LTE/5G monitoring", "Container
+management", and "USB" below. None of this changes the security model - see
+"Production features" and "Security model" below. See `CHANGELOG.md` for
+what changed since v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add
+the next write tool.
 
 ## Installation
 
@@ -118,6 +123,11 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `bridge_hosts` | List `/interface/bridge/host` entries (mac-address, on-interface, bridge, dynamic, local) - find which physical bridge port a MAC is currently on. |
 | `interface_traffic` | Current rx/tx rate of one `interface` (`/interface/monitor-traffic once=yes`); `interface` is validated for shape before use. A single instantaneous reading, not a stream - see "Physical layer & PoE control" below. |
 | `poe_status` | PoE configuration + live consumption for every PoE-capable ethernet port on the device (voltage/current/power/`poe-out-status`); empty list (not an error) for a device with no PoE hardware. See "Physical layer & PoE control" below. |
+| `lte_status` | Signal/status of one LTE/5G modem `interface` (`/interface/lte/monitor once=yes`) - operator, technology (3G/LTE/5G), signal (rsrp/rsrq/sinr/rssi), band, registration-status, cell-id. Empty dict (not an error) with no LTE hardware. See "LTE/5G monitoring" below. |
+| `lte_interfaces` | List LTE/5G modem interfaces (name, running, disabled, apn-profiles). Empty list (not an error) with no LTE hardware. |
+| `containers` | List containers (name/tag, status, ram-usage, root-dir, interface, os). Empty list (not an error) with no container package. See "Container management" below. |
+| `container_config` | Container subsystem configuration (registry-url, tmpdir, ram-high). Empty dict (not an error) with no container package. |
+| `usb_devices` | USB ports (`/system/routerboard/usb`) + attached storage (`/disk`) combined as `{"usb_ports": [...], "disks": [...]}`; either or both empty (not an error) with no USB hardware. See "USB" below. |
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 
 ### Write (guarded)
@@ -139,6 +149,8 @@ model" below for the full guard mechanism.
 | `add_to_address_list` | Add an IP/subnet `address` to a named firewall `list_name`. **Only manages the list** - see "Blocking/allowing a client via address lists" below for why this alone doesn't block/allow anything. Refuses to create a duplicate `list_name`+`address` pair. |
 | `remove_from_address_list` | Remove the `list_name`+`address` entry from a firewall address-list. Same "list only" caveat as `add_to_address_list`. |
 | `set_poe_out` | Set a PoE-capable ethernet port's `poe-out` mode (`auto-on`/`forced-on`/`off`). Errors if `interface_name` doesn't exist, or exists but isn't PoE-capable; never creates/coerces anything. See "Physical layer & PoE control" below. |
+| `start_container` | Start a container by `name` or `tag` (`/container/start`). Errors if `container` doesn't match any container; never creates one. See "Container management" below. |
+| `stop_container` | Stop a container by `name` or `tag` (`/container/stop`). Errors if `container` doesn't match any container; never creates one. See "Container management" below. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
@@ -233,6 +245,60 @@ anything: it raises `ResourceNotFoundError` if `interface_name` doesn't
 exist on the device at all, or if it exists but has no `poe-out` field (not
 PoE-capable hardware, e.g. an SFP+ cage) - see "Security model" below.
 
+### LTE/5G monitoring (v0.7)
+
+For devices with a cellular WAN modem (LTE/5G):
+
+- `lte_interfaces` to see which LTE interfaces exist on the device (name,
+  running, disabled, apn-profiles).
+- `lte_status` for one interface's live signal/status - operator
+  (`current-operator`), technology (`access-technology`: 3G/LTE/5G), signal
+  quality (`rsrp`/`rsrq`/`sinr`/`rssi`), `band`, `registration-status`, and
+  `cell-id`. Built the same "monitor-once" way as `interface_traffic`/
+  `poe_status` (`/interface/lte/monitor <interface> once=yes`) - a single
+  instantaneous reading, not a stream.
+
+Both return empty (an empty list/dict, never an error) on a device with no
+LTE hardware or package at all - the same convention `poe_status`/
+`system_health` already use for optional hardware.
+
+### Container management (v0.7)
+
+RouterOS 7's container package runs OCI containers directly on the device
+(e.g. a lightweight metrics agent or a small web dashboard, without a
+separate host). The typical flow:
+
+1. `containers` to see what's deployed (name/tag, status, ram-usage,
+   root-dir, interface, os) and `container_config` for the subsystem-wide
+   settings (registry-url, tmpdir, ram-high).
+2. `start_container`/`stop_container` with `confirm=false` first to preview,
+   then `confirm=true` to actually apply it. `container` matches against a
+   container's `name` if it has one, falling back to its `tag` (the image
+   reference, e.g. `"grafana/grafana:latest"`) otherwise - RouterOS only
+   populates `name` when the container was created with one explicitly.
+
+Unlike `enable_interface`/`set_poe_out` (which flip a field synchronously),
+starting/stopping a container fires a RouterOS *action* command
+(`/container/start`/`/container/stop`) that transitions asynchronously -
+the preview's `after.status` reflects the immediate transitional state
+(`"starting"`/`"stopping"`), not a guaranteed final one. Call `containers`
+again afterward to see the settled `"running"`/`"stopped"` status. See
+`CHANGELOG.md`'s "How start/stop extends the guard" for how this new
+action-command shape was added to the write guard without weakening it.
+Like every other write tool, `start_container`/`stop_container` never
+create a container: an unmatched `container` raises
+`ResourceNotFoundError`.
+
+### USB (v0.7)
+
+`usb_devices` reads `/system/routerboard/usb` (physical USB ports, on
+boards that expose them) and `/disk` (attached storage - USB flash drives,
+and USB LTE/5G modems that surface as a disk rather than under
+routerboard/usb) and returns both as `{"usb_ports": [...], "disks":
+[...]}`, since which of the two a given USB device shows up under depends
+on the hardware. Either or both lists come back empty (never an error) on a
+board with no USB hardware at all.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -246,6 +312,12 @@ Three independent controls apply to every write tool, all centralized in
    dedicated, named function (e.g. `set_identity`, `enable_interface`)
    mapped to exactly one API path and action in `guard.ALLOWLIST`. There is
    no code path by which a caller can reach an API path outside that table.
+   As of v0.7, `action` isn't limited to `update`/`add`/`remove`:
+   `start_container`/`stop_container` use `start`/`stop` to represent
+   RouterOS's `/container/start`/`/container/stop` ACTION commands - but the
+   dispatch mechanism (`getattr(client, op.action)`) and the fixed,
+   individually-reviewed `MikrotikClient` method it can ever reach are
+   unchanged; see `CHANGELOG.md`'s "How start/stop extends the guard".
    `set_wifi_ssid` and `set_client_bandwidth` are the two exceptions to "one
    tool, one allowlist entry": because RouterOS exposes wifi under different
    paths depending on generation (ROS7 `/interface/wifi` vs ROS6
@@ -268,14 +340,15 @@ On top of the write guard:
 
 - **Never creates the target.** Write tools that operate on a named resource
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
-  `remove_from_address_list`/`set_poe_out`) look it up by name first. If no
-  interface/wireless network/queue/address-list entry with that name (or
-  `target`, or `list_name`+`address` pair) exists on the device, the tool
-  raises a clear error instead of creating one - a typo can never silently
-  provision something new. `set_poe_out` additionally requires the matched
-  interface to actually have a `poe-out` field (i.e. be PoE-capable
-  hardware) - a name that exists but isn't a PoE port raises the same clear
-  error rather than doing nothing silently.
+  `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`)
+  look it up by name first. If no interface/wireless network/queue/
+  address-list entry/container with that name (or `target`, `list_name`+
+  `address` pair, or `name`/`tag`) exists on the device, the tool raises a
+  clear error instead of creating one - a typo can never silently provision
+  something new. `set_poe_out` additionally requires the matched interface
+  to actually have a `poe-out` field (i.e. be PoE-capable hardware) - a name
+  that exists but isn't a PoE port raises the same clear error rather than
+  doing nothing silently.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
   existing lease on the given `mac_address` first, and `add_to_address_list`
   checks for an existing entry with the same `list_name`+`address` pair
@@ -322,7 +395,8 @@ entirely before `MikrotikClient` ever attempts a connection.
   failed at any point, however early (even a write blocked by the read-only
   gate before the device is ever touched). Each event has a `timestamp`,
   `correlation_id`, `device_name`, `tool`, `operation` (the `ALLOWLIST` key),
-  `action` (`add`/`update`/`remove`), `confirm`, `outcome`
+  `action` (`add`/`update`/`remove`/`start`/`stop` - see v0.7's
+  `start_container`/`stop_container`), `confirm`, `outcome`
   (`preview`/`applied`/`error`), and a `summary` of the before/after change
   (or the error). **Never includes a device password or any field that
   looks like a secret** - see `src/mcp_mikrotik/audit.py`'s `_sanitize()`.
@@ -347,7 +421,7 @@ entirely before `MikrotikClient` ever attempts a connection.
   attempts (default 2). A command rejected by RouterOS itself (a
   `LibRouterosError`, not an `OSError`) is never retried - it would just be
   rejected again. **Writes never retry**, regardless of this setting:
-  `update`/`add`/`remove` aren't guaranteed idempotent, so retrying one
+  `update`/`add`/`remove`/`start`/`stop` aren't guaranteed idempotent, so retrying one
   could duplicate or reapply a change.
 - **Circuit breaker.** Each device gets its own in-memory, thread-safe
   breaker (`client.CircuitBreaker`, one instance per pooled `MikrotikClient`

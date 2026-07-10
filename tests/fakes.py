@@ -49,6 +49,28 @@ class FakePath:
     def remove(self, *ids: str) -> None:
         self._rows[:] = [row for row in self._rows if row.get(".id") not in ids]
 
+    def __call__(self, cmd: str, **kwargs: Any) -> list[dict[str, Any]]:
+        """Mirror librouteros' Path.__call__, used for RouterOS ACTION
+        commands like /container/start and /container/stop (see
+        client.MikrotikClient.start/.stop) - as opposed to the
+        print/set/add/remove verbs the other methods on this class model.
+
+        `.id` selects which row the action targets, same convention as
+        update() above; no match raises, like a real device would for an
+        unknown id. Mutates a `status` field on the matching row so tests can
+        observe the transition, exactly like update() mutates whichever
+        field was set.
+        """
+        row_id = kwargs.get(".id")
+        for row in self._rows:
+            if row.get(".id") == row_id:
+                if cmd == "start":
+                    row["status"] = "running"
+                elif cmd == "stop":
+                    row["status"] = "stopped"
+                return []
+        raise LibRouterosError(f"no such item (id={row_id!r})")
+
 
 class FakeConnection:
     """Stand-in for a connected librouteros.Api, entirely in memory."""
@@ -60,6 +82,7 @@ class FakeConnection:
         traceroute_replies: list[dict[str, Any]] | None = None,
         monitor_traffic_replies: dict[str, dict[str, Any]] | None = None,
         poe_monitor_replies: dict[str, dict[str, Any]] | None = None,
+        lte_monitor_replies: dict[str, dict[str, Any]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
     ):
@@ -70,9 +93,11 @@ class FakeConnection:
         # called with) rather than a flat list, since v0.6's monitor-once
         # commands (interface_traffic, poe_status) are always scoped to one
         # named interface - this lets a test give different fake readings to
-        # different ports in the same fake device.
+        # different ports in the same fake device. v0.7's lte_status reuses
+        # the same shape/convention (see client.MikrotikClient.lte_monitor).
         self._monitor_traffic_replies: dict[str, dict[str, Any]] = dict(monitor_traffic_replies or {})
         self._poe_monitor_replies: dict[str, dict[str, Any]] = dict(poe_monitor_replies or {})
+        self._lte_monitor_replies: dict[str, dict[str, Any]] = dict(lte_monitor_replies or {})
         self._on_call = on_call
         # Simulates a RouterOS menu that doesn't exist on this device/version
         # (e.g. /interface/wifi on a ROS6-only box, or /system/health on a
@@ -102,6 +127,9 @@ class FakeConnection:
             return [dict(reply)] if reply is not None else []
         if cmd == "/interface/ethernet/poe/monitor":
             reply = self._poe_monitor_replies.get(kwargs.get("interface"))
+            return [dict(reply)] if reply is not None else []
+        if cmd == "/interface/lte/monitor":
+            reply = self._lte_monitor_replies.get(kwargs.get("interface"))
             return [dict(reply)] if reply is not None else []
         return []
 

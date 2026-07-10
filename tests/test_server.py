@@ -42,6 +42,11 @@ EXPECTED_TOOLS = {
     "bridge_hosts",
     "interface_traffic",
     "poe_status",
+    "lte_status",
+    "lte_interfaces",
+    "containers",
+    "container_config",
+    "usb_devices",
     "list_write_operations",
     "set_identity",
     "enable_interface",
@@ -53,6 +58,8 @@ EXPECTED_TOOLS = {
     "add_to_address_list",
     "remove_from_address_list",
     "set_poe_out",
+    "start_container",
+    "stop_container",
 }
 
 
@@ -482,6 +489,136 @@ async def test_poe_status_survives_a_failed_monitor_call_for_one_port(settings: 
     mcp = build_server(settings=settings, client_factory=factory)
     _content, result = await mcp.call_tool("poe_status", {"device_name": "core-switch"})
     assert result["result"] == [{"interface": "ether1", "poe-out": "auto-on"}]
+
+
+# --- lte_status / lte_interfaces (v0.7, read-only) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_lte_status_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1"})
+    assert result["current-operator"] == "Vivo"
+    assert result["access-technology"] == "lte"
+    assert result["rsrp"] == "-85"
+    assert result["registration-status"] == "registered"
+
+
+@pytest.mark.asyncio
+async def test_lte_status_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1"})
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_lte_status_returns_empty_dict_for_device_with_no_lte(settings: Settings):
+    """A device with no LTE hardware/package raises DeviceCommandError from
+    the monitor-once call - lte_status must return an empty dict instead of
+    propagating that as an error, same convention as poe_status/
+    system_health for optional hardware."""
+    fake = FakeConnection(raise_for={("interface", "lte"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1"})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_lte_status_sends_once_flag_as_structured_param(settings: Settings):
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1"})
+    cmd, kwargs = fake.calls[-1]
+    assert cmd == "/interface/lte/monitor"
+    assert kwargs == {"interface": "lte1", "once": ""}
+
+
+@pytest.mark.asyncio
+async def test_lte_status_rejects_invalid_interface_name_before_touching_device(settings: Settings):
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1; reboot"})
+    assert "not valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_lte_interfaces_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("lte_interfaces", {"device_name": "core-switch"})
+    assert result["result"] == [
+        {".id": "*1", "name": "lte1", "running": "true", "disabled": "false", "apn-profiles": "default"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lte_interfaces_returns_empty_list_for_device_with_no_lte(settings: Settings):
+    fake = FakeConnection(raise_for={("interface", "lte"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("lte_interfaces", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+# --- containers / container_config (v0.7, read-only) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_containers_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("containers", {"device_name": "core-switch"})
+    rows = {row.get("name") or row["tag"]: row for row in result["result"]}
+    assert rows["grafana"]["status"] == "running"
+    assert rows["alpine:latest"]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_containers_returns_empty_list_for_device_with_no_container_support(settings: Settings):
+    fake = FakeConnection(raise_for={("container",): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("containers", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_container_config_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("container_config", {"device_name": "core-switch"})
+    assert result["registry-url"] == "https://registry-1.docker.io"
+
+
+@pytest.mark.asyncio
+async def test_container_config_returns_empty_dict_for_device_with_no_container_support(settings: Settings):
+    fake = FakeConnection(raise_for={("container", "config"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("container_config", {"device_name": "core-switch"})
+    assert result == {}
+
+
+# --- usb_devices (v0.7, read-only) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_usb_devices_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("usb_devices", {"device_name": "core-switch"})
+    assert result["usb_ports"] == [{".id": "*1", "port": "1", "power-reset": "auto-on"}]
+    assert result["disks"][0]["slot"] == "usb1"
+
+
+@pytest.mark.asyncio
+async def test_usb_devices_returns_empty_lists_for_board_with_no_usb(settings: Settings):
+    fake = FakeConnection(
+        raise_for={
+            ("system", "routerboard", "usb"): LibRouterosError("no such command"),
+            ("disk",): LibRouterosError("no such command"),
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("usb_devices", {"device_name": "core-switch"})
+    assert result == {"usb_ports": [], "disks": []}
 
 
 # --- enable_interface / disable_interface --------------------------------
@@ -958,6 +1095,107 @@ async def test_set_poe_out_rejects_invalid_poe_out_value_before_touching_device(
     assert "not valid" in str(exc_info.value)
 
 
+# --- start_container / stop_container (v0.7) ---------------------------------
+
+
+def _containers_factory(fake: FakeConnection):
+    def factory(settings: Settings, device_name: str) -> MikrotikClient:
+        return MikrotikClient(settings.get_device(device_name), connection=fake)
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_start_container_blocked_read_only_by_default(settings: Settings):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "name": "grafana", "status": "stopped"}]})
+    mcp = build_server(settings=settings, client_factory=_containers_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("start_container", {"device_name": "core-switch", "container": "grafana", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+    # Device was never touched.
+    assert fake.path("container")._rows[0]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_start_container_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "name": "grafana", "status": "stopped"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_containers_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "start_container", {"device_name": "core-switch", "container": "grafana", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["status"] == "stopped"
+    assert preview["after"]["status"] == "starting"
+    assert fake.path("container")._rows[0]["status"] == "stopped"
+
+    _content, applied = await mcp.call_tool(
+        "start_container", {"device_name": "core-switch", "container": "grafana", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("container")._rows[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_stop_container_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "name": "grafana", "status": "running"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_containers_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "stop_container", {"device_name": "core-switch", "container": "grafana", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["after"]["status"] == "stopping"
+    assert fake.path("container")._rows[0]["status"] == "running"
+
+    _content, applied = await mcp.call_tool(
+        "stop_container", {"device_name": "core-switch", "container": "grafana", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("container")._rows[0]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_stop_container_resolves_by_tag_when_no_name(device: Device):
+    fake = FakeConnection(data={("container",): [{".id": "*1", "tag": "alpine:latest", "status": "running"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_containers_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "stop_container", {"device_name": "core-switch", "container": "alpine:latest", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("container")._rows[0]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_start_container_unknown_container_raises_clear_error(device: Device):
+    fake = FakeConnection(data={("container",): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_containers_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "start_container", {"device_name": "core-switch", "container": "ghost", "confirm": True}
+        )
+    assert "ghost" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_stop_container_rejects_invalid_container_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "stop_container", {"device_name": "core-switch", "container": "grafana\nrm -rf /", "confirm": True}
+        )
+    assert "not valid" in str(exc_info.value) or "control characters" in str(exc_info.value)
+
+
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------
 
 
@@ -1045,7 +1283,7 @@ def test_server_never_calls_write_primitives_directly():
     server_src = (Path(__file__).resolve().parent.parent / "src" / "mcp_mikrotik" / "server.py").read_text(
         encoding="utf-8"
     )
-    forbidden = re.compile(r"\.(update|add|remove)\(")
+    forbidden = re.compile(r"\.(update|add|remove|start|stop)\(")
     match = forbidden.search(server_src)
     assert match is None, (
         f"server.py contains a direct write-primitive call ({match.group() if match else ''!r}) - "
