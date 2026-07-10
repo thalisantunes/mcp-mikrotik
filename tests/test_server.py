@@ -32,6 +32,12 @@ EXPECTED_TOOLS = {
     "scheduler",
     "ip_pools",
     "wireless_registrations",
+    "wireguard_peers",
+    "ppp_active",
+    "ipsec_active_peers",
+    "bgp_sessions",
+    "ospf_neighbors",
+    "netwatch",
     "dns_cache",
     "firewall_filter",
     "system_health",
@@ -223,6 +229,157 @@ async def test_wireless_registrations_returns_empty_when_no_radio(settings: Sett
     )
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("wireless_registrations", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+# --- VPN & routing diagnostics (v0.8, read-only) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_wireguard_peers_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "peer1"
+    assert result["result"][0]["public-key"] == "PUBKEYAAAA=="
+    assert result["result"][0]["allowed-address"] == "10.10.0.2/32"
+
+
+@pytest.mark.asyncio
+async def test_wireguard_peers_never_exposes_private_key(settings: Settings):
+    """SECURITY: even if a device/future RouterOS version ever included a
+    private-key field on a /interface/wireguard/peers row, wireguard_peers
+    must strip it before the row ever reaches a caller - see
+    strip_sensitive_fields' docstring."""
+    fake = FakeConnection(
+        data={
+            ("interface", "wireguard", "peers"): [
+                {
+                    ".id": "*1",
+                    "name": "peer1",
+                    "public-key": "PUBKEYAAAA==",
+                    "private-key": "SUPERSECRETPRIVATEKEY==",
+                }
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
+    assert "private-key" not in result["result"][0]
+    assert "SUPERSECRETPRIVATEKEY==" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_wireguard_peers_returns_empty_when_no_wireguard(settings: Settings):
+    fake = FakeConnection(
+        raise_for={("interface", "wireguard", "peers"): LibRouterosError("no such command")}
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ppp_active_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ppp_active", {"device_name": "core-switch"})
+    assert result["result"][0]["service"] == "l2tp"
+    assert result["result"][0]["caller-id"] == "198.51.100.9"
+
+
+@pytest.mark.asyncio
+async def test_ppp_active_returns_empty_when_no_ppp_server(settings: Settings):
+    fake = FakeConnection(raise_for={("ppp", "active"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ppp_active", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ipsec_active_peers_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ipsec_active_peers", {"device_name": "core-switch"})
+    assert result["result"][0]["remote-address"] == "198.51.100.10"
+    assert result["result"][0]["state"] == "established"
+
+
+@pytest.mark.asyncio
+async def test_ipsec_active_peers_returns_empty_when_ipsec_unused(settings: Settings):
+    fake = FakeConnection(raise_for={("ip", "ipsec", "active-peers"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ipsec_active_peers", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_bgp_sessions_ros7_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bgp_sessions", {"device_name": "core-switch"})
+    assert result["result"][0]["remote-address"] == "198.51.100.20"
+    assert result["result"][0]["state"] == "established"
+
+
+@pytest.mark.asyncio
+async def test_bgp_sessions_falls_back_to_ros6(settings: Settings):
+    fake = FakeConnection(
+        raise_for={("routing", "bgp", "session"): LibRouterosError("no such command")},
+        data={
+            ("routing", "bgp", "peer"): [
+                {".id": "*1", "remote-address": "198.51.100.21", "remote-as": "65002", "state": "established"}
+            ]
+        },
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("bgp_sessions", {"device_name": "core-switch"})
+    assert result["result"][0]["remote-address"] == "198.51.100.21"
+
+
+@pytest.mark.asyncio
+async def test_bgp_sessions_returns_empty_when_bgp_not_running(settings: Settings):
+    fake = FakeConnection(
+        raise_for={
+            ("routing", "bgp", "session"): LibRouterosError("no such command"),
+            ("routing", "bgp", "peer"): LibRouterosError("no such command"),
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("bgp_sessions", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_ospf_neighbors_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ospf_neighbors", {"device_name": "core-switch"})
+    assert result["result"][0]["state"] == "Full"
+    assert result["result"][0]["router-id"] == "10.30.0.2"
+
+
+@pytest.mark.asyncio
+async def test_ospf_neighbors_returns_empty_when_ospf_not_running(settings: Settings):
+    fake = FakeConnection(raise_for={("routing", "ospf", "neighbor"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ospf_neighbors", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_netwatch_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("netwatch", {"device_name": "core-switch"})
+    entry = result["result"][0]
+    assert entry["host"] == "8.8.8.8"
+    assert entry["status"] == "up"
+    assert entry["has-up-script"] is False
+    assert entry["has-down-script"] is True
+    assert "up-script" not in entry
+    assert "down-script" not in entry
+
+
+@pytest.mark.asyncio
+async def test_netwatch_returns_empty_when_no_entries(settings: Settings):
+    fake = FakeConnection(data={("tool", "netwatch"): []})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("netwatch", {"device_name": "core-switch"})
     assert result["result"] == []
 
 

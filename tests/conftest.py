@@ -165,6 +165,77 @@ def fake_connection() -> FakeConnection:
             ("disk",): [
                 {".id": "*1", "slot": "usb1", "type": "usb", "total-size": "32000000000", "free-size": "20000000000"}
             ],
+            # v0.8: VPN / routing / failover diagnostics.
+            ("interface", "wireguard", "peers"): [
+                {
+                    ".id": "*1",
+                    "name": "peer1",
+                    "interface": "wg1",
+                    "public-key": "PUBKEYAAAA==",
+                    "endpoint-address": "203.0.113.5",
+                    "endpoint-port": "13231",
+                    "current-endpoint-address": "203.0.113.5",
+                    "current-endpoint-port": "13231",
+                    "last-handshake": "12s",
+                    "rx": "1024",
+                    "tx": "2048",
+                    "allowed-address": "10.10.0.2/32",
+                    "disabled": "false",
+                }
+            ],
+            ("ppp", "active"): [
+                {
+                    ".id": "*1",
+                    "name": "vpn-user1",
+                    "service": "l2tp",
+                    "caller-id": "198.51.100.9",
+                    "address": "10.20.0.5",
+                    "uptime": "1h2m",
+                }
+            ],
+            ("ip", "ipsec", "active-peers"): [
+                {
+                    ".id": "*1",
+                    "remote-address": "198.51.100.10",
+                    "state": "established",
+                    "uptime": "3h",
+                    "rx": "4096",
+                    "tx": "8192",
+                    "side": "responder",
+                }
+            ],
+            ("routing", "bgp", "session"): [
+                {
+                    ".id": "*1",
+                    "remote-address": "198.51.100.20",
+                    "remote-as": "65001",
+                    "state": "established",
+                    "uptime": "1d2h",
+                    "prefix-count": "12",
+                }
+            ],
+            ("routing", "ospf", "neighbor"): [
+                {
+                    ".id": "*1",
+                    "address": "10.30.0.2",
+                    "state": "Full",
+                    "router-id": "10.30.0.2",
+                    "adjacency": "5m",
+                }
+            ],
+            ("tool", "netwatch"): [
+                {
+                    ".id": "*1",
+                    "host": "8.8.8.8",
+                    "status": "up",
+                    "interval": "10s",
+                    "since": "jan/01/2030 00:00:00",
+                    "up-script": "",
+                    "down-script": ":log warning \"gw down\"",
+                    "comment": "primary gateway",
+                    "disabled": "false",
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},

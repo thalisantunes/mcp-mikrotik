@@ -3,6 +3,107 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.8.0] - Unreleased
+
+VPN, routing, and failover diagnostics round: six new read tools covering
+every VPN mechanism RouterOS supports (WireGuard, PPP-based VPN servers,
+IPsec), plus BGP/OSPF routing-protocol status and Netwatch host monitoring -
+the piece that actually drives failover decisions on a real device. **All
+six are read-only** - none of them are gated by `MIKROTIK_ALLOW_WRITE`, none
+touch `guard.ALLOWLIST`. The write side of failover (adjusting a route's
+`distance`, adding/editing a Netwatch entry) is deliberately deferred to a
+future round; see README's "VPN & routing diagnostics" for why these reads
+come first.
+
+### Added
+
+- **`wireguard_peers`** (read, `src/mcp_mikrotik/server.py`): lists
+  `/interface/wireguard/peers` - name, interface, public-key,
+  endpoint-address/endpoint-port, current-endpoint-address/
+  current-endpoint-port, last-handshake, rx/tx byte counters,
+  allowed-address, disabled. **SECURITY**: a `private-key` field never
+  appears on RouterOS's own `/interface/wireguard/peers` reply (only
+  `/interface/wireguard` - the tunnel interfaces themselves, deliberately
+  NOT exposed by any read tool this round - carries one), but the tool
+  strips a `private-key` field defensively regardless, via a new shared
+  helper, `formatting.strip_sensitive_fields`. See
+  `test_wireguard_peers_never_exposes_private_key` (`tests/test_server.py`),
+  which feeds a fake device row that includes a `private-key` field and
+  asserts it never reaches the tool's output. Empty list (never an error)
+  for a device with no WireGuard package/interfaces.
+- **`ppp_active`** (read): lists `/ppp/active` - name, service
+  (l2tp/pptp/sstp/ovpn/pppoe), caller-id, address, uptime. Covers VPN
+  server sessions currently connected to the device. Empty list (not an
+  error) with no PPP server configured or no active sessions.
+- **`ipsec_active_peers`** (read): lists `/ip/ipsec/active-peers` -
+  remote-address, state, uptime, rx/tx byte counters, side
+  (initiator/responder). Empty list (not an error) for a device that
+  doesn't use IPsec.
+- **`bgp_sessions`** (read): BGP session status - remote-address,
+  remote-as, state (established/idle/...), uptime, prefix-count. RouterOS
+  splits this by generation exactly like v0.6's `wireless_registrations`
+  split wifi: ROS7's `/routing/bgp/session` vs ROS6's `/routing/bgp/peer`.
+  Tries ROS7 first, falls back to ROS6, empty list (not an error) for a
+  device that doesn't run BGP at all.
+- **`ospf_neighbors`** (read): lists `/routing/ospf/neighbor` - address,
+  state (Full/Down/...), router-id, adjacency. Empty list (not an error)
+  for a device that doesn't run OSPF.
+- **`netwatch`** (read): lists `/tool/netwatch` - host, status (up/down),
+  interval, since, comment, disabled, plus `has-up-script`/
+  `has-down-script` presence booleans. The up-script/down-script fields are
+  surfaced only as presence booleans, never as the raw script body (which
+  can contain arbitrary RouterOS commands, e.g. route or credential
+  changes, that don't belong in a read tool's output). Netwatch is the
+  mechanism a RouterOS device itself already uses to watch a gateway or
+  peer's reachability - this is the key read for failover diagnosis; empty
+  list (not an error) with no entries configured.
+- `formatting.strip_sensitive_fields` (`src/mcp_mikrotik/formatting.py`,
+  new): shared helper that drops a given set of field names from every row
+  before it is returned - used by `wireguard_peers` to guarantee a private
+  key can never leak, belt-and-suspenders on top of RouterOS's own reply
+  shape never including one in the first place.
+
+### Read-only, unlike everything else in this round's theme
+
+Every tool above uses the same `try: rows_to_list(client.path(*segments))
+except DeviceCommandError: return []` (or the ROS7-then-ROS6 fallback loop,
+for `bgp_sessions`) shape `wireless_registrations`/`system_health`/
+`lte_status` already established - a device that doesn't run the relevant
+feature at all returns an empty list, never a raised error. None of the six
+enters `guard.ALLOWLIST`, none checks `MIKROTIK_ALLOW_WRITE`, none is
+wrapped by `guard._audited` (the write-guard's audit journal only journals
+writes - see v0.5's "Production features"). The actual failover write tools
+(adjusting `ip_routes`' `distance` to fail over between gateways, adding/
+editing a Netwatch entry) are intentionally left for a future round; these
+six reads are the diagnostic foundation they will build on.
+
+### Fixed / carried forward from the v0.7.1 lesson
+
+v0.7.1 found that `tests/fakes.py`'s `FakeConnection.__call__` (the
+callable-connection form used by `monitor_traffic`/`poe_monitor`/
+`lte_monitor`) previously returned a `list` where real librouteros returns a
+generator, hiding a real `TypeError` from the fake suite. None of this
+round's six tools use that callable form at all - every one reads via
+`MikrotikClient.path()` (`client.py`'s `path()`, already returning
+`list[dict[str, Any]]` by materializing each row with `dict(row)` - see
+`client.py:325`), the same construction `wireless_registrations`/
+`arp_table`/`bridge_hosts` already use safely. `tests/fakes.py` is
+unchanged this round; no new generator-vs-list gap was introduced.
+
+### Tests
+
+14 new tests (501 → 515, full suite green): `wireguard_peers` (happy path,
+the explicit private-key-redaction proof, empty-for-no-WireGuard);
+`ppp_active`/`ipsec_active_peers`/`ospf_neighbors` (happy path + empty for
+device without the feature); `bgp_sessions` (ROS7 happy path, ROS6
+fallback, empty when neither path exists - mirroring
+`wireless_registrations`' three-case coverage); `netwatch` (happy path
+proving `has-up-script`/`has-down-script` booleans replace the raw
+`up-script`/`down-script` fields, empty for no entries). All new tools are
+exercised end to end through `server.py`'s `call_tool`, against
+`tests/fakes.py`'s existing `FakeConnection`/`raise_for` mechanism - no
+changes to `tests/fakes.py` itself were needed.
+
 ## [0.7.1] - Unreleased
 
 Patch round: four bugs found testing v0.7.0 against real hardware (a ROS7

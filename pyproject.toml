@@ -1,6 +1,6 @@
 [project]
 name = "mcp-mikrotik"
-version = "0.7.1"
+version = "0.8.0"
 description = "Model Context Protocol server for managing MikroTik RouterOS devices"
 readme = "README.md"
 requires-python = ">=3.11"

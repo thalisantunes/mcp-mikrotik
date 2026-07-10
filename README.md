@@ -13,26 +13,28 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.7: everything from v0.6 (the core read-tool inventory, `ping`/
+v0.8: everything from v0.7 (the core read-tool inventory, `ping`/
 `traceroute` diagnostics, a set of guarded write tools - `set_identity`,
 `enable_interface`/`disable_interface`, `set_wifi_ssid`,
 `set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`,
-`add_to_address_list`/`remove_from_address_list`, `set_poe_out` - all going
-through the same write-guard mechanism, plus the production-hardening
-layers around it: audit journal, correlation ids, read retry, circuit
-breaker; physical layer / L2 observability - `interface_traffic`,
-`poe_status`), plus an LTE/5G + containers + USB round: `lte_status`/
-`lte_interfaces` (cellular WAN signal/status), `containers`/
-`container_config` (RouterOS's container subsystem), `usb_devices` (USB
-ports + attached storage), and two new guarded write tools,
-`start_container`/`stop_container` - the first writes whose RouterOS
-operation is an ACTION command rather than an update/add/remove `set`; see
-"How start/stop extends the guard" in `CHANGELOG.md` for how that new shape
-was added without weakening the guard. See "LTE/5G monitoring", "Container
-management", and "USB" below. None of this changes the security model - see
-"Production features" and "Security model" below. See `CHANGELOG.md` for
-what changed since v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add
-the next write tool.
+`add_to_address_list`/`remove_from_address_list`, `set_poe_out`,
+`start_container`/`stop_container` - all going through the same write-guard
+mechanism, plus the production-hardening layers around it: audit journal,
+correlation ids, read retry, circuit breaker; physical layer / L2
+observability - `interface_traffic`, `poe_status`; LTE/5G, containers, USB),
+plus a VPN/routing/failover diagnostics round: six new **read-only** tools -
+`wireguard_peers`, `ppp_active`, `ipsec_active_peers` (VPN sessions/peers),
+`bgp_sessions`, `ospf_neighbors` (routing-protocol status), and `netwatch`
+(RouterOS's own gateway/peer reachability monitor - the key input for
+failover). None of the six touches the write guard or `MIKROTIK_ALLOW_WRITE`
+- see "VPN & routing diagnostics" below; the failover *write* tools (route
+distance, Netwatch entries) are deliberately left for a future round. None
+of this changes the security model - see "Production features" and
+"Security model" below. See `CHANGELOG.md` for what changed since v0.1.0,
+and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
+
+The full pytest suite currently has 515 tests, all passing against the
+in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
 
@@ -113,6 +115,12 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `scheduler` | List scheduled tasks (name, on-event, interval, next-run, disabled). |
 | `ip_pools` | List IP pools (name, ranges). |
 | `wireless_registrations` | List wireless clients currently associated to the device. Tries the ROS7 wifi registration table first, falls back to the ROS6 wireless one; returns an empty list (not an error) for a device with no radio. |
+| `wireguard_peers` | List WireGuard VPN peers (name, interface, public-key, endpoint, last-handshake, rx/tx, allowed-address, disabled). Never exposes a private-key, even defensively. Empty list (not an error) with no WireGuard interfaces. See "VPN & routing diagnostics" below. |
+| `ppp_active` | List active PPP-based VPN server sessions (`/ppp/active`: name, service - l2tp/pptp/sstp/ovpn/pppoe, caller-id, address, uptime). Empty list (not an error) with no PPP server / no active sessions. |
+| `ipsec_active_peers` | List active IPsec peers (remote-address, state, uptime, rx/tx, side). Empty list (not an error) for a device that doesn't use IPsec. |
+| `bgp_sessions` | BGP session status (remote-address/as, state, uptime, prefix-count). Tries ROS7's `/routing/bgp/session` first, falls back to ROS6's `/routing/bgp/peer`; empty list (not an error) for a device that doesn't run BGP. |
+| `ospf_neighbors` | OSPF neighbor adjacencies (address, state, router-id, adjacency). Empty list (not an error) for a device that doesn't run OSPF. |
+| `netwatch` | List Netwatch host monitors (host, status up/down, interval, since, comment, disabled, plus `has-up-script`/`has-down-script` presence booleans - never the raw script body). The key read for diagnosing/building failover. See "VPN & routing diagnostics" below. |
 | `dns_cache` | List cached DNS records (name, type, data, ttl). |
 | `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
 | `system_health` | System health metrics (voltage, temperature, ...), if the device exposes any; empty list otherwise. |
@@ -302,6 +310,38 @@ routerboard/usb) and returns both as `{"usb_ports": [...], "disks":
 on the hardware. Either or both lists come back empty (never an error) on a
 board with no USB hardware at all.
 
+### VPN & routing diagnostics (v0.8)
+
+Six **read-only** tools for VPN, routing-protocol, and failover diagnostics
+- none of them touch the write guard or require `MIKROTIK_ALLOW_WRITE`:
+
+- **VPN sessions/peers**: `wireguard_peers` (WireGuard), `ppp_active`
+  (PPP-based VPN servers - l2tp/pptp/sstp/ovpn/pppoe), `ipsec_active_peers`
+  (IPsec). Each covers a different RouterOS VPN mechanism; a device that
+  doesn't use a given one returns an empty list, not an error.
+  `wireguard_peers` never returns a private key, even defensively - see
+  "Security model" below.
+- **Routing-protocol status**: `bgp_sessions` (tries ROS7's
+  `/routing/bgp/session` first, falls back to ROS6's `/routing/bgp/peer` -
+  the same generation split `wireless_registrations` already handles for
+  wifi) and `ospf_neighbors`. Empty list (not an error) for a device that
+  doesn't run the protocol.
+- **`netwatch`**: `/tool/netwatch`, RouterOS's own mechanism for watching a
+  gateway or peer's reachability (commonly used to drive an up/down script
+  - e.g. flipping a failover route). This is the key diagnostic read for
+  understanding whether/how a device's own failover behavior is configured.
+  The `up-script`/`down-script` fields are surfaced only as
+  `has-up-script`/`has-down-script` presence booleans, never the raw script
+  body - a Netwatch script can contain arbitrary RouterOS commands (route
+  changes, credential changes, ...) that don't belong in a read tool's
+  output.
+
+These six are the **read-only foundation** for failover tooling, not
+failover itself: nothing in this round can change a route's `distance`,
+add/edit a Netwatch entry, or otherwise cause an actual failover to happen.
+The corresponding **write** tools are deliberately left for a future round
+- see `CHANGELOG.md`'s `[0.8.0]` entry and "Roadmap / non-goals" below.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -396,7 +436,11 @@ On top of the write guard:
   defense (see previous point).
 - **No secrets in output.** `Device.to_public_dict()` is the only device
   representation ever returned to a tool caller, and it omits the password
-  field entirely. Passwords are never logged.
+  field entirely. Passwords are never logged. Since v0.8, `wireguard_peers`
+  strips a `private-key` field from every row via
+  `formatting.strip_sensitive_fields` before returning it - defensively,
+  since RouterOS's own `/interface/wireguard/peers` reply doesn't carry one
+  in the first place (see "VPN & routing diagnostics" above).
 - **Structured errors.** All errors raised inside the package derive from
   `MikrotikMCPError` (see `src/mcp_mikrotik/exceptions.py`) and are caught at
   the tool boundary in `server.py`. The exception is deliberately re-raised,
@@ -498,6 +542,14 @@ Python 3.11 and 3.12.
 
 ## Roadmap / non-goals
 
+- **Failover write tools** (adjusting a route's `distance` to fail over
+  between gateways, adding/editing a Netwatch entry) are planned for a
+  future round, building on this round's six read-only VPN/routing/
+  Netwatch diagnostics (see "VPN & routing diagnostics" above). Unlike a
+  simple `set`, a failover write is not a single atomic RouterOS operation
+  - it needs its own design pass (what "atomic" means when it may involve
+  more than one route/Netwatch row, and how the before/after preview
+  represents that) before it goes into `guard.ALLOWLIST`.
 - Two write operations are deliberately **not** exposed yet, each because
   the standard guard/confirm/preview mechanism isn't sufficient protection
   on its own - see the comment above `ALLOWLIST` in `guard.py`:

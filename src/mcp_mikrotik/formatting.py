@@ -44,3 +44,19 @@ def filter_disabled(rows: Iterable[dict[str, Any]], include_disabled: bool) -> l
     if include_disabled:
         return all_rows
     return [row for row in all_rows if not ros_bool(row.get("disabled", False))]
+
+
+def strip_sensitive_fields(rows: Iterable[dict[str, Any]], keys: Iterable[str]) -> list[dict[str, Any]]:
+    """Drop the given field name(s) from every row before it ever reaches a caller.
+
+    v0.8: used by `wireguard_peers` to guarantee a WireGuard private-key can
+    never be returned. RouterOS's own `/interface/wireguard/peers` reply
+    doesn't carry a `private-key` field in the first place (only
+    `/interface/wireguard` - the tunnel interfaces themselves, which this
+    package does not expose a read tool for - does), so this is
+    belt-and-suspenders: it strips the field defensively regardless, so a
+    future RouterOS version, firmware quirk, or added read tool can't leak
+    one just because the safety net wasn't there yet.
+    """
+    key_set = set(keys)
+    return [{field: value for field, value in row.items() if field not in key_set} for row in rows]

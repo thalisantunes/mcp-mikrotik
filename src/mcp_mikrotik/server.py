@@ -29,7 +29,7 @@ from . import correlation, guard
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError
-from .formatting import filter_disabled, rows_to_list
+from .formatting import filter_disabled, rows_to_list, strip_sensitive_fields
 from .validation import validate_interface_name, validate_ping_address, validate_positive_limit
 
 logger = logging.getLogger("mcp_mikrotik")
@@ -50,6 +50,10 @@ MAX_TRACEROUTE_MAX_HOPS = 10
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
+
+# v0.8: WireGuard private keys must never be returned by any read tool - see
+# wireguard_peers below and strip_sensitive_fields' docstring.
+_WIREGUARD_REDACTED_FIELDS = {"private-key"}
 
 
 def build_server(settings: Settings | None = None, client_factory: ClientFactory = get_client) -> FastMCP:
@@ -250,6 +254,138 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             except DeviceCommandError:
                 continue
         return []
+
+    @mcp.tool()
+    @_safe
+    def wireguard_peers(device_name: str) -> list[dict[str, Any]]:
+        """List WireGuard VPN peers (/interface/wireguard/peers): name,
+        interface, public-key, endpoint-address/endpoint-port,
+        current-endpoint-address/current-endpoint-port, last-handshake,
+        rx/tx byte counters, allowed-address, disabled.
+
+        SECURITY: a `private-key` field never appears in RouterOS's own
+        /interface/wireguard/peers reply (only /interface/wireguard - the
+        tunnel interfaces themselves, which this package deliberately does
+        not expose a read tool for - carries one), but this strips any
+        `private-key` field defensively before returning anyway, in case a
+        future RouterOS version ever included one here. See
+        test_wireguard_peers_never_exposes_private_key.
+
+        Returns an empty list (never an error) for a device with no
+        WireGuard package/interfaces at all - same "empty, not an error"
+        convention as wireless_registrations/system_health for optional
+        features.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("interface", "wireguard", "peers"))
+        except DeviceCommandError:
+            return []
+        return strip_sensitive_fields(rows, _WIREGUARD_REDACTED_FIELDS)
+
+    @mcp.tool()
+    @_safe
+    def ppp_active(device_name: str) -> list[dict[str, Any]]:
+        """List active PPP sessions (/ppp/active): name, service
+        (l2tp/pptp/sstp/ovpn/pppoe), caller-id, address, uptime - VPN
+        server sessions currently connected to this device.
+
+        Returns an empty list (never an error) for a device with no PPP
+        server configured, or simply no sessions active right now.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ppp", "active"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def ipsec_active_peers(device_name: str) -> list[dict[str, Any]]:
+        """List active IPsec peers (/ip/ipsec/active-peers): remote-address,
+        state, uptime, rx/tx byte counters, side (initiator/responder).
+
+        Returns an empty list (never an error) for a device that doesn't
+        use IPsec at all - a completely normal state.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ip", "ipsec", "active-peers"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def bgp_sessions(device_name: str) -> list[dict[str, Any]]:
+        """List BGP session status: remote-address/remote-as, state
+        (established/idle/...), uptime, prefix-count.
+
+        RouterOS exposes this under two different paths depending on
+        generation, the same split wireless_registrations already handles
+        for wifi: ROS7's routing package (/routing/bgp/session) or ROS6's
+        (/routing/bgp/peer). This tries ROS7 first, falls back to ROS6, and
+        returns an empty list - rather than raising - for a device that
+        doesn't run BGP at all.
+        """
+        client = _client(device_name)
+        for segments in (
+            ("routing", "bgp", "session"),
+            ("routing", "bgp", "peer"),
+        ):
+            try:
+                return rows_to_list(client.path(*segments))
+            except DeviceCommandError:
+                continue
+        return []
+
+    @mcp.tool()
+    @_safe
+    def ospf_neighbors(device_name: str) -> list[dict[str, Any]]:
+        """List OSPF neighbor adjacencies (/routing/ospf/neighbor):
+        address, state (Full/Down/...), router-id, adjacency.
+
+        Returns an empty list (never an error) for a device that doesn't
+        run OSPF at all.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("routing", "ospf", "neighbor"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def netwatch(device_name: str) -> list[dict[str, Any]]:
+        """List Netwatch host monitors (/tool/netwatch): host, status
+        (up/down), interval, since, comment, disabled, plus
+        `has-up-script`/`has-down-script` booleans.
+
+        Netwatch is the usual way a RouterOS device itself watches a
+        gateway or peer's reachability (e.g. to drive a failover script on
+        down/up) - this is read-only groundwork for future failover
+        tooling; see README's "VPN & routing diagnostics".
+
+        The up-script/down-script fields are surfaced only as presence
+        booleans (`has-up-script`/`has-down-script`), never as the raw
+        script body, which can contain arbitrary RouterOS commands (e.g.
+        route/credential changes) that don't belong in a read tool's
+        output.
+
+        Returns an empty list (never an error) for a device with no
+        Netwatch entries configured.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("tool", "netwatch"))
+        except DeviceCommandError:
+            return []
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            entry["has-up-script"] = bool(entry.pop("up-script", ""))
+            entry["has-down-script"] = bool(entry.pop("down-script", ""))
+            result.append(entry)
+        return result
 
     @mcp.tool()
     @_safe
