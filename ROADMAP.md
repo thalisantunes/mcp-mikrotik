@@ -23,8 +23,24 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** AAA/PKI visibility — `certificates`, `users`,
-`user_active`, `radius` — landed in **v1.6**, closing out most of Tier 2:
+**Recently shipped:** Network-config visibility — `interface_monitor`,
+`dhcp_servers`, `dhcp_networks`, `bridge_ports`, `bridge_vlans` — landed in
+**v1.7**, closing out the rest of Tier 2 (NTP/clock is now the only item
+left): `interface_monitor` reads `/interface/ethernet/monitor once=yes` for
+link status/rate/duplex plus SFP/DDM optics fields when a port has an SFP
+cage and module (the command path was already verified against the
+reference mANTBox; the DDM field *values* remain unverified — that board has
+no SFP cage, see the Feasibility note below). `dhcp_servers`/`dhcp_networks`
+read `/ip/dhcp-server` and `/ip/dhcp-server/network` — the server's own
+config, as opposed to the already-shipped `dhcp_leases`. `bridge_ports`/
+`bridge_vlans` read `/interface/bridge/port` and `/interface/bridge/vlan` —
+the honest completion of the VLAN story for a managed switch (bridge VLAN
+filtering), distinct from the standalone `/interface/vlan` interfaces the
+v1.2 VLAN tools manage. All read-only; every boolean field touched goes
+through `formatting.coerce_ros_bool`, never a `== "true"` comparison.
+
+AAA/PKI visibility — `certificates`, `users`,
+`user_active`, `radius` — landed in **v1.6**:
 `certificates` reads `/certificate` with a computed `daysUntilExpiry`
 (RouterOS's date rendering handled defensively across its two known
 shapes — see `formatting.parse_ros_datetime`) and a new `security_audit`
@@ -99,26 +115,17 @@ shipped" above). Tier 2 is well underway.
 ## Tier 2 — valued, mostly reads
 
 Certificates (with expiry + a new `security_audit` check), Users/AAA read,
-and RADIUS read all shipped in **v1.6** — see "Recently shipped" above.
-Remaining:
+and RADIUS read shipped in **v1.6**; SFP/optical monitor, DHCP server
+config, and bridge ports/VLAN filtering shipped in **v1.7** — see "Recently
+shipped" above. Remaining:
 
-- **SFP / interface optical & link monitor** (`/interface/ethernet/monitor`,
-  `once`) — read-only. The command path is verified; the **DDM fields**
-  (SFP tx/rx power, temperature, vendor) are **not** yet verified against real
-  SFP hardware (the reference board has no SFP cage) and must be checked on a
-  device with optics before shipping.
-- **Bridge ports & bridge VLAN filtering** (`/interface/bridge/port`,
-  `/interface/bridge/vlan`) — read first. This is the honest completion of the
-  VLAN story: the shipped v1.2 VLAN tools operate on standalone
-  `/interface/vlan` interfaces, but VLANs on managed MikroTik switches (CRS,
-  hEX) are done via **bridge VLAN filtering**, which today has zero coverage.
-  Read of port membership and the bridge/vlan table first; guarded writes later.
-- **DHCP server config (read)** (`/ip/dhcp-server`, `/ip/dhcp-server/network`) —
-  today only `dhcp_leases` exists. Reading the server/pool/network config is a
-  small, ISP-relevant gap.
 - **NTP / clock** (`/system/ntp/client`, `/system/clock`) — read plus setting
   NTP servers. Clock drift breaks certs, logs and scheduling. ROS6/7 split to
   handle: ROS6 uses `primary-ntp`/`secondary-ntp`; ROS7 uses a `servers` list.
+
+Guarded writes for bridge VLAN filtering (assigning a port's `pvid` /
+`tagged`/`untagged` membership) are a natural Tier 2/3 follow-up now that the
+read side exists, but are not yet scoped — see "How items graduate" below.
 
 ## Tier 3 — larger or design-gated
 

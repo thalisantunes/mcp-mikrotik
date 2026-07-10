@@ -59,6 +59,43 @@ def fake_connection() -> FakeConnection:
                     "comment": "",
                 }
             ],
+            # v1.7: DHCP server + network CONFIG (as opposed to the leases
+            # it hands out above) - `disabled` deliberately omitted on *1
+            # (ROS6-style implicit-false, see coerce_ros_bool's docstring)
+            # and explicit `False` on *2 (ROS7-style), so the read tool's
+            # coercion is exercised against both shapes.
+            ("ip", "dhcp-server"): [
+                {
+                    ".id": "*1",
+                    "name": "dhcp1",
+                    "interface": "ether1",
+                    "address-pool": "pool1",
+                    "lease-time": "1d",
+                    "authoritative": "yes",
+                    "comment": "main LAN",
+                },
+                {
+                    ".id": "*2",
+                    "name": "dhcp2",
+                    "interface": "ether2",
+                    "address-pool": "pool2",
+                    "lease-time": "8h",
+                    "disabled": False,
+                    "authoritative": "yes",
+                    "comment": "",
+                },
+            ],
+            ("ip", "dhcp-server", "network"): [
+                {
+                    ".id": "*1",
+                    "address": "10.0.0.0/24",
+                    "gateway": "10.0.0.1",
+                    "dns-server": "10.0.0.1",
+                    "netmask": "24",
+                    "domain": "lan",
+                    "comment": "main LAN",
+                },
+            ],
             ("ip", "dns", "cache"): [{"name": "example.com", "type": "A", "data": "93.184.216.34", "ttl": "1h"}],
             ("ip", "firewall", "filter"): [
                 {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established"},
@@ -215,6 +252,45 @@ def fake_connection() -> FakeConnection:
                     "dynamic": False,
                     "local": False,
                 }
+            ],
+            # v1.7: bridge port membership + VLAN filtering table - the
+            # honest completion of the VLAN story for a managed switch (the
+            # v1.2 VLAN tools only cover standalone /interface/vlan).
+            ("interface", "bridge", "port"): [
+                {
+                    ".id": "*1",
+                    "bridge": "bridge1",
+                    "interface": "ether2",
+                    "pvid": "1",
+                    "disabled": False,
+                    "edge": "auto",
+                    "horizon": "none",
+                    "learn": "auto",
+                    "comment": "",
+                },
+                {
+                    ".id": "*2",
+                    "bridge": "bridge1",
+                    "interface": "ether3",
+                    "pvid": "20",
+                    "disabled": True,
+                    "edge": "yes",
+                    "horizon": "none",
+                    "learn": "auto",
+                    "comment": "camera vlan",
+                },
+            ],
+            ("interface", "bridge", "vlan"): [
+                {
+                    ".id": "*1",
+                    "bridge": "bridge1",
+                    "vlan-ids": "20",
+                    "tagged": "bridge1,ether1",
+                    "untagged": "ether3",
+                    "current-tagged": "bridge1,ether1",
+                    "current-untagged": "ether3",
+                    "comment": "cameras",
+                },
             ],
             # v0.7: LTE/5G, containers, USB.
             ("interface", "lte"): [
@@ -461,6 +537,36 @@ def fake_connection() -> FakeConnection:
                 "poe-out-voltage": "0",
                 "poe-out-current": "0",
                 "poe-out-power": "0",
+            },
+        },
+        ethernet_monitor_replies={
+            # v1.7: a plain copper port with no SFP cage - only the base
+            # link fields, no sfp-* keys at all (must be treated as absent
+            # by interface_monitor, never invented).
+            "ether1": {
+                "status": "link-ok",
+                "rate": "1Gbps",
+                "full-duplex": True,
+                "auto-negotiation": "done",
+            },
+            # An SFP-capable port WITH a module inserted - base fields plus
+            # every sfp-*/DDM field interface_monitor is documented to
+            # surface, including the boolean sfp-module-present (real bool,
+            # not the string "true" - see coerce_ros_bool).
+            "sfp1": {
+                "status": "link-ok",
+                "rate": "1Gbps",
+                "full-duplex": True,
+                "auto-negotiation": "done",
+                "sfp-temperature": "35",
+                "sfp-supply-voltage": "3.3",
+                "sfp-tx-power": "-3.0",
+                "sfp-rx-power": "-4.2",
+                "sfp-tx-bias-current": "8.5",
+                "sfp-vendor-name": "MikroTik",
+                "sfp-vendor-part-number": "S-3553LC20D",
+                "sfp-wavelength": "1310",
+                "sfp-module-present": True,
             },
         },
         lte_monitor_replies={

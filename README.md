@@ -236,6 +236,11 @@ representative exchanges:
 | `users` | List RouterOS login accounts (`/user`): name, group, address (allowed-source restriction), last-logged-in, disabled, comment. `/user` never exposes a password over the API. Read only - no `/user` creation/edit (see "Roadmap & non-goals"). See "AAA/PKI visibility" below. |
 | `user_active` | List currently active RouterOS management login sessions (`/user/active`: name, address, via, when) - who's logged into the device's own admin interface right now. |
 | `radius` | List RADIUS server configuration (`/radius`): service, address, timeout, accounting-port, authentication-port. **Never exposes the shared `secret`**, same redaction mechanism as `ppp_secrets`. See "AAA/PKI visibility" below. |
+| `interface_monitor` | Link/optical status of one ethernet `interface` (`/interface/ethernet/monitor once=yes`): status, rate, full-duplex, auto-negotiation, plus SFP/DDM optics fields when the port has an SFP cage and a module is present. Empty dict (not an error) with no reply. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
+| `dhcp_servers` | List DHCP server config (`/ip/dhcp-server`): name, interface, address-pool, lease-time, disabled, authoritative, comment - as opposed to `dhcp_leases`, which lists what a server has handed out. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
+| `dhcp_networks` | List DHCP server networks (`/ip/dhcp-server/network`): address, gateway, dns-server, netmask, domain, comment. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
+| `bridge_ports` | List bridge port membership (`/interface/bridge/port`): bridge, interface, pvid, disabled, edge, horizon, learn, comment. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
+| `bridge_vlans` | List the bridge VLAN filtering table (`/interface/bridge/vlan`): bridge, vlan-ids, tagged, untagged, comment, plus current-tagged/current-untagged when present - completes the VLAN story for a managed switch (bridge VLAN filtering), distinct from the standalone `/interface/vlan` interfaces `list_vlans`/`add_vlan` manage. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
 
 ### Write (guarded)
 
@@ -446,6 +451,51 @@ routerboard/usb) and returns both as `{"usb_ports": [...], "disks":
 [...]}`, since which of the two a given USB device shows up under depends
 on the hardware. Either or both lists come back empty (never an error) on a
 board with no USB hardware at all.
+
+### SFP/optical monitor, DHCP-server config, bridge VLAN filtering (v1.7)
+
+Five **read-only** tools closing out most of `ROADMAP.md`'s Tier 2 - none of
+them touch the write guard or require `MIKROTIK_ALLOW_WRITE`:
+
+- **`interface_monitor`** (`/interface/ethernet/monitor once=yes`): link
+  status/rate/duplex for any ethernet port, built the same "monitor once"
+  way as `interface_traffic`/`poe_status`/`lte_status`. On a port with an
+  SFP cage AND a module inserted, the reply additionally carries DDM optics
+  fields (`sfp-temperature`, `sfp-supply-voltage`, `sfp-tx-power`,
+  `sfp-rx-power`, `sfp-tx-bias-current`, `sfp-vendor-name`,
+  `sfp-vendor-part-number`, `sfp-wavelength`, `sfp-module-present`) - a
+  plain copper port (the vast majority of ports on most hardware) simply
+  has none of the sfp-* fields at all, and `interface_monitor` never
+  invents one. **Hardware caveat**: this project's reference board (a
+  mANTBox) has no SFP cage, so the command path is confirmed but the DDM
+  field *values* have not been verified against real SFP optics - treat
+  them as unverified until checked on hardware with an actual module.
+- **`dhcp_servers`** / **`dhcp_networks`** (`/ip/dhcp-server`,
+  `/ip/dhcp-server/network`): the DHCP server's own config (address-pool,
+  lease-time, authoritative, and per-subnet gateway/dns-server/domain) - as
+  opposed to the already-shipped `dhcp_leases`, which only lists what a
+  server has handed out to clients.
+- **`bridge_ports`** / **`bridge_vlans`** (`/interface/bridge/port`,
+  `/interface/bridge/vlan`): together these complete the VLAN story for a
+  **managed switch** (CRS/hEX-style hardware). The v1.2 VLAN tools
+  (`list_vlans`/`add_vlan`/`remove_vlan`) only ever operate on standalone
+  `/interface/vlan` interfaces - router-on-a-stick style routing, a
+  *different* RouterOS mechanism from **bridge VLAN filtering**, which is
+  how VLANs actually get segmented across a switch's physical ports.
+  `bridge_ports` shows per-port `pvid`/`edge`/`horizon`/`learn` config;
+  `bridge_vlans` shows the `vlan-ids`↔`tagged`/`untagged` port membership
+  table, plus RouterOS's own computed `current-tagged`/`current-untagged`
+  when the device's reply carries them.
+
+All boolean-shaped fields these five tools touch are normalized with
+`formatting.coerce_ros_bool` (`disabled` on `dhcp_servers`/`bridge_ports`,
+`full-duplex`/`sfp-module-present` on `interface_monitor`) rather than
+compared against the string `"true"`/`"false"` - librouteros hands a
+RouterOS boolean back as a Python `bool` or omits the field entirely, never
+that string. Enum-shaped RouterOS fields that merely *look* boolean
+(`auto-negotiation`, `authoritative`, `edge`, `learn` - each of which can
+take a value like `"auto"` or `"after-2sec-delay"`, not just yes/no) are
+deliberately left as RouterOS's own raw value instead.
 
 ### VPN & routing diagnostics (v0.8)
 

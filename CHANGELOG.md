@@ -3,6 +3,58 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.7.0] - 2026-07-10
+
+**Network-config visibility (Tier 2, all read-only)**: five new read tools
+closing out the rest of `ROADMAP.md`'s Tier 2 - SFP/optical link monitoring,
+DHCP server config, and bridge VLAN filtering (the honest completion of the
+VLAN story for a managed switch, as opposed to v1.2's standalone
+`/interface/vlan`).
+
+- `interface_monitor` (`/interface/ethernet/monitor once=yes`): link
+  status/rate/duplex for any ethernet port, plus SFP/DDM optics fields
+  (`sfp-temperature`, `sfp-supply-voltage`, `sfp-tx-power`, `sfp-rx-power`,
+  `sfp-tx-bias-current`, `sfp-vendor-name`, `sfp-vendor-part-number`,
+  `sfp-wavelength`, `sfp-module-present`) ONLY when the device's reply
+  actually carries them - a plain copper port has none of the sfp-* keys at
+  all, never invented. `full-duplex`/`sfp-module-present` are coerced to
+  `bool | None` (`formatting.coerce_ros_bool`); `auto-negotiation` is left
+  as RouterOS's own raw value (not a strict boolean).
+  - **New `MikrotikClient.ethernet_monitor`**: same "monitor once" shape
+    as `monitor_traffic`/`poe_monitor`/`lte_monitor` - materializes the
+    reply with `list(...)` before subscripting (librouteros returns a
+    GENERATOR here too, same v0.7.1 lesson as the other three). Selects the
+    port via `numbers=` (NOT `interface=`, which real ROS6/ROS7 reject with
+    "unknown parameter" - unlike the sibling monitors); the fake now models
+    that quirk so a regression is caught by the suite.
+  - **Hardware**: link status/rate/`full-duplex` verified on real ROS6
+    (`.254`, 1Gbps) and ROS7 (`.237`, 100Mbps). The SFP/DDM field VALUES are
+    still not verified - the reference boards have no SFP cage. See `ROADMAP.md`.
+- `dhcp_servers` (`/ip/dhcp-server`): `name`, `interface`, `address-pool`,
+  `lease-time`, `authoritative`, `comment`, with `disabled` coerced to
+  `bool | None`. As opposed to the already-shipped `dhcp_leases` (what a
+  server has handed out), this is the server's own config.
+- `dhcp_networks` (`/ip/dhcp-server/network`): `address`, `gateway`,
+  `dns-server`, `netmask`, `domain`, `comment` - the per-subnet options a
+  DHCP server hands out on lease.
+- `bridge_ports` (`/interface/bridge/port`): `bridge`, `interface`, `pvid`,
+  `disabled`, `edge`, `horizon`, `learn`, `comment`. Only `disabled` is
+  coerced to `bool | None` - `edge`/`learn` are RouterOS enums
+  (`auto`/`yes`/`no`/`yes-discover`/`no-discover`), not strict booleans, so
+  they're left as RouterOS's own raw value.
+- `bridge_vlans` (`/interface/bridge/vlan`): `bridge`, `vlan-ids`, `tagged`,
+  `untagged`, `comment`, plus `current-tagged`/`current-untagged` when
+  present. Together with `bridge_ports`, this is the missing half of VLAN
+  visibility for a managed switch (CRS/hEX-style hardware, bridge VLAN
+  filtering) - the v1.2 VLAN tools only ever covered standalone
+  `/interface/vlan` router-on-a-stick interfaces.
+
+All five follow the project's Lição B convention throughout: every RouterOS
+boolean field this round touches goes through `formatting.coerce_ros_bool`
+(never a `== "true"` string-equality comparison), since librouteros hands a
+RouterOS boolean back as a Python `bool` or omits the field entirely - never
+the string `"true"`/`"false"`.
+
 ## [1.6.0] - 2026-07-10
 
 **AAA/PKI visibility (Tier 2, all read-only)**: four new read tools closing

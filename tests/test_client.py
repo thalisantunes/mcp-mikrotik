@@ -126,6 +126,57 @@ def test_lte_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
     assert flaky.calls_made == 2
 
 
+# --- v1.7: ethernet_monitor (SFP/optical link monitor) ----------------------
+
+
+def test_ethernet_monitor_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    reply = client.ethernet_monitor("ether1")
+    assert reply["status"] == "link-ok"
+    assert reply["full-duplex"] is True
+    # `numbers=`, not `interface=` - this menu rejects `interface=` on real
+    # ROS6/ROS7 ("unknown parameter"); keep this pinned to catch a regression.
+    assert fake_connection.calls == [("/interface/ethernet/monitor", {"numbers": "ether1", "once": ""})]
+
+
+def test_ethernet_monitor_no_sfp_keys_on_a_plain_copper_port(client: MikrotikClient, fake_connection: FakeConnection):
+    reply = client.ethernet_monitor("ether1")
+    assert not any(key.startswith("sfp-") for key in reply)
+
+
+def test_ethernet_monitor_surfaces_sfp_ddm_fields_when_module_present(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    reply = client.ethernet_monitor("sfp1")
+    assert reply["sfp-module-present"] is True
+    assert reply["sfp-vendor-name"] == "MikroTik"
+
+
+def test_ethernet_monitor_returns_empty_dict_when_device_replies_nothing(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    assert client.ethernet_monitor("ether99") == {}
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_ethernet_monitor_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.ethernet_monitor("ether1")
+    assert device.name in str(exc_info.value)
+
+
+def test_ethernet_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    reply = client.ethernet_monitor("ether1")
+
+    assert reply == {}
+    assert flaky.calls_made == 2
+
+
 # --- v0.14: torch (live traffic snapshot - a MULTI-row "once" command) -----
 
 

@@ -49,6 +49,7 @@ from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
 from .formatting import (
     WIREGUARD_SENSITIVE_FIELDS,
+    coerce_ros_bool,
     days_until,
     filter_disabled,
     rows_to_list,
@@ -905,6 +906,147 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         except DeviceCommandError:
             disks = []
         return {"usb_ports": usb_ports, "disks": disks}
+
+    # --- v1.7: SFP/optical monitor, DHCP-server config, bridge VLAN --------
+    # --- filtering (Tier 2 network-config visibility) ----------------------
+
+    @mcp.tool()
+    @_safe
+    def interface_monitor(device_name: str, interface: str) -> dict[str, Any]:
+        """Link/optical status of one ethernet `interface`
+        (`/interface/ethernet/monitor once=yes`) - `status` (link-ok/
+        no-link), `rate`, `full-duplex` (coerced to `bool | None` - see
+        `formatting.coerce_ros_bool`), `auto-negotiation` (RouterOS's raw
+        value - a "done"/"incomplete"-style state, not a strict boolean, so
+        left as-is), plus SFP/DDM optics fields WHEN the port has an SFP
+        cage and a module is present: `sfp-temperature`,
+        `sfp-supply-voltage`, `sfp-tx-power`, `sfp-rx-power`,
+        `sfp-tx-bias-current`, `sfp-vendor-name`, `sfp-vendor-part-number`,
+        `sfp-wavelength`, `sfp-module-present` (also coerced to
+        `bool | None`).
+
+        A plain copper port (the vast majority) has NONE of the sfp-*
+        fields in RouterOS's reply at all - each is only added to the
+        result when the device's reply actually carries it (`.get`/`in`
+        checks throughout, nothing invented). The reference hardware this
+        project was verified against (a mANTBox) has no SFP cage, so the
+        command path itself is confirmed but the DDM field VALUES are not
+        yet verified against real SFP optics - see `ROADMAP.md`.
+
+        `interface` is validated for shape (`validate_interface_name`)
+        before it is ever sent to the device - existence isn't checked
+        separately, so a typo'd/unknown interface name simply produces
+        whatever error RouterOS itself returns. Returns an empty dict if
+        the device answers with nothing (same "once" convention as
+        `interface_traffic`/`poe_status`/`lte_status`).
+        """
+        validated_interface = validate_interface_name(interface)
+        client = _client(device_name)
+        row = client.ethernet_monitor(validated_interface)
+        if not row:
+            return {}
+
+        entry: dict[str, Any] = {
+            "interface": validated_interface,
+            "status": row.get("status"),
+            "rate": row.get("rate"),
+            "full-duplex": coerce_ros_bool(row.get("full-duplex")),
+            "auto-negotiation": row.get("auto-negotiation"),
+        }
+        for field in (
+            "sfp-temperature",
+            "sfp-supply-voltage",
+            "sfp-tx-power",
+            "sfp-rx-power",
+            "sfp-tx-bias-current",
+            "sfp-vendor-name",
+            "sfp-vendor-part-number",
+            "sfp-wavelength",
+        ):
+            if field in row:
+                entry[field] = row[field]
+        if "sfp-module-present" in row:
+            entry["sfp-module-present"] = coerce_ros_bool(row["sfp-module-present"])
+        return entry
+
+    @mcp.tool()
+    @_safe
+    def dhcp_servers(device_name: str) -> list[dict[str, Any]]:
+        """List DHCP server CONFIG (`/ip/dhcp-server`) - as opposed to
+        `dhcp_leases`, which lists the leases a server has handed out. Each
+        entry keeps every field RouterOS returns (`name`, `interface`,
+        `address-pool`, `lease-time`, `authoritative`, `comment`, ...), with
+        `disabled` normalized to `bool | None` (`formatting.coerce_ros_bool`
+        - never a `== "true"` string-equality trap, see that helper's
+        docstring). `authoritative` is left as RouterOS's own raw value
+        (it can be `"yes"`/`"no"`/`"after-2sec-delay"`/... - not a strict
+        boolean - so it is not coerced).
+        """
+        client = _client(device_name)
+        rows = rows_to_list(client.path("ip", "dhcp-server"))
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            entry["disabled"] = coerce_ros_bool(row.get("disabled"))
+            result.append(entry)
+        return result
+
+    @mcp.tool()
+    @_safe
+    def dhcp_networks(device_name: str) -> list[dict[str, Any]]:
+        """List DHCP server networks (`/ip/dhcp-server/network`): `address`,
+        `gateway`, `dns-server`, `netmask`, `domain`, `comment` - the
+        per-subnet options a DHCP server (see `dhcp_servers`) hands out to
+        clients on lease. No boolean fields here to normalize.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "dhcp-server", "network"))
+
+    @mcp.tool()
+    @_safe
+    def bridge_ports(device_name: str) -> list[dict[str, Any]]:
+        """List bridge port membership (`/interface/bridge/port`): `bridge`,
+        `interface`, `pvid`, `disabled`, `edge`, `horizon`, `learn`,
+        `comment`. Only `disabled` is normalized to `bool | None`
+        (`formatting.coerce_ros_bool`) - `edge`/`learn` are RouterOS enums
+        (e.g. `auto`/`yes`/`no`/`yes-discover`/`no-discover`), not strict
+        booleans, so they are left as RouterOS's own raw value rather than
+        coerced.
+
+        Use this (with `bridge_vlans` below) to see which physical port of
+        a managed switch's bridge a VLAN actually applies to - `bridge_hosts`
+        only shows the MAC table, not port/VLAN configuration.
+        """
+        client = _client(device_name)
+        rows = rows_to_list(client.path("interface", "bridge", "port"))
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            entry["disabled"] = coerce_ros_bool(row.get("disabled"))
+            result.append(entry)
+        return result
+
+    @mcp.tool()
+    @_safe
+    def bridge_vlans(device_name: str) -> list[dict[str, Any]]:
+        """List bridge VLAN filtering table entries (`/interface/bridge/vlan`):
+        `bridge`, `vlan-ids`, `tagged`, `untagged`, `comment`, plus
+        `current-tagged`/`current-untagged` when the device's reply carries
+        them (RouterOS's own computed effective port lists - not present on
+        every ROS6/ROS7 version, so only added when actually present, never
+        invented).
+
+        This is the honest completion of the VLAN story for a MANAGED
+        SWITCH (CRS/hEX-style hardware): the v1.2 `list_vlans`/`add_vlan`/
+        `remove_vlan` tools operate on standalone `/interface/vlan`
+        interfaces (router-on-a-stick style routing), which is a DIFFERENT
+        RouterOS mechanism from bridge VLAN filtering - a switch that
+        segments traffic by VLAN across bridge ports needs THIS table, not
+        `/interface/vlan`. See `bridge_ports` above for per-port
+        `pvid`/`edge`/`learn` config.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("interface", "bridge", "vlan"))
 
     # --- v0.14: hotspot vouchers, live traffic (torch), backup -------------
 

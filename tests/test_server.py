@@ -57,6 +57,11 @@ EXPECTED_TOOLS = {
     "containers",
     "container_config",
     "usb_devices",
+    "interface_monitor",
+    "dhcp_servers",
+    "dhcp_networks",
+    "bridge_ports",
+    "bridge_vlans",
     "list_write_operations",
     "set_identity",
     "enable_interface",
@@ -987,6 +992,176 @@ async def test_usb_devices_returns_empty_lists_for_board_with_no_usb(settings: S
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("usb_devices", {"device_name": "core-switch"})
     assert result == {"usb_ports": [], "disks": []}
+
+
+# --- interface_monitor / dhcp_servers / dhcp_networks / bridge_ports / -----
+# --- bridge_vlans (v1.7, read-only) -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_happy_path_no_sfp(settings: Settings, fake_connection: FakeConnection):
+    """A plain copper port (no SFP cage) must never carry any sfp-* key -
+    `fake_connection`'s "ether1" reply has none, mirroring a real device."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "ether1"})
+    assert result["interface"] == "ether1"
+    assert result["status"] == "link-ok"
+    assert result["rate"] == "1Gbps"
+    # RouterOS hands this back as a real Python bool (never the string
+    # "true") - see coerce_ros_bool's docstring (Lição B).
+    assert result["full-duplex"] is True
+    assert result["auto-negotiation"] == "done"
+    assert not any(key.startswith("sfp-") for key in result)
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_happy_path_with_sfp_module(settings: Settings, fake_connection: FakeConnection):
+    """An SFP-capable port WITH a module inserted must surface every
+    DDM/SFP field the device reply carries, with sfp-module-present coerced
+    to a real bool."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "sfp1"})
+    assert result["sfp-module-present"] is True
+    assert result["sfp-vendor-name"] == "MikroTik"
+    assert result["sfp-vendor-part-number"] == "S-3553LC20D"
+    assert result["sfp-wavelength"] == "1310"
+    assert result["sfp-temperature"] == "35"
+    assert result["sfp-supply-voltage"] == "3.3"
+    assert result["sfp-tx-power"] == "-3.0"
+    assert result["sfp-rx-power"] == "-4.2"
+    assert result["sfp-tx-bias-current"] == "8.5"
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "ether1"})
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_returns_empty_dict_when_device_replies_nothing(settings: Settings):
+    """Same "empty, not an error" convention as interface_traffic/poe_status/
+    lte_status for a monitor-once call the device answers with nothing."""
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "ether5"})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_rejects_invalid_interface_name_before_touching_device(settings: Settings):
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "ether1; reboot"})
+    assert "not valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_interface_monitor_sends_once_flag_as_structured_param(settings: Settings):
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    await mcp.call_tool("interface_monitor", {"device_name": "core-switch", "interface": "ether1"})
+    cmd, kwargs = fake.calls[-1]
+    assert cmd == "/interface/ethernet/monitor"
+    # RouterOS selects the port here via `numbers=`, not `interface=` (verified
+    # on ROS6/ROS7 - the latter gives "unknown parameter").
+    assert kwargs == {"numbers": "ether1", "once": ""}
+
+
+@pytest.mark.asyncio
+async def test_dhcp_servers_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("dhcp_servers", {"device_name": "core-switch"})
+    rows = {row["name"]: row for row in result["result"]}
+    assert rows["dhcp1"]["interface"] == "ether1"
+    assert rows["dhcp1"]["address-pool"] == "pool1"
+    assert rows["dhcp1"]["lease-time"] == "1d"
+    assert rows["dhcp1"]["authoritative"] == "yes"
+    # *1 omits `disabled` entirely (ROS6-style implicit-false) - must
+    # coerce to None (unknown/absent), never crash or silently become True.
+    assert rows["dhcp1"]["disabled"] is None
+    # *2 carries an explicit ROS7-style `False` - must coerce to a real
+    # bool, never left as the raw value or a string-equality trap.
+    assert rows["dhcp2"]["disabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_dhcp_servers_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("dhcp_servers", {"device_name": "core-switch"})
+    assert result["result"]
+
+
+@pytest.mark.asyncio
+async def test_dhcp_networks_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("dhcp_networks", {"device_name": "core-switch"})
+    assert result["result"] == [
+        {
+            ".id": "*1",
+            "address": "10.0.0.0/24",
+            "gateway": "10.0.0.1",
+            "dns-server": "10.0.0.1",
+            "netmask": "24",
+            "domain": "lan",
+            "comment": "main LAN",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_ports_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bridge_ports", {"device_name": "core-switch"})
+    rows = {row["interface"]: row for row in result["result"]}
+    assert rows["ether2"]["pvid"] == "1"
+    assert rows["ether2"]["disabled"] is False
+    assert rows["ether2"]["edge"] == "auto"
+    assert rows["ether2"]["learn"] == "auto"
+    assert rows["ether3"]["pvid"] == "20"
+    # RouterOS's own bool, not the string "true" - must coerce, not compare.
+    assert rows["ether3"]["disabled"] is True
+    assert rows["ether3"]["comment"] == "camera vlan"
+
+
+@pytest.mark.asyncio
+async def test_bridge_ports_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bridge_ports", {"device_name": "core-switch"})
+    assert result["result"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_vlans_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bridge_vlans", {"device_name": "core-switch"})
+    assert result["result"] == [
+        {
+            ".id": "*1",
+            "bridge": "bridge1",
+            "vlan-ids": "20",
+            "tagged": "bridge1,ether1",
+            "untagged": "ether3",
+            "current-tagged": "bridge1,ether1",
+            "current-untagged": "ether3",
+            "comment": "cameras",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_vlans_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bridge_vlans", {"device_name": "core-switch"})
+    assert result["result"]
 
 
 # --- enable_interface / disable_interface --------------------------------

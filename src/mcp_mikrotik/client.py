@@ -464,6 +464,35 @@ class MikrotikClient:
 
         return self._run_read("interface/lte/monitor", _do)
 
+    def ethernet_monitor(self, interface: str) -> dict[str, Any]:
+        """Run /interface/ethernet/monitor once=yes for a single ethernet
+        interface, returning one reply dict - link status/rate/duplex
+        fields present on every ethernet port, plus SFP/DDM optics fields
+        (sfp-temperature, sfp-supply-voltage, sfp-tx-power, sfp-rx-power,
+        sfp-tx-bias-current, sfp-vendor-name, sfp-vendor-part-number,
+        sfp-wavelength, sfp-module-present) that RouterOS only includes at
+        all on a port with an SFP cage - see server.py's `interface_monitor`
+        tool for how these are surfaced (v1.7).
+
+        Same "once" construction and semantics as monitor_traffic/
+        poe_monitor/lte_monitor above: `once=""` gets exactly one reply back
+        instead of opening a continuous stream. Note the interface is
+        forwarded as `numbers=` (RouterOS's selector parameter for this
+        menu), NOT `interface=` - unlike monitor-traffic/poe/monitor, real
+        `/interface/ethernet/monitor` rejects `interface=` with "unknown
+        parameter" (verified on ROS6 and ROS7). The value is expected to be
+        already validated by validation.validate_interface_name. Retried
+        automatically on a transient network error - see _run_read.
+        """
+
+        def _do(connection: RouterosConnection) -> dict[str, Any]:
+            # See monitor_traffic's _do above: must materialize with list(...)
+            # before subscripting - librouteros returns a generator here too.
+            rows = list(connection("/interface/ethernet/monitor", numbers=interface, once=""))
+            return dict(rows[0]) if rows else {}
+
+        return self._run_read("interface/ethernet/monitor", _do)
+
     def torch(
         self,
         interface: str,

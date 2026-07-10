@@ -168,6 +168,7 @@ class FakeConnection:
         monitor_traffic_replies: dict[str, dict[str, Any]] | None = None,
         poe_monitor_replies: dict[str, dict[str, Any]] | None = None,
         lte_monitor_replies: dict[str, dict[str, Any]] | None = None,
+        ethernet_monitor_replies: dict[str, dict[str, Any]] | None = None,
         torch_replies: dict[str, list[dict[str, Any]]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
@@ -184,6 +185,10 @@ class FakeConnection:
         self._monitor_traffic_replies: dict[str, dict[str, Any]] = dict(monitor_traffic_replies or {})
         self._poe_monitor_replies: dict[str, dict[str, Any]] = dict(poe_monitor_replies or {})
         self._lte_monitor_replies: dict[str, dict[str, Any]] = dict(lte_monitor_replies or {})
+        # v1.7: same keyed-by-interface, single-row-generator shape as the
+        # three above, for /interface/ethernet/monitor once=yes (see
+        # server.py's `interface_monitor`).
+        self._ethernet_monitor_replies: dict[str, dict[str, Any]] = dict(ethernet_monitor_replies or {})
         # v0.14: keyed by interface name like the three above, but each value
         # is a LIST of flow rows (a torch snapshot can genuinely report many
         # flows for one interface) rather than a single dict.
@@ -218,6 +223,12 @@ class FakeConnection:
             return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
         if cmd == "/interface/lte/monitor":
             return _once_reply_stream(self._lte_monitor_replies.get(kwargs.get("interface")))
+        if cmd == "/interface/ethernet/monitor":
+            # Real RouterOS selects the port via `numbers=` here, NOT
+            # `interface=` (unlike monitor-traffic/poe/lte above) - keying on
+            # `numbers` mirrors that so a regression back to `interface=`
+            # yields no reply and the test catches it (verified on ROS6/ROS7).
+            return _once_reply_stream(self._ethernet_monitor_replies.get(kwargs.get("numbers")))
         if cmd == "/tool/torch":
             return _multi_reply_stream(self._torch_replies.get(kwargs.get("interface"), []))
         if cmd == "/system/backup/save":
