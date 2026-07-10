@@ -1,9 +1,10 @@
 """MCP server entrypoint.
 
 Registers the read tools plus every guarded write tool (set_identity,
-enable_interface/disable_interface, set_wifi_ssid - see guard.py's ALLOWLIST
-for the full write-tool inventory). Transport is stdio only - this process is
-meant to run on the operator's own machine, launched by an MCP client (e.g.
+enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
+add_static_dhcp_lease, remove_simple_queue - see guard.py's ALLOWLIST for the
+full write-tool inventory). Transport is stdio only - this process is meant
+to run on the operator's own machine, launched by an MCP client (e.g.
 Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
@@ -160,6 +161,18 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """List DHCP server leases (address, mac, host-name, status, server, comment)."""
         client = _client(device_name)
         return rows_to_list(client.path("ip", "dhcp-server", "lease"))
+
+    @mcp.tool()
+    @_safe
+    def simple_queues(device_name: str) -> list[dict[str, Any]]:
+        """List Simple Queue entries (/queue/simple): name, target, max-limit,
+        limit-at, bytes counters, disabled. Use this to see which clients
+        already have a bandwidth limit and how much traffic they've moved
+        (the `bytes` counter), before deciding who to limit with
+        set_client_bandwidth.
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("queue", "simple"))
 
     @mcp.tool()
     @_safe
@@ -340,6 +353,92 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.set_wifi_ssid(
             client, settings, interface_name=interface_name, new_ssid=new_ssid, confirm=confirm
         )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def set_client_bandwidth(
+        device_name: str, target: str, max_limit: str, limit_at: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Limit a client's bandwidth via a RouterOS Simple Queue (/queue/simple).
+
+        `target` is the client's IP address or subnet (e.g. "10.0.0.5" or
+        "10.0.0.0/24"). `max_limit` is a RouterOS rate pair in
+        "upload/download" form (e.g. "10M/5M"); `limit_at` is the optional
+        guaranteed-rate (CIR) pair in the same form. If a Simple Queue
+        already targets `target`, its max-limit/limit-at is UPDATED;
+        otherwise a new one is CREATED with a name derived from `target` -
+        the returned `operation` field ("set_client_bandwidth_update" vs
+        "set_client_bandwidth_add") tells you which happened (or would
+        happen, with confirm=False).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it.
+
+        GOTCHA - FastTrack: if the device has a FastTrack rule in its
+        firewall (common on RouterOS's own quick-set wizards), fasttracked
+        connections bypass queueing entirely, so this queue may have no
+        visible effect on a client whose traffic is already fasttracked -
+        see README's "Security model" section.
+        """
+        client = _client(device_name)
+        preview = guard.set_client_bandwidth(
+            client, settings, target=target, max_limit=max_limit, limit_at=limit_at, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_static_dhcp_lease(
+        device_name: str,
+        address: str,
+        mac_address: str,
+        comment: str | None = None,
+        server: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a static DHCP lease (/ip/dhcp-server/lease), pinning
+        `address` to `mac_address`. Useful to give a client a stable,
+        predictable IP - e.g. before limiting it with set_client_bandwidth.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if a lease for `mac_address` already
+        exists on the device - it never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_static_dhcp_lease(
+            client,
+            settings,
+            address=address,
+            mac_address=mac_address,
+            comment=comment,
+            server=server,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_simple_queue(
+        device_name: str, target: str | None = None, name: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove a Simple Queue by `target` or by `name` - undoes a
+        bandwidth limit previously set with set_client_bandwidth. At least
+        one of `target`/`name` must be given and must match an existing
+        queue.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be removed; call again with
+        confirm=True to actually remove it.
+        """
+        client = _client(device_name)
+        preview = guard.remove_simple_queue(client, settings, target=target, name=name, confirm=confirm)
         return asdict(preview)
 
     return mcp

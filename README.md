@@ -13,12 +13,15 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.2: read tools covering the core device inventory plus DHCP leases, DNS
-cache, firewall filter rules, wireless client registrations and system
-health, and a small set of guarded write tools (`set_identity`,
-`enable_interface`/`disable_interface`, `set_wifi_ssid`) that all go through
-the same write-guard mechanism. See `CHANGELOG.md` for what changed since
-v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
+v0.3: read tools covering the core device inventory plus DHCP leases, DNS
+cache, firewall filter rules, wireless client registrations, system health
+and Simple Queue entries, and a set of guarded write tools (`set_identity`,
+`enable_interface`/`disable_interface`, `set_wifi_ssid`, plus v0.3's
+`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue` for
+identifying and limiting a client that's consuming too much bandwidth) that
+all go through the same write-guard mechanism. See `CHANGELOG.md` for what
+changed since v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the
+next write tool.
 
 ## Installation
 
@@ -89,6 +92,7 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `ip_routes` | List the IPv4 routing table; optional `limit` (capped at 500). |
 | `neighbors` | List neighbors discovered via CDP/MNDP/LLDP. |
 | `dhcp_leases` | List DHCP server leases (address, mac, host-name, status, server, comment). |
+| `simple_queues` | List Simple Queue entries (name, target, max-limit, limit-at, bytes counters, disabled) - see who already has a bandwidth limit and how much traffic they've moved. |
 | `wireless_registrations` | List wireless clients currently associated to the device. Tries the ROS7 wifi registration table first, falls back to the ROS6 wireless one; returns an empty list (not an error) for a device with no radio. |
 | `dns_cache` | List cached DNS records (name, type, data, ttl). |
 | `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
@@ -110,9 +114,35 @@ model" below for the full guard mechanism.
 | `enable_interface` | Enable a network interface by name (`disabled=no`). Errors if the interface name doesn't exist; never creates one. |
 | `disable_interface` | Disable a network interface by name (`disabled=yes`). Errors if the interface name doesn't exist; never creates one. |
 | `set_wifi_ssid` | Set a wireless interface's SSID. Detects whether the interface lives under the ROS7 wifi package or the ROS6 wireless package and writes to whichever one matches; errors if the interface name isn't found under either. |
+| `set_client_bandwidth` | Limit a client's bandwidth via a Simple Queue targeting an IP/subnet (`target`). Updates the existing queue's `max-limit`/`limit-at` if one already targets it, otherwise creates one with a name derived from `target`. **FastTrack gotcha**: if the device has a FastTrack firewall rule, fasttracked traffic bypasses queues entirely - this may have no visible effect until FastTrack is adjusted. See "Limiting a client's bandwidth" below. |
+| `add_static_dhcp_lease` | Create a static DHCP lease pinning an IP `address` to a `mac_address` (useful to give a client a stable target before limiting it). Refuses to create a second lease for a MAC that already has one. |
+| `remove_simple_queue` | Remove a Simple Queue by `target` or `name` - undoes a bandwidth limit. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
+
+### Limiting a client's bandwidth (v0.3)
+
+The typical flow to find and limit a client that's consuming too much of the
+link:
+
+1. `simple_queues` and `dhcp_leases` / `wireless_registrations` to see who's
+   on the network and whether they already have a limit.
+2. Optionally, `add_static_dhcp_lease` to pin a chatty client's IP so its
+   `target` doesn't drift to a different address on DHCP renewal.
+3. `set_client_bandwidth` with `confirm=false` first to preview the
+   `max-limit`/`limit-at` it would set (and whether it would create a new
+   queue or update an existing one), then `confirm=true` to apply it.
+4. `remove_simple_queue` (by `target` or `name`) to lift the limit later.
+
+**FastTrack gotcha**: RouterOS's own quick-set wizards commonly add a
+FastTrack rule to `/ip/firewall/filter` for performance. Fasttracked
+connections bypass the whole queueing subsystem, including Simple Queue -
+so a queue created by `set_client_bandwidth` can silently have zero effect
+on a client whose traffic is already being fasttracked. If a limit doesn't
+seem to be taking effect, check `firewall_filter` for a FastTrack rule and
+adjust/disable it for the traffic you're trying to limit. `mcp-mikrotik`
+does not modify firewall rules itself (see "Roadmap / non-goals" below).
 
 ## Security model
 
@@ -127,13 +157,19 @@ Three independent controls apply to every write tool, all centralized in
    dedicated, named function (e.g. `set_identity`, `enable_interface`)
    mapped to exactly one API path and action in `guard.ALLOWLIST`. There is
    no code path by which a caller can reach an API path outside that table.
-   `set_wifi_ssid` is the one exception to "one tool, one allowlist entry":
-   because RouterOS exposes wifi under different paths depending on
-   generation (ROS7 `/interface/wifi` vs ROS6 `/interface/wireless`), it is
-   backed by *two* fixed, reviewed allowlist entries
-   (`set_wifi_ssid_ros7`/`set_wifi_ssid_ros6`), and the guard function picks
-   between them by checking which path actually has a matching interface
-   name on the device - never by accepting a path from the caller.
+   `set_wifi_ssid` and `set_client_bandwidth` are the two exceptions to "one
+   tool, one allowlist entry": because RouterOS exposes wifi under different
+   paths depending on generation (ROS7 `/interface/wifi` vs ROS6
+   `/interface/wireless`), `set_wifi_ssid` is backed by *two* fixed, reviewed
+   allowlist entries (`set_wifi_ssid_ros7`/`set_wifi_ssid_ros6`), and the
+   guard function picks between them by checking which path actually has a
+   matching interface name on the device. Likewise, `set_client_bandwidth`
+   either updates an existing Simple Queue or creates a new one, so it is
+   backed by `set_client_bandwidth_update`/`set_client_bandwidth_add`, and
+   the guard function picks between them by checking whether a queue already
+   targets the given `target`. In both cases the choice is made entirely by
+   the guard function reading the device - never by accepting a path or an
+   add-vs-update decision from the caller.
 3. **Explicit confirm with before/after preview.** Every write tool takes a
    `confirm: bool` parameter. With `confirm=False` (the default), the tool
    computes and returns what would change - a `before`/`after` structure -
@@ -142,10 +178,15 @@ Three independent controls apply to every write tool, all centralized in
 On top of the write guard:
 
 - **Never creates the target.** Write tools that operate on a named resource
-  (`enable_interface`/`disable_interface`/`set_wifi_ssid`) look it up by name
-  first. If no interface/wireless network with that name exists on the
-  device, the tool raises a clear error instead of creating one - a typo in
-  `interface_name` can never silently provision something new.
+  (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`)
+  look it up by name first. If no interface/wireless network/queue with that
+  name (or `target`) exists on the device, the tool raises a clear error
+  instead of creating one - a typo in `interface_name`/`target` can never
+  silently provision something new.
+- **Never silently duplicates.** `add_static_dhcp_lease` checks for an
+  existing lease on the given `mac_address` first and raises
+  `ResourceAlreadyExistsError` instead of creating a second one - both for
+  `confirm=false` previews and `confirm=true` applies.
 - **Structured API, not shell commands.** All device communication goes
   through [`librouteros`](https://github.com/luqasz/librouteros)'s
   structured API (`path().select()/.add()/.update()/.remove()`, and the

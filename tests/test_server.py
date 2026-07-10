@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     "ip_routes",
     "neighbors",
     "dhcp_leases",
+    "simple_queues",
     "wireless_registrations",
     "dns_cache",
     "firewall_filter",
@@ -37,6 +38,9 @@ EXPECTED_TOOLS = {
     "enable_interface",
     "disable_interface",
     "set_wifi_ssid",
+    "set_client_bandwidth",
+    "add_static_dhcp_lease",
+    "remove_simple_queue",
 }
 
 
@@ -90,6 +94,14 @@ async def test_dhcp_leases_happy_path(settings: Settings, fake_connection: FakeC
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("dhcp_leases", {"device_name": "core-switch"})
     assert result["result"][0]["host-name"] == "laptop-1"
+
+
+@pytest.mark.asyncio
+async def test_simple_queues_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("simple_queues", {"device_name": "core-switch"})
+    assert result["result"][0]["target"] == "10.0.0.50/32"
+    assert result["result"][0]["max-limit"] == "10M/5M"
 
 
 @pytest.mark.asyncio
@@ -364,6 +376,162 @@ async def test_set_wifi_ssid_unknown_interface_raises_clear_error(device: Device
             {"device_name": "core-switch", "interface_name": "ghost-radio", "new_ssid": "x", "confirm": False},
         )
     assert "ghost-radio" in str(exc_info.value)
+
+
+# --- set_client_bandwidth ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_client_bandwidth_blocked_read_only_by_default(settings: Settings):
+    fake = FakeConnection(data={("queue", "simple"): []})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_client_bandwidth",
+            {"device_name": "core-switch", "target": "10.0.0.50", "max_limit": "10M/5M", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert fake.path("queue", "simple")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_set_client_bandwidth_creates_then_updates(device: Device):
+    fake = FakeConnection(data={("queue", "simple"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_client_bandwidth",
+        {"device_name": "core-switch", "target": "10.0.0.50", "max_limit": "10M/5M", "confirm": False},
+    )
+    assert preview["operation"] == "set_client_bandwidth_add"
+    assert preview["applied"] is False
+    assert fake.path("queue", "simple")._rows == []
+
+    _content, applied = await mcp.call_tool(
+        "set_client_bandwidth",
+        {"device_name": "core-switch", "target": "10.0.0.50", "max_limit": "10M/5M", "confirm": True},
+    )
+    assert applied["operation"] == "set_client_bandwidth_add"
+    assert applied["applied"] is True
+    assert len(fake.path("queue", "simple")._rows) == 1
+
+    # Calling it again for the same target updates the existing queue instead of adding a second one.
+    _content, updated = await mcp.call_tool(
+        "set_client_bandwidth",
+        {"device_name": "core-switch", "target": "10.0.0.50", "max_limit": "20M/10M", "confirm": True},
+    )
+    assert updated["operation"] == "set_client_bandwidth_update"
+    assert updated["applied"] is True
+    rows = fake.path("queue", "simple")._rows
+    assert len(rows) == 1
+    assert rows[0]["max-limit"] == "20M/10M"
+
+
+@pytest.mark.asyncio
+async def test_set_client_bandwidth_rejects_invalid_max_limit_before_touching_device(settings: Settings):
+    fake = FakeConnection(data={("queue", "simple"): []})
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_client_bandwidth",
+            {"device_name": "core-switch", "target": "10.0.0.50", "max_limit": "not-a-rate", "confirm": True},
+        )
+    assert "rate pair" in str(exc_info.value).lower()
+    assert fake.path("queue", "simple")._rows == []
+
+
+# --- add_static_dhcp_lease ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_static_dhcp_lease_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_static_dhcp_lease",
+            {"device_name": "core-switch", "address": "10.0.0.60", "mac_address": "AA:BB:CC:DD:EE:02", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "dhcp-server", "lease")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_static_dhcp_lease_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_static_dhcp_lease",
+        {"device_name": "core-switch", "address": "10.0.0.60", "mac_address": "AA:BB:CC:DD:EE:02", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("ip", "dhcp-server", "lease")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "add_static_dhcp_lease",
+        {"device_name": "core-switch", "address": "10.0.0.60", "mac_address": "AA:BB:CC:DD:EE:02", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "dhcp-server", "lease")._rows
+    assert any(row["mac-address"] == "AA:BB:CC:DD:EE:02" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_add_static_dhcp_lease_rejects_duplicate_mac(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_static_dhcp_lease",
+            {"device_name": "core-switch", "address": "10.0.0.99", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": True},
+        )
+    assert "already exists" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "dhcp-server", "lease")._rows) == 1
+
+
+# --- remove_simple_queue ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remove_simple_queue_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_simple_queue", {"device_name": "core-switch", "target": "10.0.0.50/32", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("queue", "simple")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_simple_queue_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_simple_queue", {"device_name": "core-switch", "target": "10.0.0.50/32", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("queue", "simple")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "remove_simple_queue", {"device_name": "core-switch", "target": "10.0.0.50/32", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake_connection.path("queue", "simple")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_simple_queue_unknown_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_simple_queue", {"device_name": "core-switch", "target": "10.0.0.99", "confirm": True}
+        )
+    assert "10.0.0.99" in str(exc_info.value)
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------

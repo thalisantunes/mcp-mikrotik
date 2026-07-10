@@ -74,6 +74,25 @@ class ResourceNotFoundError(MikrotikMCPError):
         self.resource_name = resource_name
 
 
+class ResourceAlreadyExistsError(MikrotikMCPError):
+    """A write tool refused to create a resource that already exists (e.g. a
+    static DHCP lease for a MAC address that already has one).
+
+    Raised instead of silently creating a duplicate row or overwriting the
+    existing one - the caller must remove/adjust the existing resource
+    explicitly first (this package's add_* write tools never update or
+    remove as a side effect of add).
+    """
+
+    def __init__(self, device_name: str, resource_kind: str, resource_name: str):
+        super().__init__(
+            f"{resource_kind} {resource_name!r} already exists on device {device_name!r}; not creating a duplicate."
+        )
+        self.device_name = device_name
+        self.resource_kind = resource_kind
+        self.resource_name = resource_name
+
+
 class GuardViolationError(MikrotikMCPError):
     """A write operation was requested that is not present in the write allowlist.
 

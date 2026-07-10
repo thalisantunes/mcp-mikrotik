@@ -28,12 +28,21 @@ each write operation must stay individually named and reviewable.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .client import MikrotikClient
 from .config import Settings
-from .exceptions import DeviceCommandError, GuardViolationError, ResourceNotFoundError, WriteDisabledError
+from .exceptions import (
+    DeviceCommandError,
+    GuardViolationError,
+    ResourceAlreadyExistsError,
+    ResourceNotFoundError,
+    ValidationError,
+    WriteDisabledError,
+)
+from .validation import validate_ip_address, validate_mac_address, validate_rate_pair, validate_target
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,35 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("interface", "wireless"),
         action="update",
         description="Set the SSID of a ROS6 wireless-package interface (/interface/wireless).",
+    ),
+    # set_client_bandwidth is exposed as ONE server.py tool, backed by two
+    # fixed allowlist entries exactly like set_wifi_ssid above: whichever one
+    # applies is decided by set_client_bandwidth() itself (does a Simple
+    # Queue already target this `target`?), never by a path the caller
+    # supplies directly.
+    "set_client_bandwidth_update": WriteOperation(
+        name="set_client_bandwidth_update",
+        path=("queue", "simple"),
+        action="update",
+        description="Update an existing Simple Queue's max-limit/limit-at for a client target (bandwidth limit).",
+    ),
+    "set_client_bandwidth_add": WriteOperation(
+        name="set_client_bandwidth_add",
+        path=("queue", "simple"),
+        action="add",
+        description="Create a new Simple Queue to limit a client target's bandwidth (max-limit/limit-at).",
+    ),
+    "add_static_dhcp_lease": WriteOperation(
+        name="add_static_dhcp_lease",
+        path=("ip", "dhcp-server", "lease"),
+        action="add",
+        description="Create a static DHCP lease pinning an IP address to a MAC address.",
+    ),
+    "remove_simple_queue": WriteOperation(
+        name="remove_simple_queue",
+        path=("queue", "simple"),
+        action="remove",
+        description="Remove a Simple Queue by target or name (undoes a bandwidth limit).",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -256,4 +294,190 @@ def set_wifi_ssid(
 
     write = getattr(client, op.action)
     write(*op.path, **{".id": row.get(".id"), "ssid": new_ssid})
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.3: bandwidth control + IP reservation ------------------------------
+
+_QUEUE_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _queue_name_for_target(target: str) -> str:
+    """Deterministic Simple Queue `name` derived from a validated `target`.
+
+    RouterOS queue names can't sensibly contain "." or "/", so every
+    non-alphanumeric run is collapsed to a single "-", e.g.
+    "10.0.0.5" -> "limit-10-0-0-5", "10.0.0.0/24" -> "limit-10-0-0-0-24".
+    Deterministic (not random) so calling set_client_bandwidth again for the
+    same target reliably finds the queue it created last time via `target`
+    matching in set_client_bandwidth itself - this is only used the first
+    time a queue is created for a given target.
+    """
+    slug = _QUEUE_NAME_UNSAFE.sub("-", target).strip("-")
+    return f"limit-{slug}"
+
+
+def set_client_bandwidth(
+    client: MikrotikClient,
+    settings: Settings,
+    target: str,
+    max_limit: str,
+    confirm: bool,
+    limit_at: str | None = None,
+) -> WritePreview:
+    """Limit a client's bandwidth via a RouterOS Simple Queue (/queue/simple).
+
+    If a Simple Queue already targets `target`, this UPDATES its max-limit
+    (and limit-at, if given) - operation "set_client_bandwidth_update". If
+    none exists yet, this CREATES one - operation "set_client_bandwidth_add"
+    - with a name deterministically derived from `target` (see
+    _queue_name_for_target). The returned WritePreview's `operation` field
+    tells the caller which of the two happened (or would happen, with
+    confirm=False), and `before`/`after` show the values either way (`before`
+    is `{}` for a create, since nothing exists yet).
+
+    `max_limit` and the optional `limit_at` are RouterOS rate pairs in
+    "upload/download" form (e.g. "10M/5M") - see validate_rate_pair.
+
+    GOTCHA - FastTrack: if the device has a FastTrack rule in its firewall
+    (common on RouterOS's own quick-set wizards), fasttracked connections
+    bypass queueing entirely, so a queue created/updated here may have no
+    visible effect on a client whose traffic is already being fasttracked.
+    See README's "Security model" section.
+    """
+    # Gate check + allowlist presence, anchored on the "_update" entry purely
+    # to reuse _require_allowed - both _update and _add share the exact same
+    # gate, mirroring set_wifi_ssid's ros7/ros6 anchoring above.
+    _require_allowed(settings, "set_client_bandwidth_update")
+
+    validated_target = validate_target(target)
+    validated_max_limit = validate_rate_pair(max_limit, "max_limit")
+    validated_limit_at = validate_rate_pair(limit_at, "limit_at") if limit_at is not None else None
+
+    update_op = ALLOWLIST["set_client_bandwidth_update"]
+    add_op = ALLOWLIST["set_client_bandwidth_add"]
+
+    rows = client.path(*update_op.path)
+    row = _find_row_by_field(rows, "target", validated_target)
+
+    if row is not None:
+        op = update_op
+        before = dict(row)
+        after = dict(row)
+        after["max-limit"] = validated_max_limit
+        if validated_limit_at is not None:
+            after["limit-at"] = validated_limit_at
+
+        if not confirm:
+            return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+        fields: dict[str, Any] = {".id": row.get(".id"), "max-limit": validated_max_limit}
+        if validated_limit_at is not None:
+            fields["limit-at"] = validated_limit_at
+        write = getattr(client, op.action)
+        write(*op.path, **fields)
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+    op = add_op
+    payload: dict[str, Any] = {
+        "name": _queue_name_for_target(validated_target),
+        "target": validated_target,
+        "max-limit": validated_max_limit,
+    }
+    if validated_limit_at is not None:
+        payload["limit-at"] = validated_limit_at
+
+    before = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def add_static_dhcp_lease(
+    client: MikrotikClient,
+    settings: Settings,
+    address: str,
+    mac_address: str,
+    confirm: bool,
+    comment: str | None = None,
+    server: str | None = None,
+) -> WritePreview:
+    """Create a static DHCP lease (/ip/dhcp-server/lease), pinning `address`
+    to `mac_address`. Useful to give a client a stable, predictable IP -
+    e.g. before limiting it with set_client_bandwidth, whose `target` is far
+    more useful pinned to one address than following a client around a
+    dynamic pool.
+
+    Refuses to create a lease for a `mac_address` that already has one
+    (static or dynamic) on the device - raises ResourceAlreadyExistsError
+    instead of silently creating a duplicate. This tool only ever adds; it
+    never updates or removes an existing lease.
+    """
+    op = _require_allowed(settings, "add_static_dhcp_lease")
+
+    validated_address = validate_ip_address(address)
+    validated_mac = validate_mac_address(mac_address)
+
+    rows = client.path(*op.path)
+    existing = _find_row_by_field(rows, "mac-address", validated_mac)
+    if existing is not None:
+        raise ResourceAlreadyExistsError(client.device.name, "DHCP lease", validated_mac)
+
+    payload: dict[str, Any] = {"address": validated_address, "mac-address": validated_mac}
+    if comment:
+        payload["comment"] = comment
+    if server:
+        payload["server"] = server
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def remove_simple_queue(
+    client: MikrotikClient,
+    settings: Settings,
+    confirm: bool,
+    target: str | None = None,
+    name: str | None = None,
+) -> WritePreview:
+    """Remove a Simple Queue by `target` or by `name` - undoes a bandwidth
+    limit previously set with set_client_bandwidth. At least one of
+    `target`/`name` must be given and must resolve to an existing queue
+    (`name` is tried first if both are given); raises ResourceNotFoundError
+    otherwise. Never removes more than the one matching row.
+    """
+    op = _require_allowed(settings, "remove_simple_queue")
+
+    if not target and not name:
+        raise ValidationError("remove_simple_queue requires 'target' or 'name'.")
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", name) if name else None
+    if row is None and target:
+        validated_target = validate_target(target)
+        row = _find_row_by_field(rows, "target", validated_target)
+
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "Simple queue", name or target or "")
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

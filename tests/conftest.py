@@ -62,6 +62,17 @@ def fake_connection() -> FakeConnection:
                 {"name": "voltage", "value": "24.1", "type": "V"},
                 {"name": "temperature", "value": "38", "type": "C"},
             ],
+            ("queue", "simple"): [
+                {
+                    ".id": "*1",
+                    "name": "limit-10-0-0-50",
+                    "target": "10.0.0.50/32",
+                    "max-limit": "10M/5M",
+                    "limit-at": "0/0",
+                    "bytes": "1234567/7654321",
+                    "disabled": "false",
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},

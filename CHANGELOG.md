@@ -3,6 +3,45 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.3.0] - Unreleased
+
+### Added
+
+- Read tool: `simple_queues` (`/queue/simple`) - name, target, max-limit,
+  limit-at, bytes counters, disabled. Lets an operator see who already has a
+  bandwidth limit and how much traffic they've moved before deciding who to
+  limit next.
+- Guarded write tool `set_client_bandwidth`: limits a client's bandwidth via
+  a RouterOS Simple Queue targeting an IP/subnet. Updates the existing queue
+  if one already targets `target`, otherwise creates one with a name
+  deterministically derived from `target` - backed by two allowlist entries
+  (`set_client_bandwidth_update`/`set_client_bandwidth_add`), following the
+  same "two fixed, reviewed paths, chosen by the guard function, never by
+  the caller" shape as `set_wifi_ssid`. `max_limit`/`limit_at` are validated
+  as RouterOS rate pairs (`validate_rate_pair`, `src/mcp_mikrotik/validation.py`).
+- Guarded write tool `add_static_dhcp_lease`: creates a static DHCP lease
+  (`/ip/dhcp-server/lease`) pinning an IP address to a MAC address (useful
+  to give a client a stable target before limiting it). Refuses to create a
+  second lease for a MAC that already has one - raises the new
+  `ResourceAlreadyExistsError` (`src/mcp_mikrotik/exceptions.py`) instead of
+  duplicating.
+- Guarded write tool `remove_simple_queue`: removes a Simple Queue by
+  `target` or `name`, to undo a bandwidth limit.
+- Validation: `validate_target` (IPv4/IPv6 address or `/prefix` subnet, for
+  Simple Queue `target`), `validate_ip_address` (plain address, for DHCP
+  lease `address` - unlike `validate_ping_address`, no hostname), `validate_mac_address`,
+  `validate_rate_pair` (RouterOS `upload/download` rate pairs, e.g. `"10M/5M"`)
+  - all in `src/mcp_mikrotik/validation.py`.
+
+### Notes
+
+- **FastTrack gotcha**: if a device has a FastTrack rule in its firewall (a
+  common default from RouterOS's own quick-set wizards), fasttracked
+  connections bypass Simple Queue entirely - `set_client_bandwidth` may have
+  no visible effect on a client whose traffic is already fasttracked. This
+  is documented in `set_client_bandwidth`'s docstring (`server.py`/`guard.py`)
+  and in README's "Security model" section below.
+
 ## [0.2.0] - Unreleased
 
 ### Added
