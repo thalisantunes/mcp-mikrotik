@@ -3,6 +3,65 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.8.0] - 2026-07-10
+
+**NTP client + clock - closes out `ROADMAP.md`'s Tier 2.** Two read tools
+and one guarded write, the last item Tier 2 named after v1.6/v1.7 shipped
+everything else in it (certificates/users/RADIUS, then SFP monitor/DHCP
+server config/bridge VLAN filtering).
+
+- `ntp_client` (`/system/ntp/client`): NTP client configuration/status. Every
+  field RouterOS's own reply carries is returned as-is (`.get`-based, nothing
+  invented) - only `enabled` is normalized via `formatting.coerce_ros_bool`.
+  ROS7's `servers` field (a comma-joined list of configured servers) is left
+  exactly as RouterOS sends it, never split into a Python list - the same
+  "no invented shape" convention v1.7's `bridge_vlans` already established
+  for `tagged`/`untagged`. Returns an empty dict (never an error) for a
+  device with no NTP client menu at all.
+- `system_clock` (`/system/clock`): `time`, `date`, `time-zone-name`,
+  `time-zone-autodetect` and `dst-active` (both coerced to `bool | None`),
+  `gmt-offset`. Clock drift breaks certificate validation, log timestamps,
+  and scheduler timing - check this alongside `ntp_client`'s
+  `status`/`synced-server` when diagnosing any of those.
+- `set_ntp_servers` (WRITE, guarded): sets the NTP server(s) a device syncs
+  against. **ROS6/ROS7 field-shape split, same generation as
+  `/system/ntp/client` on both - unlike `set_wifi_ssid`'s genuinely
+  different menus, this is one RouterOS path with two different field
+  shapes**, detected by reading the row once and checking which field is
+  present - `servers` (ROS7) or `primary-ntp` (ROS6) - the same "read
+  first, then decide" detection `set_wifi_ssid` already established for its
+  own ROS6/ROS7 split. ROS7 writes the full comma-joined `servers` list.
+  ROS6 has no `servers` list at all - only two fixed slots: `servers[0]`
+  maps to `primary-ntp`, `servers[1]` (if given) to `secondary-ntp`; extra
+  entries beyond two are dropped, with `warning` naming exactly which ones.
+  Older ROS6 firmware only accepts a literal IP in either slot - a hostname
+  destined for one of those two slots is instead folded into
+  `server-dns-names` (RouterOS's own DNS-name field for this menu) IF the
+  device's row shows that field exists, otherwise it is not applied at all
+  (never a value RouterOS would likely reject) and `warning` says so; if
+  nothing at all ends up applicable, this raises `ValidationError` instead
+  of silently performing a no-op write. Never enables/disables the NTP
+  client itself - only the server list changes; `warning` also fires when
+  the client is currently disabled, since new servers won't be used until
+  it's enabled separately (out of scope here). Every server is validated as
+  an IPv4/IPv6 address OR hostname (`validate_ping_address`, reused as-is)
+  before anything is read from the device - fail fast on a caller mistake.
+  New `validation.is_literal_ip_address` - a non-raising boolean cousin of
+  `validate_ip_address`, reusing the same `_IPV4`/`_IPV6` matchers - backs
+  the IP-vs-hostname branch on the ROS6 side.
+
+**Hardware-verified, both generations**: reads confirmed on real ROS7
+(`.237`, `servers` shape) and real ROS6 6.49 (`.254`, `primary-ntp` shape -
+so the ROS6 branch is a live path in the field, not a legacy hypothetical).
+`set_ntp_servers` exercised end-to-end and reversibly on both: the ROS7
+`servers` write on `.237` (set then cleared back), and the ROS6 branch on
+`.254` (set `primary-ntp` to a different valid NTP IP, confirmed it applied,
+restored the original exactly). `dst-active`/`enabled` came back as real
+Python `bool` (coerce_ros_bool path). **Still unverified**: only IP servers
+were exercised on the ROS6 device - the hostname-to-`server-dns-names` fold
+(and whether older ROS6 firmware rejects a hostname in `primary-ntp`) is
+still fake-only, since no hostname was written to a real ROS6 box.
+
 ## [1.7.0] - 2026-07-10
 
 **Network-config visibility (Tier 2, all read-only)**: five new read tools

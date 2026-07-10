@@ -114,6 +114,9 @@ EXPECTED_TOOLS = {
     "users",
     "user_active",
     "radius",
+    "ntp_client",
+    "system_clock",
+    "set_ntp_servers",
 }
 
 
@@ -1162,6 +1165,109 @@ async def test_bridge_vlans_does_not_require_write_enabled(settings: Settings, f
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("bridge_vlans", {"device_name": "core-switch"})
     assert result["result"]
+
+
+# --- ntp_client / system_clock (v1.8) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ntp_client_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ntp_client", {"device_name": "core-switch"})
+    # A dict-typed tool result is returned as the object itself (its own
+    # keys as top-level fields), unlike a list-typed tool's `result["result"]`
+    # - see container_config's tests for the same convention.
+    assert result["enabled"] is True
+    assert result["mode"] == "unicast"
+    # ROS7's `servers` stays the raw comma-joined string RouterOS sends -
+    # never split into a list, same "no invented shape" convention
+    # bridge_vlans' tagged/untagged fields already follow.
+    assert result["servers"] == "1.2.3.4,pool.ntp.org"
+    assert result["status"] == "synchronized"
+    assert result["synced-server"] == "1.2.3.4"
+
+
+@pytest.mark.asyncio
+async def test_ntp_client_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ntp_client", {"device_name": "core-switch"})
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_ntp_client_returns_empty_when_menu_absent(settings: Settings):
+    fake = FakeConnection(raise_for={("system", "ntp", "client"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ntp_client", {"device_name": "core-switch"})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_ntp_client_returns_empty_when_menu_has_no_rows(settings: Settings):
+    """The menu exists but replies with zero rows (as opposed to raising) -
+    same empty-dict result, distinct code path from a raised
+    DeviceCommandError above."""
+    fake = FakeConnection(data={("system", "ntp", "client"): []})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ntp_client", {"device_name": "core-switch"})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_ntp_client_ros6_shape_returned_as_is(settings: Settings):
+    """ROS6's field shape (primary-ntp/secondary-ntp, no `servers` list) is
+    returned exactly as the device sends it - nothing invented."""
+    fake = FakeConnection(
+        data={
+            ("system", "ntp", "client"): [
+                {"enabled": False, "primary-ntp": "10.0.0.1", "secondary-ntp": "0.0.0.0", "mode": "unicast"}
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ntp_client", {"device_name": "core-switch"})
+    assert result["enabled"] is False
+    assert result["primary-ntp"] == "10.0.0.1"
+    assert "servers" not in result
+
+
+@pytest.mark.asyncio
+async def test_system_clock_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("system_clock", {"device_name": "core-switch"})
+    assert result["time"] == "12:00:00"
+    assert result["date"] == "jan/01/2026"
+    assert result["time-zone-name"] == "America/Sao_Paulo"
+    assert result["time-zone-autodetect"] is True
+    assert result["dst-active"] is False
+
+
+@pytest.mark.asyncio
+async def test_system_clock_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("system_clock", {"device_name": "core-switch"})
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_system_clock_returns_empty_when_menu_absent(settings: Settings):
+    fake = FakeConnection(raise_for={("system", "clock"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("system_clock", {"device_name": "core-switch"})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_system_clock_returns_empty_when_menu_has_no_rows(settings: Settings):
+    """The menu exists but replies with zero rows (as opposed to raising) -
+    same empty-dict result, distinct code path from a raised
+    DeviceCommandError above."""
+    fake = FakeConnection(data={("system", "clock"): []})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("system_clock", {"device_name": "core-switch"})
+    assert result == {}
 
 
 # --- enable_interface / disable_interface --------------------------------
@@ -4764,3 +4870,91 @@ async def test_remove_ppp_secret_ambiguous_name_raises_and_removes_nothing(devic
     assert "ambiguous" in str(exc_info.value).lower()
     rows = [row for row in fake.path("ppp", "secret")._rows if row["name"] == "dup-secret"]
     assert len(rows) == 2
+
+
+# --- set_ntp_servers (v1.8) --------------------------------------------------
+
+
+def _ros7_ntp_fake() -> FakeConnection:
+    return FakeConnection(data={("system", "ntp", "client"): [{"enabled": True, "servers": "10.0.0.1"}]})
+
+
+def _ros6_ntp_fake() -> FakeConnection:
+    return FakeConnection(
+        data={("system", "ntp", "client"): [{"enabled": True, "primary-ntp": "10.0.0.1", "secondary-ntp": "0.0.0.0"}]}
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_ntp_servers_blocked_read_only_by_default(settings: Settings):
+    fake = _ros7_ntp_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("set_ntp_servers", {"device_name": "core-switch", "servers": ["1.2.3.4"], "confirm": True})
+    assert "read-only" in str(exc_info.value)
+    # Device was never touched.
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "10.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_set_ntp_servers_ros7_preview_then_confirm(device: Device):
+    fake = _ros7_ntp_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_ntp_servers", {"device_name": "core-switch", "servers": ["1.2.3.4", "pool.ntp.org"], "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["servers"] == "10.0.0.1"
+    assert preview["after"]["servers"] == "1.2.3.4,pool.ntp.org"
+    # Preview must not touch the device.
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "10.0.0.1"
+
+    _content, applied = await mcp.call_tool(
+        "set_ntp_servers", {"device_name": "core-switch", "servers": ["1.2.3.4", "pool.ntp.org"], "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "1.2.3.4,pool.ntp.org"
+
+
+@pytest.mark.asyncio
+async def test_set_ntp_servers_ros6_maps_to_primary_secondary(device: Device):
+    fake = _ros6_ntp_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "set_ntp_servers", {"device_name": "core-switch", "servers": ["1.2.3.4", "5.6.7.8"], "confirm": True}
+    )
+    assert applied["applied"] is True
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "1.2.3.4"
+    assert row["secondary-ntp"] == "5.6.7.8"
+    assert "servers" not in row
+
+
+@pytest.mark.asyncio
+async def test_set_ntp_servers_invalid_server_raises_clear_error(device: Device):
+    fake = _ros7_ntp_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_ntp_servers", {"device_name": "core-switch", "servers": ["not a valid host!!"], "confirm": True}
+        )
+    assert "not a valid" in str(exc_info.value).lower()
+    # Nothing was written.
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "10.0.0.1"
+
+
+@pytest.mark.asyncio
+async def test_set_ntp_servers_requires_at_least_one_server(device: Device):
+    fake = _ros7_ntp_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("set_ntp_servers", {"device_name": "core-switch", "servers": [], "confirm": True})
+    assert "at least one" in str(exc_info.value).lower()

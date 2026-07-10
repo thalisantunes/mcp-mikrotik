@@ -114,6 +114,21 @@ def validate_ip_address(address: str) -> str:
     raise ValidationError(f"Address {address!r} is not a valid IPv4/IPv6 address.")
 
 
+def is_literal_ip_address(value: str) -> bool:
+    """True if `value` is a literal IPv4/IPv6 address (no hostname) - a
+    non-raising boolean cousin of `validate_ip_address`, reusing the same
+    `_IPV4`/`_IPV6` matchers rather than a separate check.
+
+    v1.8: used by `guard.set_ntp_servers` to tell a plain IP apart from a
+    hostname when mapping onto ROS6's `primary-ntp`/`secondary-ntp` fields,
+    which (on older RouterOS versions) only accept a literal IP - not a
+    validation failure on its own (the value was already accepted upstream
+    by `validate_ping_address`, which allows either shape), just a shape
+    check the caller needs to branch on.
+    """
+    return bool(_IPV4.match(value) or _IPV6.match(value))
+
+
 def validate_target(target: str) -> str:
     """Validate a Simple Queue `target`: an IPv4/IPv6 address, optionally
     followed by a "/prefix-length" subnet mask (e.g. "10.0.0.5",

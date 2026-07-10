@@ -11,16 +11,18 @@ wake_on_lan, enable_firewall_rule/disable_firewall_rule,
 add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
 add_hotspot_user, create_backup, add_vlan/remove_vlan, move_firewall_rule,
 add_ppp_secret/remove_ppp_secret, enable_nat_rule/disable_nat_rule,
-enable_mangle_rule/disable_mangle_rule -
+enable_mangle_rule/disable_mangle_rule, set_ntp_servers (v1.8) -
 see guard.py's ALLOWLIST for the full write-tool inventory), plus the
 read-only connection_tracking tool (v0.11), the read-only
 security_audit/security_events tools (v0.12 - see security.py), the
 read-only wireguard_interfaces tool (v0.13), three more read-only tools from
 v0.14 - hotspot_active, torch, list_backups - (v1.2) one more read-only
 tool - list_vlans - (v1.3) one more read-only tool - ppp_secrets - (v1.4)
-one more read-only tool - firewall_mangle - and (v1.6) four more read-only
+one more read-only tool - firewall_mangle - (v1.6) four more read-only
 tools - certificates, users, user_active, radius - see "AAA/PKI visibility"
-below.
+below - (v1.7) five more read-only tools - interface_monitor, dhcp_servers,
+dhcp_networks, bridge_ports, bridge_vlans - and (v1.8) two more read-only
+tools - ntp_client, system_clock - closing out ROADMAP.md's Tier 2.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -1047,6 +1049,71 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         return rows_to_list(client.path("interface", "bridge", "vlan"))
+
+    # --- v1.8: NTP client + clock (closes out Tier 2) -----------------------
+
+    @mcp.tool()
+    @_safe
+    def ntp_client(device_name: str) -> dict[str, Any]:
+        """NTP client configuration/status (`/system/ntp/client`) - a
+        single-row menu, same shape as `container_config`. Every field
+        RouterOS's own reply carries is returned as-is (`.get`-based,
+        nothing invented) - only `enabled` is normalized to `bool | None`
+        (`formatting.coerce_ros_bool`).
+
+        ROS7 fields: `enabled`, `mode`, `servers` (a comma-joined string of
+        every configured NTP server - left exactly as RouterOS sends it, NOT
+        split into a list; same "no invented shape" convention
+        `bridge_vlans`' `tagged`/`untagged` fields already follow),
+        `freq-drift`, `status`, `synced-server`, `synced-stratum`.
+
+        ROS6 fields: `enabled`, `primary-ntp`, `secondary-ntp`,
+        `server-dns-names`, `mode`. See `set_ntp_servers` for how a write
+        detects and targets whichever of these two shapes a device actually
+        speaks.
+
+        Returns an empty dict (never an error) for a device with no NTP
+        client menu at all.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("system", "ntp", "client"))
+        except DeviceCommandError:
+            return {}
+        if not rows:
+            return {}
+        entry = dict(rows[0])
+        entry["enabled"] = coerce_ros_bool(rows[0].get("enabled"))
+        return entry
+
+    @mcp.tool()
+    @_safe
+    def system_clock(device_name: str) -> dict[str, Any]:
+        """Device clock (`/system/clock`): `time`, `date`, `time-zone-name`,
+        `time-zone-autodetect` (normalized to `bool | None` -
+        `formatting.coerce_ros_bool`), `gmt-offset`, `dst-active` (also
+        normalized) - a single-row menu, same shape as `container_config`/
+        `ntp_client`.
+
+        Clock drift breaks certificate validation (see `certificates`'
+        `daysUntilExpiry`), log timestamps, and scheduler timing - check
+        this alongside `ntp_client`'s `status`/`synced-server` when
+        diagnosing any of those. Returns an empty dict (never an error) for
+        a device with no `/system/clock` menu at all (not expected on any
+        real RouterOS device, but handled the same defensive way every
+        other single-row read here is).
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("system", "clock"))
+        except DeviceCommandError:
+            return {}
+        if not rows:
+            return {}
+        entry = dict(rows[0])
+        entry["time-zone-autodetect"] = coerce_ros_bool(rows[0].get("time-zone-autodetect"))
+        entry["dst-active"] = coerce_ros_bool(rows[0].get("dst-active"))
+        return entry
 
     # --- v0.14: hotspot vouchers, live traffic (torch), backup -------------
 
@@ -2538,6 +2605,37 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.remove_ppp_secret(client, settings, name=name, confirm=confirm)
+        return asdict(preview)
+
+    # --- v1.8: NTP client servers --------------------------------------
+
+    @mcp.tool()
+    @_safe
+    def set_ntp_servers(device_name: str, servers: list[str], confirm: bool = False) -> dict[str, Any]:
+        """Set the NTP server(s) a device syncs its clock against
+        (`/system/ntp/client`). `servers` is a list of one or more IPv4/
+        IPv6 addresses or hostnames.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Never
+        enables/disables the NTP client itself - only the server list
+        changes; the returned preview's `warning` says so if the client is
+        currently disabled.
+
+        Works against either RouterOS generation, detected by reading
+        `/system/ntp/client` first: ROS7 writes the full `servers` list;
+        ROS6 has no such list - `servers[0]`/`servers[1]` map onto its fixed
+        `primary-ntp`/`secondary-ntp` slots instead (extras beyond two are
+        dropped, called out in `warning`). A hostname destined for one of
+        those two ROS6 slots is folded into `server-dns-names` if the device
+        has that field, otherwise it is not applied - `warning` says so. See
+        `guard.set_ntp_servers`'s docstring for the full detection/mapping
+        rules.
+        """
+        client = _client(device_name)
+        preview = guard.set_ntp_servers(client, settings, servers=servers, confirm=confirm)
         return asdict(preview)
 
     return mcp

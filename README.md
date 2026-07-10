@@ -241,6 +241,8 @@ representative exchanges:
 | `dhcp_networks` | List DHCP server networks (`/ip/dhcp-server/network`): address, gateway, dns-server, netmask, domain, comment. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
 | `bridge_ports` | List bridge port membership (`/interface/bridge/port`): bridge, interface, pvid, disabled, edge, horizon, learn, comment. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
 | `bridge_vlans` | List the bridge VLAN filtering table (`/interface/bridge/vlan`): bridge, vlan-ids, tagged, untagged, comment, plus current-tagged/current-untagged when present - completes the VLAN story for a managed switch (bridge VLAN filtering), distinct from the standalone `/interface/vlan` interfaces `list_vlans`/`add_vlan` manage. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
+| `ntp_client` | NTP client configuration/status (`/system/ntp/client`): enabled, mode, plus whichever of ROS7's `servers`/`freq-drift`/`status`/`synced-server`/`synced-stratum` or ROS6's `primary-ntp`/`secondary-ntp`/`server-dns-names` the device actually returns - nothing invented. `enabled` normalized to `bool \| None`. See "NTP client + clock" below. |
+| `system_clock` | Device clock (`/system/clock`): time, date, time-zone-name, time-zone-autodetect, gmt-offset, dst-active. `time-zone-autodetect`/`dst-active` normalized to `bool \| None`. See "NTP client + clock" below. |
 
 ### Write (guarded)
 
@@ -291,6 +293,7 @@ model" below for the full guard mechanism.
 | `disable_nat_rule` | Disable an **EXISTING** firewall NAT rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_nat_rule`. |
 | `enable_mangle_rule` | Enable an **EXISTING** firewall mangle rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** Same pattern as `enable_firewall_rule`. |
 | `disable_mangle_rule` | Disable an **EXISTING** firewall mangle rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_mangle_rule`. |
+| `set_ntp_servers` | Set the NTP server(s) a device syncs its clock against (`/system/ntp/client`), `servers` (1+ IPv4/IPv6 addresses or hostnames). Detects ROS6 vs ROS7 field shape and writes to whichever one matches. **Never enables/disables the NTP client itself.** See "NTP client + clock" below. |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
@@ -496,6 +499,48 @@ that string. Enum-shaped RouterOS fields that merely *look* boolean
 (`auto-negotiation`, `authoritative`, `edge`, `learn` - each of which can
 take a value like `"auto"` or `"after-2sec-delay"`, not just yes/no) are
 deliberately left as RouterOS's own raw value instead.
+
+### NTP client + clock (v1.8)
+
+The last item `ROADMAP.md`'s Tier 2 named - closed out here. Two read tools
+plus one guarded write:
+
+- **`ntp_client`** / **`system_clock`** (`/system/ntp/client`,
+  `/system/clock`): NTP configuration/sync status and the device's own
+  clock. Every field the device's reply actually carries is returned as-is
+  - `.get`-based, nothing invented - only the boolean-shaped ones
+  (`enabled`, `time-zone-autodetect`, `dst-active`) are normalized via
+  `formatting.coerce_ros_bool`. Clock drift breaks certificate validation
+  (see `certificates`'s `daysUntilExpiry`), log timestamps, and scheduler
+  timing - check both tools together when diagnosing any of those.
+- **`set_ntp_servers`** (WRITE, guarded): sets the NTP server(s) a device
+  syncs against. `/system/ntp/client` is the SAME RouterOS path on both
+  generations (unlike `set_wifi_ssid`'s genuinely different
+  `/interface/wifi` vs `/interface/wireless` menus) - only the FIELD SHAPE
+  differs, detected by reading the row once and checking which field is
+  present: `servers` (ROS7's single comma-joined list) or `primary-ntp`
+  (ROS6's fixed two-slot form) - the same "read first, then decide"
+  detection `set_wifi_ssid` already established.
+  - **ROS7**: writes the full comma-joined `servers` list.
+  - **ROS6**: has no `servers` list at all. `servers[0]` maps to
+    `primary-ntp`, `servers[1]` (if given) to `secondary-ntp`; anything
+    beyond the first two is dropped, with `warning` naming exactly which
+    ones. Older ROS6 firmware only accepts a literal IP in either slot - a
+    hostname destined for one of those two slots is instead folded into
+    `server-dns-names` (RouterOS's own DNS-name field for this menu) IF the
+    device's row shows that field exists; if it doesn't, that hostname is
+    NOT applied (never a value RouterOS would likely reject), and
+    `warning` says so. If nothing at all ends up applicable, the tool
+    raises a validation error rather than silently performing a no-op
+    write.
+  - Never enables/disables the NTP client itself - only the server list
+    changes. `warning` also fires if the client is currently disabled
+    (`enabled=no`): new servers won't be used until it's enabled
+    separately (out of scope here - see "Roadmap & non-goals" below).
+  - **Hardware caveat**: exercised only against this project's fake
+    RouterOS connection (`tests/fakes.py`), not real ROS6 hardware - the
+    ROS6 field shapes and the "older firmware rejects a hostname" claim are
+    unverified on an actual device. See `CHANGELOG.md`.
 
 ### VPN & routing diagnostics (v0.8)
 

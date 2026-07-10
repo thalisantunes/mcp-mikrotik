@@ -49,6 +49,7 @@ from .exceptions import (
 )
 from .formatting import WIREGUARD_SENSITIVE_FIELDS, coerce_ros_bool, strip_sensitive_fields
 from .validation import (
+    is_literal_ip_address,
     validate_address_list_name,
     validate_allowed_address_list,
     validate_backup_name,
@@ -507,6 +508,22 @@ ALLOWLIST: dict[str, WriteOperation] = {
         description=(
             "Disable an EXISTING firewall mangle rule (disabled=yes), resolved by its comment "
             "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
+    # v1.8: NTP client servers. Unlike set_wifi_ssid's genuinely different
+    # /interface/wifi vs /interface/wireless menus, /system/ntp/client is the
+    # SAME RouterOS path on both generations - only the field SHAPE differs
+    # (ROS7's single `servers` list vs ROS6's fixed `primary-ntp`/
+    # `secondary-ntp` slots), so one allowlist entry covers both; see
+    # set_ntp_servers below for how it detects and targets whichever shape a
+    # given device actually speaks.
+    "set_ntp_servers": WriteOperation(
+        name="set_ntp_servers",
+        path=("system", "ntp", "client"),
+        action="update",
+        description=(
+            "Set the NTP server(s) a device syncs its clock against (/system/ntp/client). "
+            "Never enables/disables the NTP client itself, only its server list."
         ),
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
@@ -3049,3 +3066,127 @@ def remove_ppp_secret(client: MikrotikClient, settings: Settings, name: str, con
     write = getattr(client, op.action)
     write(*op.path, ids=(row.get(".id"),))
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v1.8: NTP client servers -----------------------------------------------
+
+
+@_audited("set_ntp_servers")
+def set_ntp_servers(client: MikrotikClient, settings: Settings, servers: list[str], confirm: bool) -> WritePreview:
+    """Set the NTP server(s) a device syncs its clock against
+    (`/system/ntp/client`). See `server.py`'s `ntp_client` read tool for the
+    field shapes this reads back afterward.
+
+    `servers` must have at least one entry; each is validated as an IPv4/
+    IPv6 address OR hostname (`validate_ping_address`, same shape `ping`/
+    `add_wireguard_peer`'s `endpoint_address` already accept) BEFORE
+    anything is read from the device - fail fast on a caller mistake rather
+    than partway through resolving which RouterOS generation is in play.
+
+    GENERATION DETECTION: `/system/ntp/client` is the SAME RouterOS path on
+    both generations (unlike `set_wifi_ssid`'s genuinely different
+    `/interface/wifi` vs `/interface/wireless` menus) - only the FIELD SHAPE
+    differs. This reads the row once and checks which field is present -
+    `servers` (ROS7's single comma-joined list) or `primary-ntp` (ROS6's
+    fixed two-slot form) - mirroring `set_wifi_ssid`'s own "read first, then
+    decide" detection. A device with neither field yet (e.g. a completely
+    default/never-configured NTP client) is treated as ROS7 - the newer,
+    more common shape - since there is nothing on the row to detect ROS6
+    from.
+
+    ROS7: writes the full comma-joined `servers` list, e.g. "1.2.3.4,pool.
+    ntp.org" - the raw device string is never split into a list on the read
+    side either (see `ntp_client`'s docstring), so this stays symmetric.
+
+    ROS6: has no `servers` list at all - only two fixed slots. `servers[0]`
+    maps to `primary-ntp`, `servers[1]` (if given) to `secondary-ntp`; any
+    entries beyond the first two are DROPPED, never silently - `warning`
+    names exactly which ones were ignored. Older ROS6 firmware only accepts
+    a literal IP in either slot (`validation.is_literal_ip_address`); a
+    hostname destined for one of those two slots is instead folded into
+    `server-dns-names` (RouterOS's own DNS-name field for this menu) IF the
+    device's row shows that field exists - never guessed at otherwise. If it
+    doesn't exist, that hostname is NOT applied at all (never sent as a
+    value RouterOS would likely reject) and `warning` says so. If nothing at
+    all ends up applicable (every given server is a hostname the device has
+    no way to accept), this raises `ValidationError` rather than silently
+    performing a no-op write.
+
+    Never enables/disables the NTP client itself - only the server
+    field(s) change. If the client's `enabled` field (`formatting.
+    coerce_ros_bool`) reads as `False`, `warning` says so too: new servers
+    configured on a disabled client won't actually be used until it's
+    enabled separately (out of scope for this tool - see `ROADMAP.md`).
+    """
+    op = _require_allowed(settings, "set_ntp_servers")
+
+    if not servers:
+        raise ValidationError("At least one NTP server must be given.")
+    validated_servers = [validate_ping_address(server) for server in servers]
+
+    rows = client.path(*op.path)
+    before = dict(rows[0]) if rows else {}
+    after = dict(before)
+
+    warnings: list[str] = []
+    if coerce_ros_bool(before.get("enabled")) is False:
+        warnings.append(
+            "NTP client is currently disabled (enabled=no) - servers will be set, "
+            "but won't be used until the client is enabled separately."
+        )
+
+    fields: dict[str, Any] = {}
+    is_ros6 = "servers" not in before and "primary-ntp" in before
+
+    if is_ros6:
+        if len(validated_servers) > 2:
+            ignored = validated_servers[2:]
+            warnings.append(
+                f"ROS6 only has two NTP server slots (primary-ntp/secondary-ntp) - "
+                f"ignoring {len(ignored)} extra server(s): {', '.join(ignored)}."
+            )
+        slots = [("primary-ntp", validated_servers[0])]
+        if len(validated_servers) > 1:
+            slots.append(("secondary-ntp", validated_servers[1]))
+
+        dns_names: list[str] = []
+        for field_name, value in slots:
+            if is_literal_ip_address(value):
+                fields[field_name] = value
+                after[field_name] = value
+            elif "server-dns-names" in before:
+                dns_names.append(value)
+            else:
+                warnings.append(
+                    f"{field_name}={value!r} is a hostname, but this ROS6 device has no "
+                    "server-dns-names field and older ROS6 firmware only accepts a literal "
+                    f"IP in {field_name} - not applied."
+                )
+
+        if dns_names:
+            joined = ",".join(dns_names)
+            fields["server-dns-names"] = joined
+            after["server-dns-names"] = joined
+
+        if not fields:
+            raise ValidationError(
+                "None of the given NTP servers could be applied to this ROS6 device "
+                "(all hostnames, no server-dns-names field, and no literal IP given)."
+            )
+    else:
+        joined = ",".join(validated_servers)
+        fields["servers"] = joined
+        after["servers"] = joined
+
+    warning = " ".join(warnings) if warnings else None
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, **fields)
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )

@@ -23,16 +23,26 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** Network-config visibility — `interface_monitor`,
-`dhcp_servers`, `dhcp_networks`, `bridge_ports`, `bridge_vlans` — landed in
-**v1.7**, closing out the rest of Tier 2 (NTP/clock is now the only item
-left): `interface_monitor` reads `/interface/ethernet/monitor once=yes` for
-link status/rate/duplex plus SFP/DDM optics fields when a port has an SFP
-cage and module (the command path was already verified against the
-reference mANTBox; the DDM field *values* remain unverified — that board has
-no SFP cage, see the Feasibility note below). `dhcp_servers`/`dhcp_networks`
-read `/ip/dhcp-server` and `/ip/dhcp-server/network` — the server's own
-config, as opposed to the already-shipped `dhcp_leases`. `bridge_ports`/
+**Recently shipped:** NTP client + clock — `ntp_client`, `system_clock`
+(read), `set_ntp_servers` (guarded write) — landed in **v1.8**, closing out
+Tier 2 entirely (see the note below). `ntp_client`/`system_clock` read
+`/system/ntp/client` and `/system/clock`, returning every field the device's
+reply actually carries (nothing invented); `set_ntp_servers` detects which
+of the two field shapes a device speaks — ROS7's single `servers` list vs
+ROS6's fixed `primary-ntp`/`secondary-ntp` slots, both on the SAME RouterOS
+path — the same "read first, then decide" detection `set_wifi_ssid` already
+established for its own ROS6/ROS7 split. Never verified against real ROS6
+hardware — see `CHANGELOG.md`'s v1.8 entry for the honest gap.
+
+Before that, Network-config visibility — `interface_monitor`, `dhcp_servers`,
+`dhcp_networks`, `bridge_ports`, `bridge_vlans` — landed in **v1.7**:
+`interface_monitor` reads `/interface/ethernet/monitor once=yes` for link
+status/rate/duplex plus SFP/DDM optics fields when a port has an SFP cage
+and module (the command path was already verified against the reference
+mANTBox; the DDM field *values* remain unverified — that board has no SFP
+cage, see the Feasibility note below). `dhcp_servers`/`dhcp_networks` read
+`/ip/dhcp-server` and `/ip/dhcp-server/network` — the server's own config,
+as opposed to the already-shipped `dhcp_leases`. `bridge_ports`/
 `bridge_vlans` read `/interface/bridge/port` and `/interface/bridge/vlan` —
 the honest completion of the VLAN story for a managed switch (bridge VLAN
 filtering), distinct from the standalone `/interface/vlan` interfaces the
@@ -110,18 +120,18 @@ separately-argued case. The default stance is: stay API-only.
 
 Tier 1 items have all shipped (v1.3 – v1.5: PPP/PPPoE secrets, NAT rule
 toggle + firewall mangle, and static route add/remove — see "Recently
-shipped" above). Tier 2 is well underway.
+shipped" above). Tier 2 is complete.
 
 ## Tier 2 — valued, mostly reads
 
-Certificates (with expiry + a new `security_audit` check), Users/AAA read,
-and RADIUS read shipped in **v1.6**; SFP/optical monitor, DHCP server
-config, and bridge ports/VLAN filtering shipped in **v1.7** — see "Recently
-shipped" above. Remaining:
-
-- **NTP / clock** (`/system/ntp/client`, `/system/clock`) — read plus setting
-  NTP servers. Clock drift breaks certs, logs and scheduling. ROS6/7 split to
-  handle: ROS6 uses `primary-ntp`/`secondary-ntp`; ROS7 uses a `servers` list.
+**Tier 2 complete (v1.6 – v1.8).** Certificates (with expiry + a new
+`security_audit` check), Users/AAA read, and RADIUS read shipped in **v1.6**;
+SFP/optical monitor, DHCP server config, and bridge ports/VLAN filtering
+shipped in **v1.7**; NTP client + clock (read plus guarded `set_ntp_servers`)
+shipped in **v1.8**, closing out everything this tier ever named — see
+"Recently shipped" above for all three rounds. Tier 3 (IPv6 parity, advanced
+queuing, richer ROS7 Wi-Fi, CAPsMAN, RouterOS CVE check, API-only config
+snapshot & diff) is now next.
 
 Guarded writes for bridge VLAN filtering (assigning a port's `pvid` /
 `tagged`/`untagged` membership) are a natural Tier 2/3 follow-up now that the

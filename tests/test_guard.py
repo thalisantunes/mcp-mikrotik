@@ -4407,3 +4407,214 @@ def test_remove_ppp_secret_dispatches_via_allowlist_action(
     guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- set_ntp_servers (v1.8) --------------------------------------------------
+
+
+def _ros7_ntp_fixture(enabled: bool | None = True) -> FakeConnection:
+    row: dict = {"mode": "unicast", "servers": "10.0.0.1,old.pool.ntp.org"}
+    if enabled is not None:
+        row["enabled"] = enabled
+    return FakeConnection(data={("system", "ntp", "client"): [row]})
+
+
+def _ros6_ntp_fixture(with_dns_names: bool = False, enabled: bool | None = True) -> FakeConnection:
+    row: dict = {"mode": "unicast", "primary-ntp": "10.0.0.1", "secondary-ntp": "0.0.0.0"}
+    if with_dns_names:
+        row["server-dns-names"] = ""
+    if enabled is not None:
+        row["enabled"] = enabled
+    return FakeConnection(data={("system", "ntp", "client"): [row]})
+
+
+def test_set_ntp_servers_blocked_when_write_disabled(settings: Settings, device: Device):
+    fake = _ros7_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(WriteDisabledError):
+        guard.set_ntp_servers(client, settings, servers=["10.0.0.2"], confirm=True)
+
+
+def test_set_ntp_servers_read_only_gate_applies_before_touching_device(settings: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_ntp_servers(guarded_client, settings, servers=["10.0.0.2"], confirm=True)
+
+
+def test_set_ntp_servers_requires_at_least_one_server(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_ntp_servers(guarded_client, settings_write_enabled, servers=[], confirm=True)
+
+
+def test_set_ntp_servers_validates_fail_fast_before_touching_device(settings_write_enabled: Settings, device: Device):
+    """An invalid server must be rejected before /system/ntp/client is ever
+    read - RaisingConnection proves the device is never touched."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_ntp_servers(guarded_client, settings_write_enabled, servers=["not a valid host!!"], confirm=True)
+
+
+def test_set_ntp_servers_ros7_preview_then_confirm(settings_write_enabled: Settings, device: Device):
+    fake = _ros7_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4", "pool.ntp.org"], confirm=False)
+    assert preview.operation == "set_ntp_servers"
+    assert preview.applied is False
+    assert preview.before["servers"] == "10.0.0.1,old.pool.ntp.org"
+    assert preview.after["servers"] == "1.2.3.4,pool.ntp.org"
+    # Preview must not touch the device.
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "10.0.0.1,old.pool.ntp.org"
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4", "pool.ntp.org"], confirm=True)
+    assert applied.applied is True
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "1.2.3.4,pool.ntp.org"
+
+
+def test_set_ntp_servers_ros6_maps_first_two_servers_to_primary_secondary(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _ros6_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4", "5.6.7.8"], confirm=True)
+
+    assert applied.operation == "set_ntp_servers"
+    assert applied.applied is True
+    assert applied.after["primary-ntp"] == "1.2.3.4"
+    assert applied.after["secondary-ntp"] == "5.6.7.8"
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "1.2.3.4"
+    assert row["secondary-ntp"] == "5.6.7.8"
+    # ROS6 has no `servers` list at all - never invented on the write side.
+    assert "servers" not in row
+
+
+def test_set_ntp_servers_ros6_single_server_only_sets_primary(settings_write_enabled: Settings, device: Device):
+    fake = _ros6_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=True)
+
+    assert applied.applied is True
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "1.2.3.4"
+    # secondary-ntp untouched (still its old fixture value).
+    assert row["secondary-ntp"] == "0.0.0.0"
+
+
+def test_set_ntp_servers_ros6_ignores_extra_servers_with_warning(settings_write_enabled: Settings, device: Device):
+    fake = _ros6_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_ntp_servers(
+        client, settings_write_enabled, servers=["1.2.3.4", "5.6.7.8", "9.9.9.9"], confirm=False
+    )
+
+    assert preview.warning is not None
+    assert "9.9.9.9" in preview.warning
+    assert preview.after["primary-ntp"] == "1.2.3.4"
+    assert preview.after["secondary-ntp"] == "5.6.7.8"
+
+
+def test_set_ntp_servers_ros6_hostname_routes_to_server_dns_names_when_field_exists(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _ros6_ntp_fixture(with_dns_names=True)
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4", "pool.ntp.org"], confirm=True)
+
+    assert applied.applied is True
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "1.2.3.4"
+    assert row["server-dns-names"] == "pool.ntp.org"
+    # The hostname is NOT forced into secondary-ntp - RouterOS wouldn't accept it there.
+    assert row["secondary-ntp"] == "0.0.0.0"
+    assert applied.warning is None
+
+
+def test_set_ntp_servers_ros6_hostname_warns_when_no_server_dns_names_field(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _ros6_ntp_fixture(with_dns_names=False)
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4", "pool.ntp.org"], confirm=True)
+
+    assert applied.applied is True
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "1.2.3.4"
+    # secondary-ntp left untouched - the hostname could not be honestly applied.
+    assert row["secondary-ntp"] == "0.0.0.0"
+    assert applied.warning is not None
+    assert "pool.ntp.org" in applied.warning
+    assert "not applied" in applied.warning
+
+
+def test_set_ntp_servers_ros6_all_hostnames_with_no_server_dns_names_raises_validation_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Nothing at all could be honestly applied - must fail loudly rather
+    than silently perform a no-op write."""
+    fake = _ros6_ntp_fixture(with_dns_names=False)
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError):
+        guard.set_ntp_servers(client, settings_write_enabled, servers=["pool.ntp.org"], confirm=True)
+    # Nothing was written.
+    row = fake.path("system", "ntp", "client")._rows[0]
+    assert row["primary-ntp"] == "10.0.0.1"
+
+
+def test_set_ntp_servers_warns_when_client_disabled(settings_write_enabled: Settings, device: Device):
+    fake = _ros7_ntp_fixture(enabled=False)
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=False)
+
+    assert preview.warning is not None
+    assert "disabled" in preview.warning
+
+
+def test_set_ntp_servers_no_warning_when_client_enabled(settings_write_enabled: Settings, device: Device):
+    fake = _ros7_ntp_fixture(enabled=True)
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=False)
+
+    assert preview.warning is None
+
+
+def test_set_ntp_servers_defaults_to_ros7_shape_when_menu_row_empty(settings_write_enabled: Settings, device: Device):
+    """A device row with neither `servers` nor `primary-ntp` (e.g. a brand
+    new/never-configured NTP client) is treated as ROS7 - documented
+    behaviour, not an error."""
+    fake = FakeConnection(data={("system", "ntp", "client"): [{}]})
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=True)
+
+    assert applied.applied is True
+    assert fake.path("system", "ntp", "client")._rows[0]["servers"] == "1.2.3.4"
+
+
+def test_set_ntp_servers_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _ros7_ntp_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_ntp_servers"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_ntp_servers", patched_op)
+
+    guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"servers": "1.2.3.4"}}

@@ -508,6 +508,37 @@ def fake_connection() -> FakeConnection:
                     "authentication-port": "1812",
                 }
             ],
+            # v1.8: NTP client (ROS7 shape - a `servers` list, kept as
+            # RouterOS's own comma-joined string, not split - see
+            # `ntp_client`'s docstring) + system clock. `enabled`/
+            # `dst-active`/`time-zone-autodetect` are real Python bools, not
+            # the strings "true"/"false" - see coerce_ros_bool's docstring -
+            # so read-tool coercion is exercised against the same shape a
+            # real device sends. The ROS6-shaped (`primary-ntp`/
+            # `secondary-ntp`) variant is exercised via its own dedicated
+            # FakeConnection in test_guard.py/test_server.py, mirroring
+            # set_wifi_ssid's ROS6/ROS7 split.
+            ("system", "ntp", "client"): [
+                {
+                    "enabled": True,
+                    "mode": "unicast",
+                    "servers": "1.2.3.4,pool.ntp.org",
+                    "freq-drift": "0.5ppm",
+                    "status": "synchronized",
+                    "synced-server": "1.2.3.4",
+                    "synced-stratum": "2",
+                }
+            ],
+            ("system", "clock"): [
+                {
+                    "time": "12:00:00",
+                    "date": "jan/01/2026",
+                    "time-zone-name": "America/Sao_Paulo",
+                    "time-zone-autodetect": True,
+                    "gmt-offset": "-03:00",
+                    "dst-active": False,
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
