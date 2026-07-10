@@ -4618,3 +4618,769 @@ def test_set_ntp_servers_dispatches_via_allowlist_action(
     guard.set_ntp_servers(client, settings_write_enabled, servers=["1.2.3.4"], confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {"servers": "1.2.3.4"}}
+
+
+# --- v1.10: IPv6 write parity ------------------------------------------------
+#
+# enable_ipv6_firewall_rule/disable_ipv6_firewall_rule, add_ipv6_route/
+# remove_ipv6_route, add_to_ipv6_address_list/remove_from_ipv6_address_list
+# mirror their IPv4 counterparts field-for-field on the equivalent /ipv6/*
+# path. Coverage below deliberately focuses on what's actually NEW/risky in
+# this round rather than re-proving every IPv4 behavior a second time:
+#   - IPv6-only address validation (an IPv4 address/subnet must be rejected
+#     BEFORE the device is touched, same "fail fast" contract as every other
+#     validated write).
+#   - remove_ipv6_route's dynamic-route refusal (the single most important
+#     safety property carried over from remove_route, tested explicitly with
+#     a real Python bool - the v1.5 lesson this whole codebase learned the
+#     hard way, see remove_route's own regression test above).
+#   - ambiguous/not-found resolution, never-creates guarantees, dispatch via
+#     ALLOWLIST.
+#   - the "ipv6 package disabled" trap: unlike the v1.9 READS (which catch
+#     DeviceCommandError and return []), these WRITES must let
+#     DeviceCommandError propagate - a write has no safe "nothing happened"
+#     empty-list shape to fall back to.
+
+
+def test_enable_ipv6_firewall_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.enable_ipv6_firewall_rule(client, settings, comment="allow-v6-mgmt", confirm=True)
+
+
+def test_disable_ipv6_firewall_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.disable_ipv6_firewall_rule(client, settings, comment="allow-v6-mgmt", confirm=True)
+
+
+def test_enable_ipv6_firewall_rule_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.enable_ipv6_firewall_rule(guarded_client, settings, comment="allow-v6-mgmt", confirm=True)
+
+
+def _ipv6_filter_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow-v6-mgmt", "disabled": True},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "block-v6-guest", "disabled": False},
+            ]
+        }
+    )
+
+
+def test_enable_ipv6_firewall_rule_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="allow-v6-mgmt", confirm=False)
+    assert preview.applied is False
+    assert preview.before["disabled"] is True
+    assert preview.after["disabled"] == "no"
+    assert fake.path("ipv6", "firewall", "filter")._rows[0]["disabled"] is True
+
+
+def test_enable_ipv6_firewall_rule_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="allow-v6-mgmt", confirm=True)
+    assert applied.applied is True
+    assert fake.path("ipv6", "firewall", "filter")._rows[0]["disabled"] == "no"
+
+
+def test_disable_ipv6_firewall_rule_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.disable_ipv6_firewall_rule(client, settings_write_enabled, comment="block-v6-guest", confirm=True)
+    assert applied.applied is True
+    assert fake.path("ipv6", "firewall", "filter")._rows[1]["disabled"] == "yes"
+
+
+def test_enable_ipv6_firewall_rule_never_creates_a_rule(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="no-such-rule", confirm=True)
+    assert len(fake.path("ipv6", "firewall", "filter")._rows) == 2
+
+
+def test_enable_ipv6_firewall_rule_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "comment": "dup", "disabled": True},
+                {".id": "*2", "chain": "forward", "comment": "dup", "disabled": True},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError):
+        guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="dup", confirm=True)
+
+
+def test_enable_ipv6_firewall_rule_disambiguated_by_chain(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "comment": "dup", "disabled": True},
+                {".id": "*2", "chain": "forward", "comment": "dup", "disabled": True},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.enable_ipv6_firewall_rule(
+        client, settings_write_enabled, comment="dup", chain="forward", confirm=True
+    )
+    assert applied.applied is True
+    assert applied.before[".id"] == "*2"
+
+
+def test_enable_ipv6_firewall_rule_unknown_comment_error_names_ipv6_filter_resource(
+    settings_write_enabled: Settings, device: Device
+):
+    """resource_label="IPv6 firewall filter rule" - distinct from the IPv4
+    pair's "Firewall filter rule" - so an error is never confused between
+    the two menus."""
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="missing", confirm=True)
+    assert "IPv6 firewall filter rule" in str(exc_info.value)
+
+
+def test_enable_ipv6_firewall_rule_rejects_empty_comment_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.enable_ipv6_firewall_rule(guarded_client, settings_write_enabled, comment="", confirm=True)
+
+
+def test_enable_ipv6_firewall_rule_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _ipv6_filter_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["enable_ipv6_firewall_rule"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "enable_ipv6_firewall_rule", patched_op)
+
+    guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="allow-v6-mgmt", confirm=True)
+
+    assert called["path"] == patched_op.path
+    assert called["fields"][".id"] == "*1"
+    assert called["fields"]["disabled"] == "no"
+
+
+def test_enable_ipv6_firewall_rule_propagates_error_when_ipv6_package_disabled(
+    settings_write_enabled: Settings, device: Device
+):
+    """WRITE tools must NOT catch DeviceCommandError like the v1.9 reads do
+    - a write has no safe empty-list fallback, so the ipv6-disabled error
+    must surface clearly instead of looking like "nothing to toggle"."""
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "filter"): LibRouterosError("no such command")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.enable_ipv6_firewall_rule(client, settings_write_enabled, comment="allow-v6-mgmt", confirm=True)
+
+
+# --- add_ipv6_route / remove_ipv6_route --------------------------------------
+
+
+def test_add_ipv6_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.add_ipv6_route(client, settings, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=True)
+
+
+def test_add_ipv6_route_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_ipv6_route(
+            guarded_client, settings, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=True
+        )
+
+
+def test_add_ipv6_route_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"dst-address": "2001:db8:40::/64", "gateway": "2001:db8::254"}
+    assert fake.path("ipv6", "route")._rows == []
+
+
+def test_add_ipv6_route_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=True
+    )
+    assert preview.applied is True
+    created = fake.path("ipv6", "route")._rows[0]
+    assert created == {"dst-address": "2001:db8:40::/64", "gateway": "2001:db8::254"}
+
+
+def test_add_ipv6_route_includes_optional_distance_and_comment_when_given(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    guard.add_ipv6_route(
+        client,
+        settings_write_enabled,
+        dst_address="2001:db8:40::/64",
+        gateway="2001:db8::254",
+        distance=3,
+        comment="failover-v6",
+        confirm=True,
+    )
+    created = fake.path("ipv6", "route")._rows[0]
+    assert created["distance"] == "3"
+    assert created["comment"] == "failover-v6"
+
+
+def test_add_ipv6_route_never_refuses_duplicate_dst_address(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): [{".id": "*1", "dst-address": "::/0", "gateway": "2001:db8::254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="::/0", gateway="2001:db8::253", confirm=True
+    )
+    assert preview.applied is True
+    matches = [row for row in fake.path("ipv6", "route")._rows if row["dst-address"] == "::/0"]
+    assert len(matches) == 2
+
+
+def test_add_ipv6_route_default_dst_address_carries_warning(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="::/0", gateway="2001:db8::254", confirm=False
+    )
+    assert preview.warning is not None
+    assert "::/0" in preview.warning
+    assert "default" in preview.warning.lower()
+
+    applied = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="::/0", gateway="2001:db8::254", confirm=True
+    )
+    assert applied.warning is not None
+
+
+def test_add_ipv6_route_non_default_dst_address_carries_no_warning(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=False
+    )
+    assert preview.warning is None
+
+
+def test_add_ipv6_route_rejects_ipv4_dst_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """The IPv6 route tool must reject an IPv4 dst_address outright - /ipv6/route
+    has no IPv4 concept."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ipv6_route(
+            guarded_client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="2001:db8::254", confirm=True
+        )
+
+
+def test_add_ipv6_route_rejects_ipv4_gateway_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ipv6_route(
+            guarded_client,
+            settings_write_enabled,
+            dst_address="2001:db8:40::/64",
+            gateway="10.0.0.254",
+            confirm=True,
+        )
+
+
+def test_add_ipv6_route_rejects_invalid_distance_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ipv6_route(
+            guarded_client,
+            settings_write_enabled,
+            dst_address="2001:db8:40::/64",
+            gateway="2001:db8::254",
+            distance=999,
+            confirm=True,
+        )
+
+
+def test_add_ipv6_route_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_ipv6_route"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_ipv6_route", patched_op)
+
+    guard.add_ipv6_route(
+        client, settings_write_enabled, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=True
+    )
+
+    assert called == {
+        "path": patched_op.path,
+        "fields": {"dst-address": "2001:db8:40::/64", "gateway": "2001:db8::254"},
+    }
+
+
+def test_add_ipv6_route_propagates_error_when_ipv6_package_disabled(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(raise_for={("ipv6", "route"): LibRouterosError("no such command")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.add_ipv6_route(
+            client, settings_write_enabled, dst_address="2001:db8:40::/64", gateway="2001:db8::254", confirm=True
+        )
+
+
+def test_remove_ipv6_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.remove_ipv6_route(client, settings, dst_address="2001:db8:20::/64", confirm=True)
+
+
+def test_remove_ipv6_route_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_ipv6_route(guarded_client, settings, dst_address="2001:db8:20::/64", confirm=True)
+
+
+def _ipv6_route_fake_with_static_and_dynamic() -> FakeConnection:
+    """Mirrors _route_fake_with_static_and_dynamic (IPv4) above:
+    `dynamic` is a real Python `bool`, never the string "true"."""
+    return FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "2001:db8:20::/64", "gateway": "2001:db8::254"},
+                {".id": "*2", "dst-address": "2001:db8:30::/64", "gateway": "ether1", "dynamic": True},
+            ]
+        }
+    )
+
+
+def test_remove_ipv6_route_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=False)
+    assert preview.applied is False
+    assert preview.before == {".id": "*1", "dst-address": "2001:db8:20::/64", "gateway": "2001:db8::254"}
+    assert len(fake.path("ipv6", "route")._rows) == 2
+
+
+def test_remove_ipv6_route_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = _ipv6_route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=True)
+    assert preview.applied is True
+    remaining = {row["dst-address"] for row in fake.path("ipv6", "route")._rows}
+    assert remaining == {"2001:db8:30::/64"}
+
+
+def test_remove_ipv6_route_ambiguous_without_gateway_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "::/0", "gateway": "2001:db8::254", "comment": "primary"},
+                {".id": "*2", "dst-address": "::/0", "gateway": "2001:db8::253", "comment": "backup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError):
+        guard.remove_ipv6_route(client, settings_write_enabled, dst_address="::/0", confirm=True)
+    assert len(fake.path("ipv6", "route")._rows) == 2
+
+
+def test_remove_ipv6_route_unknown_dst_address_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _ipv6_route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:99::/64", confirm=True)
+
+
+def test_remove_ipv6_route_refuses_dynamic_route_and_does_not_remove_it(
+    settings_write_enabled: Settings, device: Device
+):
+    """CRITICAL for this round: same dynamic-route refusal remove_route
+    (IPv4) enforces, reused unchanged by _remove_route. dynamic=True is a
+    real Python bool here, the actual shape librouteros hands back from
+    hardware - NOT the string "true" (see coerce_ros_bool)."""
+    fake = _ipv6_route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError) as exc_info:
+        guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:30::/64", confirm=True)
+    assert "dynamic" in str(exc_info.value).lower()
+
+    remaining = {row["dst-address"] for row in fake.path("ipv6", "route")._rows}
+    assert "2001:db8:30::/64" in remaining
+    assert len(fake.path("ipv6", "route")._rows) == 2
+
+
+def test_remove_ipv6_route_regression_dynamic_bool_true_is_refused_not_silently_removed(
+    settings_write_enabled: Settings, device: Device
+):
+    """Same regression proof as remove_route's IPv4 test above, on the IPv6
+    menu: a `dynamic=True` (Python bool) row must be refused, never removed -
+    this is the exact 1.5.0 security fix `_remove_route` shares with both
+    menus."""
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "2001:db8:30::/64", "gateway": "ether1", "dynamic": True},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError):
+        guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:30::/64", confirm=True)
+
+    assert len(fake.path("ipv6", "route")._rows) == 1
+
+
+def test_remove_ipv6_route_allows_removal_when_dynamic_is_bool_false(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "2001:db8:20::/64", "gateway": "2001:db8::254", "dynamic": False},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=True)
+    assert preview.applied is True
+    assert fake.path("ipv6", "route")._rows == []
+
+
+def test_remove_ipv6_route_allows_removal_when_dynamic_field_is_absent(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [
+                {".id": "*1", "dst-address": "2001:db8:20::/64", "gateway": "2001:db8::254"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=True)
+    assert preview.applied is True
+    assert fake.path("ipv6", "route")._rows == []
+
+
+def test_remove_ipv6_route_default_dst_address_carries_warning_not_refusal(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ipv6", "route"): [{".id": "*1", "dst-address": "::/0", "gateway": "2001:db8::254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="::/0", confirm=False)
+    assert preview.warning is not None
+    assert "::/0" in preview.warning
+    assert "default" in preview.warning.lower()
+
+    applied = guard.remove_ipv6_route(client, settings_write_enabled, dst_address="::/0", confirm=True)
+    assert applied.applied is True
+    assert applied.warning is not None
+
+
+def test_remove_ipv6_route_rejects_ipv4_dst_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_ipv6_route(guarded_client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=True)
+
+
+def test_remove_ipv6_route_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _ipv6_route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_ipv6_route"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_ipv6_route", patched_op)
+
+    guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+def test_remove_ipv6_route_propagates_error_when_ipv6_package_disabled(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(raise_for={("ipv6", "route"): LibRouterosError("no such command")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.remove_ipv6_route(client, settings_write_enabled, dst_address="2001:db8:20::/64", confirm=True)
+
+
+# --- add_to_ipv6_address_list / remove_from_ipv6_address_list ---------------
+
+
+def test_add_to_ipv6_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.add_to_ipv6_address_list(
+            client, settings, list_name="blocked-clients-v6", address="2001:db8::61", confirm=True
+        )
+
+
+def test_add_to_ipv6_address_list_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_to_ipv6_address_list(
+            guarded_client, settings, list_name="blocked-clients-v6", address="2001:db8::61", confirm=True
+        )
+
+
+def test_add_to_ipv6_address_list_preview_does_not_create(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_to_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::61", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after["list"] == "blocked-clients-v6"
+    assert preview.after["address"] == "2001:db8::61"
+    assert fake.path("ipv6", "firewall", "address-list")._rows == []
+
+
+def test_add_to_ipv6_address_list_confirm_true_creates(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.add_to_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::61", confirm=True
+    )
+    assert applied.applied is True
+    rows = fake.path("ipv6", "firewall", "address-list")._rows
+    assert any(row["list"] == "blocked-clients-v6" and row["address"] == "2001:db8::61" for row in rows)
+
+
+def test_add_to_ipv6_address_list_rejects_duplicate_list_and_address(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "address-list"): [
+                {".id": "*1", "list": "blocked-clients-v6", "address": "2001:db8::60"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_to_ipv6_address_list(
+            client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
+        )
+    assert len(fake.path("ipv6", "firewall", "address-list")._rows) == 1
+
+
+def test_add_to_ipv6_address_list_rejects_ipv4_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """The IPv6 address-list tool must reject an IPv4 address outright -
+    /ipv6/firewall/address-list has no IPv4 concept."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_to_ipv6_address_list(
+            guarded_client, settings_write_enabled, list_name="blocked-clients-v6", address="10.0.0.61", confirm=True
+        )
+
+
+def test_add_to_ipv6_address_list_rejects_invalid_list_name(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_to_ipv6_address_list(
+            guarded_client, settings_write_enabled, list_name="bad list", address="2001:db8::61", confirm=True
+        )
+
+
+def test_add_to_ipv6_address_list_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_to_ipv6_address_list"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_to_ipv6_address_list", patched_op)
+
+    guard.add_to_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::61", confirm=True
+    )
+
+    assert called == {"path": patched_op.path, "fields": {"list": "blocked-clients-v6", "address": "2001:db8::61"}}
+
+
+def test_add_to_ipv6_address_list_propagates_error_when_ipv6_package_disabled(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "address-list"): LibRouterosError("no such command")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.add_to_ipv6_address_list(
+            client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::61", confirm=True
+        )
+
+
+def test_remove_from_ipv6_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.remove_from_ipv6_address_list(
+            client, settings, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
+        )
+
+
+def test_remove_from_ipv6_address_list_preview_then_confirm(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "address-list"): [
+                {".id": "*1", "list": "blocked-clients-v6", "address": "2001:db8::60"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_from_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before["address"] == "2001:db8::60"
+    assert len(fake.path("ipv6", "firewall", "address-list")._rows) == 1
+
+    applied = guard.remove_from_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
+    )
+    assert applied.applied is True
+    assert fake.path("ipv6", "firewall", "address-list")._rows == []
+
+
+def test_remove_from_ipv6_address_list_unknown_entry_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_from_ipv6_address_list(
+            client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::99", confirm=True
+        )
+
+
+def test_remove_from_ipv6_address_list_rejects_ipv4_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_from_ipv6_address_list(
+            guarded_client, settings_write_enabled, list_name="blocked-clients-v6", address="10.0.0.60", confirm=True
+        )
+
+
+def test_remove_from_ipv6_address_list_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "address-list"): [
+                {".id": "*1", "list": "blocked-clients-v6", "address": "2001:db8::60"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_from_ipv6_address_list"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_from_ipv6_address_list", patched_op)
+
+    guard.remove_from_ipv6_address_list(
+        client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
+    )
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+def test_remove_from_ipv6_address_list_propagates_error_when_ipv6_package_disabled(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "address-list"): LibRouterosError("no such command")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.remove_from_ipv6_address_list(
+            client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
+        )

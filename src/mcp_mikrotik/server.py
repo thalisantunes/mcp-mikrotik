@@ -25,7 +25,10 @@ dhcp_networks, bridge_ports, bridge_vlans - and (v1.8) two more read-only
 tools - ntp_client, system_clock - closing out ROADMAP.md's Tier 2. (v1.9)
 five more read-only tools - ipv6_addresses, ipv6_routes,
 ipv6_firewall_filter, ipv6_neighbors, ipv6_firewall_address_lists - IPv6
-READ parity (ROADMAP.md's Tier 3); IPv6 writes are left for a later release.
+READ parity (ROADMAP.md's Tier 3). (v1.10) six more guarded write tools -
+enable_ipv6_firewall_rule/disable_ipv6_firewall_rule, add_ipv6_route/
+remove_ipv6_route, add_to_ipv6_address_list/remove_from_ipv6_address_list -
+IPv6 WRITE parity, closing out the IPv6 parity item entirely.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -2743,6 +2746,235 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             return rows_to_list(client.path("ipv6", "firewall", "address-list"))
         except DeviceCommandError:
             return []
+
+    # --- v1.10: IPv6 write parity -----------------------------------------
+    # Closes the follow-up v1.9 explicitly left open: six guarded write
+    # tools mirroring their IPv4 counterparts field-for-field on the
+    # equivalent /ipv6/* path - enable_ipv6_firewall_rule/
+    # disable_ipv6_firewall_rule (mirrors enable_firewall_rule/
+    # disable_firewall_rule), add_ipv6_route/remove_ipv6_route (mirrors
+    # add_route/remove_route, INCLUDING remove_ipv6_route's refusal to
+    # remove a dynamic route), add_to_ipv6_address_list/
+    # remove_from_ipv6_address_list (mirrors add_to_address_list/
+    # remove_from_address_list). See guard.py's ALLOWLIST entries for each.
+    #
+    # UNLIKE the v1.9 reads above, none of these six catch DeviceCommandError
+    # - if the `ipv6` package is disabled on the device, the resolution step
+    # (reading existing rows to find the target rule/route/entry) raises
+    # DeviceCommandError, and it propagates as a normal write-tool error
+    # (still one clean audited entry - see guard._audited) instead of being
+    # silently swallowed into an empty-list-shaped success. Returning `[]`
+    # (the read tools' skip-if-missing pattern) would be actively misleading
+    # here: a write tool has no "empty" success shape to fall back to, and
+    # silently reporting nothing changed would look identical to "there was
+    # nothing to toggle/remove" rather than "the ipv6 package is off - fix
+    # that first". See "IPv6 write parity (v1.10)" in the README.
+
+    @mcp.tool()
+    @_safe
+    def enable_ipv6_firewall_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Enable an EXISTING IPv6 firewall filter rule (`/ipv6/firewall/filter
+        set disabled=no`), resolved by its `comment` - optionally narrowed by
+        `chain` if more than one rule shares that comment. Mirrors
+        `enable_firewall_rule` on the IPv6 menu - see its docstring and
+        README's "Firewall rule toggle (by comment)" section for the full
+        admin-creates/LLM-enables workflow.
+
+        SAFE BY DESIGN: this NEVER creates a rule.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview - the FULL matched rule, not
+        just its `disabled` field - without changing anything; call again
+        with confirm=True to actually apply it. Errors clearly if no rule
+        matches `comment` (narrowed by `chain`), or if more than one still
+        does (`AmbiguousResourceError`) - never guesses which one to
+        toggle. Also errors clearly (does not return an empty result) if
+        the `ipv6` package is disabled on the device - see "IPv6 write
+        parity (v1.10)" in the README.
+        """
+        client = _client(device_name)
+        preview = guard.enable_ipv6_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_ipv6_firewall_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Disable an EXISTING IPv6 firewall filter rule (`/ipv6/firewall/
+        filter set disabled=yes`), resolved by its `comment` - optionally
+        narrowed by `chain` if more than one rule shares that comment.
+        Mirrors `disable_firewall_rule` on the IPv6 menu.
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_ipv6_firewall_rule`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        no rule matches `comment` (narrowed by `chain`), or if more than one
+        still does (`AmbiguousResourceError`). Also errors clearly if the
+        `ipv6` package is disabled on the device.
+        """
+        client = _client(device_name)
+        preview = guard.disable_ipv6_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_ipv6_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str,
+        distance: int | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Add a static IPv6 route (`/ipv6/route add`): `dst_address` and
+        `gateway` are required, `distance` (failover priority - lower wins)
+        and `comment` are optional. Mirrors `add_route` on the IPv6 menu -
+        never refuses a duplicate `dst_address`, multiple routes sharing one
+        is the normal failover shape.
+
+        `dst_address`/`gateway` must be IPv6 (an IPv4 address/subnet in
+        either is rejected before the device is ever touched - `/ipv6/route`
+        has no IPv4 concept).
+
+        RISK: adding/overriding the default route (`dst_address="::/0"`)
+        redirects all outbound IPv6 traffic through the new gateway. The
+        returned preview's `warning` field is non-null whenever this is the
+        case - always check it before calling again with `confirm=true`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the `warning`
+        field) without changing anything; call again with confirm=True to
+        actually apply it. Also errors clearly if the `ipv6` package is
+        disabled on the device.
+        """
+        client = _client(device_name)
+        preview = guard.add_ipv6_route(
+            client,
+            settings,
+            dst_address=dst_address,
+            gateway=gateway,
+            distance=distance,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_ipv6_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Remove a static IPv6 route (`/ipv6/route remove`), resolved by
+        `dst_address` - narrowed by `gateway` when more than one route
+        shares that `dst_address`. Mirrors `remove_route` on the IPv6 menu,
+        INCLUDING its most important safety property. Errors clearly if
+        nothing matches, or if the match is still ambiguous after
+        narrowing.
+
+        `dst_address`/`gateway` must be IPv6 (an IPv4 address/subnet in
+        either is rejected before the device is ever touched).
+
+        SAFETY: refuses outright (raises an error, does not remove
+        anything) if the resolved route is dynamic (`dynamic=true` - a
+        connected/DHCP/router-advertisement-installed route). Only static,
+        admin-created IPv6 routes can be removed by this tool.
+
+        RISK: removing the default route (`dst_address="::/0"`) cuts all
+        outbound IPv6 traffic that relies on this gateway. The returned
+        preview's `warning` field is non-null whenever this is the case
+        (not blocking - removing a static default route is legitimate).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the `warning`
+        field) without changing anything; call again with confirm=True to
+        actually apply it. Also errors clearly if the `ipv6` package is
+        disabled on the device.
+        """
+        client = _client(device_name)
+        preview = guard.remove_ipv6_route(client, settings, dst_address=dst_address, gateway=gateway, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_to_ipv6_address_list(
+        device_name: str,
+        list_name: str,
+        address: str,
+        comment: str | None = None,
+        timeout: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Add `address` (an IPv6 address or subnet) to a named IPv6
+        firewall address-list (`/ipv6/firewall/address-list`). Mirrors
+        `add_to_address_list` on the IPv6 menu.
+
+        IMPORTANT: this only manages the *list* - it does NOT create or
+        modify any firewall rule. Adding an address here only blocks or
+        allows traffic if an `/ipv6/firewall/filter` rule on the device
+        already references `list_name`. See README's "Blocking/allowing a
+        client via address lists" section.
+
+        `address` must be IPv6 (an IPv4 address/subnet is rejected before
+        the device is ever touched).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if this exact `list_name`+`address`
+        pair already exists on the device - it never creates a duplicate.
+        Also errors clearly if the `ipv6` package is disabled on the
+        device.
+        """
+        client = _client(device_name)
+        preview = guard.add_to_ipv6_address_list(
+            client,
+            settings,
+            list_name=list_name,
+            address=address,
+            comment=comment,
+            timeout=timeout,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_from_ipv6_address_list(
+        device_name: str, list_name: str, address: str, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove the entry matching `list_name`+`address` from an IPv6
+        firewall address-list (`/ipv6/firewall/address-list`). Mirrors
+        `remove_from_address_list` on the IPv6 menu.
+
+        `address` must be IPv6 (an IPv4 address/subnet is rejected before
+        the device is ever touched).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be removed; call again with
+        confirm=True to actually remove it. Errors clearly if no entry
+        matches `list_name`+`address`. Also errors clearly if the `ipv6`
+        package is disabled on the device.
+        """
+        client = _client(device_name)
+        preview = guard.remove_from_ipv6_address_list(
+            client, settings, list_name=list_name, address=address, confirm=confirm
+        )
+        return asdict(preview)
 
     return mcp
 

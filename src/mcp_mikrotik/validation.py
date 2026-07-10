@@ -995,3 +995,114 @@ def validate_ppp_profile(value: str) -> str:
             "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
         )
     return value
+
+
+# --- v1.10: IPv6 write parity -----------------------------------------------
+#
+# add_ipv6_route/remove_ipv6_route and add_to_ipv6_address_list/
+# remove_from_ipv6_address_list (guard.py) reuse validate_dst_address/
+# validate_route_gateway/validate_target's IPv4-or-IPv6 shape checks for
+# everything EXCEPT the address itself - dst_address/gateway/address are
+# validated with the three functions below instead, which are the SAME
+# parsing as their IPv4-or-IPv6 counterparts but additionally REJECT an
+# IPv4 match. This is deliberate: an IPv4 address/subnet is syntactically
+# indistinguishable from garbage to /ipv6/route or /ipv6/firewall/
+# address-list (neither menu has any IPv4 concept), so failing fast here -
+# with a clear ValidationError naming the mistake - is strictly better than
+# forwarding it to the device and surfacing whatever RouterOS's own
+# rejection looks like.
+
+
+def validate_ipv6_dst_address(value: str) -> str:
+    """Validate an IPv6 route `dst-address` (optionally with a
+    "/prefix-length" subnet, e.g. "::/0", "2001:db8::/32") for
+    `add_ipv6_route`/`remove_ipv6_route`. Same shape as `validate_dst_address`,
+    but rejects an IPv4 address/subnet outright - `/ipv6/route` only accepts
+    IPv6 prefixes.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("dst_address must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("dst_address is too long.")
+
+    address_part, sep, prefix_part = value.partition("/")
+    prefix: int | None = None
+    if sep:
+        if not prefix_part.isdigit():
+            raise ValidationError(f"dst_address {value!r} has an invalid subnet prefix.")
+        prefix = int(prefix_part)
+
+    if _IPV6.match(address_part):
+        if prefix is not None and not (0 <= prefix <= 128):
+            raise ValidationError(f"dst_address {value!r} has an invalid IPv6 subnet prefix (expected 0-128).")
+        return value
+
+    raise ValidationError(f"dst_address {value!r} is not a valid IPv6 address or subnet.")
+
+
+def validate_ipv6_route_gateway(value: str) -> str:
+    """Validate an IPv6 route `gateway` for `add_ipv6_route`/
+    `remove_ipv6_route`: an IPv6 address, or a bare interface name (same
+    point-to-point/PPP-link case `validate_route_gateway` allows). Same
+    shape as `validate_route_gateway`, but rejects an IPv4 address outright
+    - `/ipv6/route` only accepts an IPv6 gateway address.
+
+    The IPv4 check runs BEFORE the interface-name fallback: `_INTERFACE_NAME`
+    (digits/letters/dots/underscore/hyphen) is permissive enough to
+    otherwise accept an IPv4-shaped string like "10.0.0.254" as if it were a
+    plausible interface name, silently letting an IPv4 gateway slip through
+    - an explicit IPv4 check first gives a clear, specific error instead.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("gateway must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("gateway is too long.")
+
+    if _IPV4.match(value):
+        raise ValidationError(f"gateway {value!r} is an IPv4 address; ipv6 route tools require an IPv6 gateway.")
+    if _IPV6.match(value):
+        return value
+    if _INTERFACE_NAME.match(value):
+        return value
+
+    raise ValidationError(f"gateway {value!r} is not a valid IPv6 address or interface name.")
+
+
+def validate_ipv6_target(target: str) -> str:
+    """Validate an IPv6 firewall address-list `address` for
+    `add_to_ipv6_address_list`/`remove_from_ipv6_address_list`: an IPv6
+    address, optionally followed by a "/prefix-length" subnet (0-128, e.g.
+    "2001:db8::1", "2001:db8::/32"). Same shape as `validate_target`'s IPv6
+    branch, but rejects an IPv4 address/subnet outright -
+    `/ipv6/firewall/address-list` only accepts IPv6 entries.
+
+    Returns the (stripped) target on success, raises ValidationError otherwise.
+    """
+    if not isinstance(target, str) or not target.strip():
+        raise ValidationError("Target must be a non-empty string.")
+
+    target = target.strip()
+    if len(target) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("Target is too long.")
+
+    address_part, sep, prefix_part = target.partition("/")
+    prefix: int | None = None
+    if sep:
+        if not prefix_part.isdigit():
+            raise ValidationError(f"Target {target!r} has an invalid subnet prefix.")
+        prefix = int(prefix_part)
+
+    if _IPV6.match(address_part):
+        if prefix is not None and not (0 <= prefix <= 128):
+            raise ValidationError(f"Target {target!r} has an invalid IPv6 subnet prefix (expected 0-128).")
+        return target
+
+    raise ValidationError(f"Target {target!r} is not a valid IPv6 address or subnet.")

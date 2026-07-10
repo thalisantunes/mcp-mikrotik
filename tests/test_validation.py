@@ -24,6 +24,9 @@ from mcp_mikrotik.validation import (
     validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
+    validate_ipv6_dst_address,
+    validate_ipv6_route_gateway,
+    validate_ipv6_target,
     validate_mac_address,
     validate_mtu,
     validate_ping_address,
@@ -949,3 +952,114 @@ def test_validate_ppp_profile_rejects_empty_or_non_string(value):
 def test_validate_ppp_profile_rejects_invalid_shape(value: str):
     with pytest.raises(ValidationError, match="not valid"):
         validate_ppp_profile(value)
+
+
+# --- validate_ipv6_dst_address / validate_ipv6_route_gateway /
+# --- validate_ipv6_target (v1.10) --------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["::/0", "2001:db8::/32", "2001:db8::1", "fe80::1"])
+def test_validate_ipv6_dst_address_accepts_valid(value: str):
+    assert validate_ipv6_dst_address(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "not-an-ip",
+        "0.0.0.0/0",
+        "10.0.0.0/24",
+        "999.1.1.1",
+        "2001:db8::/129",
+        "2001:db8::/-1",
+        "2001:db8::/abc",
+    ],
+)
+def test_validate_ipv6_dst_address_rejects_invalid(value: str):
+    """An IPv4 address/subnet - even a syntactically valid one like
+    "0.0.0.0/0" - must be rejected: /ipv6/route has no IPv4 concept."""
+    with pytest.raises(ValidationError):
+        validate_ipv6_dst_address(value)
+
+
+def test_validate_ipv6_dst_address_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_ipv6_dst_address(None)  # type: ignore[arg-type]
+
+
+def test_validate_ipv6_dst_address_strips_whitespace():
+    assert validate_ipv6_dst_address("  ::/0  ") == "::/0"
+
+
+def test_validate_ipv6_dst_address_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_ipv6_dst_address("1" * 254)
+
+
+@pytest.mark.parametrize("value", ["2001:db8::1", "fe80::1", "ether1", "pppoe-out1", "vlan100"])
+def test_validate_ipv6_route_gateway_accepts_valid(value: str):
+    assert validate_ipv6_route_gateway(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", "gateway with spaces", "gateway;drop", "gateway/slash"])
+def test_validate_ipv6_route_gateway_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_ipv6_route_gateway(value)
+
+
+@pytest.mark.parametrize("value", ["10.0.0.254", "192.168.1.1"])
+def test_validate_ipv6_route_gateway_rejects_ipv4_address(value: str):
+    """A syntactically valid IPv4 address must be rejected outright, even
+    though it also happens to match the (permissive) interface-name shape -
+    see validate_ipv6_route_gateway's docstring for why the IPv4 check runs
+    first."""
+    with pytest.raises(ValidationError, match="IPv4"):
+        validate_ipv6_route_gateway(value)
+
+
+def test_validate_ipv6_route_gateway_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_ipv6_route_gateway(None)  # type: ignore[arg-type]
+
+
+def test_validate_ipv6_route_gateway_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_ipv6_route_gateway("1" * 254)
+
+
+@pytest.mark.parametrize("target", ["2001:db8::1", "2001:db8::/32", "::1/128", "fe80::1"])
+def test_validate_ipv6_target_accepts_valid(target: str):
+    assert validate_ipv6_target(target) == target
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "",
+        "   ",
+        "not-an-ip",
+        "10.0.0.50",
+        "10.0.0.0/24",
+        "2001:db8::/129",
+        "2001:db8::/-1",
+        "2001:db8::/abc",
+        "10.0.0.50; reboot",
+    ],
+)
+def test_validate_ipv6_target_rejects_invalid(target: str):
+    """An IPv4 address/subnet must be rejected: /ipv6/firewall/address-list
+    has no IPv4 concept."""
+    with pytest.raises(ValidationError):
+        validate_ipv6_target(target)
+
+
+def test_validate_ipv6_target_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_ipv6_target(None)  # type: ignore[arg-type]
+
+
+def test_validate_ipv6_target_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_ipv6_target("1" * 254)

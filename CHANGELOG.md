@@ -3,6 +3,74 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.10.0] - 2026-07-10
+
+**IPv6 write parity - closes `ROADMAP.md`'s Tier 3 "IPv6 parity" item
+entirely.** Six guarded write tools, each mirroring an existing IPv4 write
+tool field-for-field on the equivalent `/ipv6/*` path - completing what
+v1.9's IPv6 reads deliberately left open.
+
+- `enable_ipv6_firewall_rule` / `disable_ipv6_firewall_rule`
+  (`/ipv6/firewall/filter`): mirror `enable_firewall_rule`/
+  `disable_firewall_rule` - toggle an EXISTING rule's `disabled` field by
+  `comment` (optionally narrowed by `chain`), NEVER create one. No IPv6
+  equivalent of `move_firewall_rule` (reorder) in this release.
+- `add_ipv6_route` / `remove_ipv6_route` (`/ipv6/route`): mirror
+  `add_route`/`remove_route`, including `remove_ipv6_route`'s most
+  important safety property - **refuses outright to remove a dynamic route**
+  (`dynamic=true`, checked via `formatting.coerce_ros_bool`, never a
+  `== "true"` string comparison, same 1.5.0 lesson `remove_route` learned).
+  Both carry the `::/0` default-route `warning` their IPv4 counterparts
+  already carry for `0.0.0.0/0`.
+- `add_to_ipv6_address_list` / `remove_from_ipv6_address_list`
+  (`/ipv6/firewall/address-list`): mirror `add_to_address_list`/
+  `remove_from_address_list` - list-only, never touches a firewall rule;
+  refuses a duplicate `list_name`+`address` pair.
+
+**IPv6-only address validation**: `dst_address`/`gateway`/`address` on all
+six tools are validated with new IPv6-only functions
+(`validate_ipv6_dst_address`, `validate_ipv6_route_gateway`,
+`validate_ipv6_target`) that explicitly REJECT an IPv4 match, unlike their
+IPv4-or-IPv6 counterparts (`validate_dst_address`/`validate_route_gateway`/
+`validate_target`) - an IPv4 address/subnet is syntactically indistinguishable
+from garbage to any `/ipv6/*` menu, so it's rejected client-side with a
+clear error before the device is ever touched, rather than forwarded and
+surfaced as whatever RouterOS's own rejection looks like.
+
+**"ipv6 package disabled" trap - deliberately different behavior from
+v1.9's reads**: the v1.9 read tools catch `DeviceCommandError` from a
+disabled `ipv6` package and return `[]`. These six WRITE tools do **not** -
+a write has no safe "nothing happened" empty-list shape to fall back to,
+so `DeviceCommandError` is left to propagate as a normal (audited) write
+error instead of being silently swallowed into a result that would look
+identical to "there was nothing to toggle/remove".
+
+**Implementation note**: rather than duplicating IPv4 logic, `add_route`/
+`remove_route`/`add_to_address_list`/`remove_from_address_list` in
+`guard.py` were refactored into shared private helpers
+(`_add_route`/`_remove_route`/`_add_to_address_list`/
+`_remove_from_address_list`) parameterized by `operation_name` (which
+ALLOWLIST entry, hence which `/ip/*` vs `/ipv6/*` path) and validator
+functions; the public `add_route`/`remove_route`/`add_to_address_list`/
+`remove_from_address_list` and their new `..._ipv6_...` counterparts are
+now thin wrappers around the shared helper, matching the pattern
+`enable_route`/`disable_route` and `enable_firewall_rule`/
+`disable_firewall_rule` already established. `_set_firewall_rule_disabled`
+(already generalized since v1.4's NAT/mangle toggle) needed no changes at
+all - `enable_ipv6_firewall_rule`/`disable_ipv6_firewall_rule` are thin
+wrappers around it, exactly like `enable_nat_rule`/`enable_mangle_rule`.
+The full IPv4 test suite (unchanged assertions) passes against the
+refactored functions, proving no IPv4 regression. 108 tools total, 100%
+line coverage maintained.
+
+**Hardware-verified**: on real ROS7 (`.237`, `ipv6` ON) `remove_ipv6_route`
+refused a live dynamic route (`::1/128`, `dynamic=True`) via the shared
+`coerce_ros_bool` guard, and `add_ipv6_route`/`remove_ipv6_route` round-tripped
+a static `2001:db8::/32` route reversibly; on real ROS6 (`.254`, `ipv6` OFF) a
+v6 write correctly propagated `DeviceCommandError` (not a silent `[]`),
+confirming the deliberate reads-vs-writes skip-if-missing split. IPv6 NAT (NPT)
+and v6 firewall-rule reorder are explicitly out of scope - see `ROADMAP.md`.
+
 ## [1.9.0] - 2026-07-10
 
 **IPv6 read parity - opens up `ROADMAP.md`'s Tier 3.** Five read-only

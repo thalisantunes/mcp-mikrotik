@@ -122,6 +122,12 @@ EXPECTED_TOOLS = {
     "ipv6_firewall_filter",
     "ipv6_neighbors",
     "ipv6_firewall_address_lists",
+    "enable_ipv6_firewall_rule",
+    "disable_ipv6_firewall_rule",
+    "add_ipv6_route",
+    "remove_ipv6_route",
+    "add_to_ipv6_address_list",
+    "remove_from_ipv6_address_list",
 }
 
 
@@ -5087,3 +5093,404 @@ async def test_ipv6_firewall_address_lists_returns_empty_when_ipv6_package_disab
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("ipv6_firewall_address_lists", {"device_name": "core-switch"})
     assert result["result"] == []
+
+
+# --- IPv6 write parity (v1.10) -----------------------------------------------
+#
+# Mirrors enable_firewall_rule/disable_firewall_rule, add_route/remove_route,
+# add_to_address_list/remove_from_address_list field-for-field on the
+# equivalent /ipv6/* path - closing out ROADMAP.md's "IPv6 parity" item
+# entirely. These smoke tests exercise each tool once end to end through
+# FastMCP's call_tool (guard.py's own test_guard.py has the exhaustive
+# validation/resolution/refusal coverage) plus the ONE thing this round is
+# genuinely new/risky on: unlike the v1.9 reads directly above (which return
+# an empty list, never an error, when the `ipv6` package is disabled), a
+# WRITE tool must let that error propagate as a normal ToolError - see each
+# write tool's "returns_error_when_ipv6_package_disabled" test below.
+
+
+@pytest.mark.asyncio
+async def test_enable_ipv6_firewall_rule_blocked_read_only_by_default(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_ipv6_firewall_rule",
+            {"device_name": "core-switch", "comment": "allow-v6-mgmt", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_ipv6_firewall_rule_preview_then_confirm(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow-v6-mgmt", "disabled": True},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "enable_ipv6_firewall_rule", {"device_name": "core-switch", "comment": "allow-v6-mgmt", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["after"]["disabled"] == "no"
+    assert fake.path("ipv6", "firewall", "filter")._rows[0]["disabled"] is True
+
+    _content, applied = await mcp.call_tool(
+        "enable_ipv6_firewall_rule", {"device_name": "core-switch", "comment": "allow-v6-mgmt", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("ipv6", "firewall", "filter")._rows[0]["disabled"] == "no"
+    # Never creates a rule.
+    assert len(fake.path("ipv6", "firewall", "filter")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_disable_ipv6_firewall_rule_preview_then_confirm(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "filter"): [
+                {".id": "*1", "chain": "forward", "action": "drop", "comment": "block-v6-guest", "disabled": False},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "disable_ipv6_firewall_rule", {"device_name": "core-switch", "comment": "block-v6-guest", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("ipv6", "firewall", "filter")._rows[0]["disabled"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_disable_ipv6_firewall_rule_unknown_comment_raises_clear_error(device: Device):
+    fake = FakeConnection(data={("ipv6", "firewall", "filter"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "disable_ipv6_firewall_rule", {"device_name": "core-switch", "comment": "no-such-rule", "confirm": True}
+        )
+    assert "no-such-rule" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_ipv6_firewall_rule_returns_error_when_ipv6_package_disabled(device: Device):
+    """UNLIKE the v1.9 reads (ipv6_firewall_filter etc.), a write tool must
+    NOT swallow this into an empty/no-op result - the caller needs to know
+    the ipv6 package is off, not think there was simply no rule to toggle."""
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "filter"): LibRouterosError("no such command")})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_ipv6_firewall_rule", {"device_name": "core-switch", "comment": "allow-v6-mgmt", "confirm": True}
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_ipv6_route_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ipv6_route",
+            {
+                "device_name": "core-switch",
+                "dst_address": "2001:db8:40::/64",
+                "gateway": "2001:db8::254",
+                "confirm": True,
+            },
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_ipv6_route_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "add_ipv6_route",
+        {
+            "device_name": "core-switch",
+            "dst_address": "2001:db8:40::/64",
+            "gateway": "2001:db8::254",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+    assert fake.path("ipv6", "route")._rows == []
+
+    _content, applied = await mcp.call_tool(
+        "add_ipv6_route",
+        {
+            "device_name": "core-switch",
+            "dst_address": "2001:db8:40::/64",
+            "gateway": "2001:db8::254",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    created = fake.path("ipv6", "route")._rows[0]
+    assert created == {"dst-address": "2001:db8:40::/64", "gateway": "2001:db8::254"}
+
+
+@pytest.mark.asyncio
+async def test_add_ipv6_route_default_route_carries_warning(device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "add_ipv6_route",
+        {"device_name": "core-switch", "dst_address": "::/0", "gateway": "2001:db8::254", "confirm": False},
+    )
+    assert preview["warning"] is not None
+    assert "::/0" in preview["warning"]
+
+
+@pytest.mark.asyncio
+async def test_add_ipv6_route_rejects_ipv4_dst_address(device: Device):
+    fake = FakeConnection(data={("ipv6", "route"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ipv6_route",
+            {"device_name": "core-switch", "dst_address": "10.40.0.0/24", "gateway": "2001:db8::254", "confirm": True},
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+    assert fake.path("ipv6", "route")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_add_ipv6_route_returns_error_when_ipv6_package_disabled(device: Device):
+    fake = FakeConnection(raise_for={("ipv6", "route"): LibRouterosError("no such command")})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ipv6_route",
+            {
+                "device_name": "core-switch",
+                "dst_address": "2001:db8:40::/64",
+                "gateway": "2001:db8::254",
+                "confirm": True,
+            },
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_remove_ipv6_route_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_ipv6_route", {"device_name": "core-switch", "dst_address": "2001:db8:20::/64", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_ipv6_route_preview_then_confirm(device: Device):
+    fake = FakeConnection(
+        data={("ipv6", "route"): [{".id": "*1", "dst-address": "2001:db8:20::/64", "gateway": "2001:db8::254"}]}
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_ipv6_route", {"device_name": "core-switch", "dst_address": "2001:db8:20::/64", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert len(fake.path("ipv6", "route")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "remove_ipv6_route", {"device_name": "core-switch", "dst_address": "2001:db8:20::/64", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert fake.path("ipv6", "route")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_ipv6_route_refuses_dynamic_route(device: Device):
+    """CRITICAL for this round, exercised end to end (not just guard.py
+    directly): a dynamic IPv6 route must be refused, never removed - same
+    dynamic=True Python-bool refusal as remove_route (IPv4)."""
+    fake = FakeConnection(
+        data={
+            ("ipv6", "route"): [{".id": "*1", "dst-address": "2001:db8:30::/64", "gateway": "ether1", "dynamic": True}]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_ipv6_route", {"device_name": "core-switch", "dst_address": "2001:db8:30::/64", "confirm": True}
+        )
+    assert "dynamic" in str(exc_info.value).lower()
+    assert len(fake.path("ipv6", "route")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_ipv6_route_returns_error_when_ipv6_package_disabled(device: Device):
+    fake = FakeConnection(raise_for={("ipv6", "route"): LibRouterosError("no such command")})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_ipv6_route", {"device_name": "core-switch", "dst_address": "2001:db8:20::/64", "confirm": True}
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_to_ipv6_address_list_blocked_read_only_by_default(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_to_ipv6_address_list",
+            {
+                "device_name": "core-switch",
+                "list_name": "blocked-clients-v6",
+                "address": "2001:db8::61",
+                "confirm": True,
+            },
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_to_ipv6_address_list_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "add_to_ipv6_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients-v6", "address": "2001:db8::61", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert fake.path("ipv6", "firewall", "address-list")._rows == []
+
+    _content, applied = await mcp.call_tool(
+        "add_to_ipv6_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients-v6", "address": "2001:db8::61", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = fake.path("ipv6", "firewall", "address-list")._rows
+    assert any(row["list"] == "blocked-clients-v6" and row["address"] == "2001:db8::61" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_add_to_ipv6_address_list_rejects_ipv4_address(device: Device):
+    fake = FakeConnection(data={("ipv6", "firewall", "address-list"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_to_ipv6_address_list",
+            {"device_name": "core-switch", "list_name": "blocked-clients-v6", "address": "10.0.0.61", "confirm": True},
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_to_ipv6_address_list_returns_error_when_ipv6_package_disabled(device: Device):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "address-list"): LibRouterosError("no such command")})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_to_ipv6_address_list",
+            {
+                "device_name": "core-switch",
+                "list_name": "blocked-clients-v6",
+                "address": "2001:db8::61",
+                "confirm": True,
+            },
+        )
+    assert "ipv6" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_remove_from_ipv6_address_list_blocked_read_only_by_default(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_from_ipv6_address_list",
+            {
+                "device_name": "core-switch",
+                "list_name": "blocked-clients-v6",
+                "address": "2001:db8::60",
+                "confirm": True,
+            },
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_from_ipv6_address_list_preview_then_confirm(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ipv6", "firewall", "address-list"): [
+                {".id": "*1", "list": "blocked-clients-v6", "address": "2001:db8::60"}
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_from_ipv6_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients-v6", "address": "2001:db8::60", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert len(fake.path("ipv6", "firewall", "address-list")._rows) == 1
+
+    _content, applied = await mcp.call_tool(
+        "remove_from_ipv6_address_list",
+        {"device_name": "core-switch", "list_name": "blocked-clients-v6", "address": "2001:db8::60", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake.path("ipv6", "firewall", "address-list")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_from_ipv6_address_list_returns_error_when_ipv6_package_disabled(device: Device):
+    fake = FakeConnection(raise_for={("ipv6", "firewall", "address-list"): LibRouterosError("no such command")})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_from_ipv6_address_list",
+            {
+                "device_name": "core-switch",
+                "list_name": "blocked-clients-v6",
+                "address": "2001:db8::60",
+                "confirm": True,
+            },
+        )
+    assert "ipv6" in str(exc_info.value).lower()

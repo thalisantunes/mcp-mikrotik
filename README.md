@@ -34,25 +34,28 @@ each of those is avoided here.
 
 ## Status
 
-**1.9.0.** Every planned tool round through Tier 2 has shipped, plus the
-first Tier 3 item: the full read-tool inventory (interfaces, VLANs, routing
-IPv4 **and IPv6**, DHCP servers/leases/networks, wireless, VPN/WireGuard/PPP,
-containers, LTE/5G, USB, hotspot, live traffic, backups, firewall
-filter/NAT/mangle IPv4 **and IPv6**, bridge ports & VLAN filtering, SFP/optical
-monitor, certificates, users/RADIUS, NTP/clock, a heuristic security audit),
-guarded writes across identity/interfaces/wifi/bandwidth/DHCP/address-lists/
-PoE/containers/failover-routing/Netwatch/DNS/Wake-on-LAN/firewall-rule-toggle
-(filter/NAT/mangle)/firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/
-VLANs/PPP-PPPoE-secrets/static-routes/NTP-servers, and the production-hardening
-layers this needs to run unattended against a real fleet - audit journal,
-correlation IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
+**1.10.0.** Every planned tool round through Tier 2 has shipped, plus
+Tier 3's IPv6 parity item in full - reads (v1.9) and writes (v1.10) alike:
+the full read-tool inventory (interfaces, VLANs, routing IPv4 **and IPv6**,
+DHCP servers/leases/networks, wireless, VPN/WireGuard/PPP, containers,
+LTE/5G, USB, hotspot, live traffic, backups, firewall filter/NAT/mangle IPv4
+**and IPv6**, bridge ports & VLAN filtering, SFP/optical monitor,
+certificates, users/RADIUS, NTP/clock, a heuristic security audit), guarded
+writes across identity/interfaces/wifi/bandwidth/DHCP/address-lists (IPv4
+**and IPv6**)/PoE/containers/failover-routing (IPv4 **and IPv6**)/Netwatch/
+DNS/Wake-on-LAN/firewall-rule-toggle (filter/NAT/mangle, IPv4 **and
+IPv6**)/firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/VLANs/
+PPP-PPPoE-secrets/NTP-servers, and the production-hardening layers this
+needs to run unattended against a real fleet - audit journal, correlation
+IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
 version-by-version history, and `ROADMAP.md` for what's next (and what's
 deliberately out of scope, and why).
 
-The full pytest suite currently has 1476 tests (102 tools), all passing against
+The full pytest suite currently has 1597 tests (108 tools), all passing against
 an in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
 a 95% floor) - see "Development & CI" below. Many tools are additionally
-smoke-tested against real ROS6/ROS7 hardware before release.
+smoke-tested against real ROS6/ROS7 hardware before release (the v1.10 IPv6
+writes are the exception - see `CHANGELOG.md`'s v1.10 entry).
 
 ## Installation
 
@@ -302,6 +305,12 @@ model" below for the full guard mechanism.
 | `enable_mangle_rule` | Enable an **EXISTING** firewall mangle rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** Same pattern as `enable_firewall_rule`. |
 | `disable_mangle_rule` | Disable an **EXISTING** firewall mangle rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_mangle_rule`. |
 | `set_ntp_servers` | Set the NTP server(s) a device syncs its clock against (`/system/ntp/client`), `servers` (1+ IPv4/IPv6 addresses or hostnames). Detects ROS6 vs ROS7 field shape and writes to whichever one matches. **Never enables/disables the NTP client itself.** See "NTP client + clock" below. |
+| `enable_ipv6_firewall_rule` | Enable an **EXISTING** IPv6 firewall filter rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** Mirrors `enable_firewall_rule` on `/ipv6/firewall/filter`. See "IPv6 write parity (v1.10)" below. |
+| `disable_ipv6_firewall_rule` | Disable an **EXISTING** IPv6 firewall filter rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_ipv6_firewall_rule`. |
+| `add_ipv6_route` | Add a static IPv6 route (`dst_address`+`gateway` required, optional `distance`/`comment`). Mirrors `add_route` on `/ipv6/route` - never refuses a duplicate `dst_address`. `dst_address`/`gateway` must be IPv6 (an IPv4 value is rejected). `warning` is non-null when `dst_address` is the default route (`::/0`). See "IPv6 write parity (v1.10)" below. |
+| `remove_ipv6_route` | Remove a static IPv6 route, resolved by `dst_address` (narrowed by optional `gateway`). **Refuses outright (raises an error, removes nothing) if the resolved route is dynamic** (`dynamic=true`). `warning` is non-null (not blocking) when removing a static default route (`::/0`). Mirrors `remove_route` on `/ipv6/route`. |
+| `add_to_ipv6_address_list` | Add an IPv6 `address`/subnet to a named IPv6 firewall `list_name` (`/ipv6/firewall/address-list`). **Only manages the list.** Refuses to create a duplicate `list_name`+`address` pair. `address` must be IPv6. Mirrors `add_to_address_list`. |
+| `remove_from_ipv6_address_list` | Remove the `list_name`+`address` entry from an IPv6 firewall address-list. Same "list only" caveat as `add_to_ipv6_address_list`. |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
@@ -552,9 +561,8 @@ plus one guarded write:
 
 ### IPv6 read parity (v1.9)
 
-`ROADMAP.md`'s Tier 3 "IPv6 parity" item, **READ-ONLY** for now - IPv6
-writes (firewall rule toggle, route add/remove) are a later release. Five
-read tools, each mirroring an existing IPv4 read field-for-field on the
+`ROADMAP.md`'s Tier 3 "IPv6 parity" item, **READ-ONLY** side. Five read
+tools, each mirroring an existing IPv4 read field-for-field on the
 `/ipv6/*` equivalent of its path:
 
 | IPv6 tool | Mirrors |
@@ -577,6 +585,46 @@ an error. Like the IPv4 reads they mirror (`ip_addresses`/`firewall_filter`/
 server-side boolean coercion. The fixtures/tests use real Python `bool`
 values for `disabled`/`dynamic`/`advertise`/`active` (matching what
 librouteros actually returns), so the tests exercise the real shape.
+
+### IPv6 write parity (v1.10)
+
+The **WRITE** side of the same `ROADMAP.md` Tier 3 item, closing it out
+entirely. Six guarded write tools, each mirroring an existing IPv4 write
+tool field-for-field on the `/ipv6/*` equivalent of its path:
+
+| IPv6 tool | Mirrors |
+|---|---|
+| `enable_ipv6_firewall_rule` / `disable_ipv6_firewall_rule` | `enable_firewall_rule` / `disable_firewall_rule` |
+| `add_ipv6_route` / `remove_ipv6_route` | `add_route` / `remove_route` |
+| `add_to_ipv6_address_list` / `remove_from_ipv6_address_list` | `add_to_address_list` / `remove_from_address_list` |
+
+**IPv6-only address validation**: `dst_address`/`gateway`/`address` on all
+six tools are validated as IPv6-only (`validate_ipv6_dst_address`,
+`validate_ipv6_route_gateway`, `validate_ipv6_target` in `validation.py`) -
+unlike the IPv4-or-IPv6 validators the IPv4 tools use, these explicitly
+REJECT an IPv4 match, since `/ipv6/*` has no IPv4 concept and forwarding
+one to the device would just surface RouterOS's own rejection instead of a
+clear client-side error.
+
+**The "ipv6 package disabled" trap behaves DIFFERENTLY here than for the
+v1.9 reads above**: those catch `DeviceCommandError` and return `[]`
+(skip-if-missing). These six write tools deliberately do **not** - a write
+has no safe "nothing happened" empty-list shape to fall back to, so if the
+resolution step (reading existing rows to find the target rule/route/entry)
+hits a disabled `ipv6` package, `DeviceCommandError` propagates as a normal
+write-tool error instead of being silently swallowed into a result that
+would look identical to "there was nothing to toggle/remove".
+
+`remove_ipv6_route` carries `remove_route`'s single most important safety
+property unchanged: it **refuses outright to remove a dynamic route**
+(`dynamic=true`, via `formatting.coerce_ros_bool` - never a `== "true"`
+string comparison). `add_ipv6_route`/`remove_ipv6_route` also carry the same
+default-route `warning` their IPv4 counterparts carry, checked against
+`::/0` instead of `0.0.0.0/0`.
+
+**Hardware caveat**: not verified against real hardware - exercised only
+against this project's fake RouterOS connection (`tests/fakes.py`), unlike
+v1.9's reads (verified on both real ROS6 and ROS7). See `CHANGELOG.md`.
 
 ### VPN & routing diagnostics (v0.8)
 

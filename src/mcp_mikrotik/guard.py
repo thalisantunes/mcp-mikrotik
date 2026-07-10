@@ -68,6 +68,9 @@ from .validation import (
     validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
+    validate_ipv6_dst_address,
+    validate_ipv6_route_gateway,
+    validate_ipv6_target,
     validate_mac_address,
     validate_mtu,
     validate_ping_address,
@@ -524,6 +527,75 @@ ALLOWLIST: dict[str, WriteOperation] = {
         description=(
             "Set the NTP server(s) a device syncs its clock against (/system/ntp/client). "
             "Never enables/disables the NTP client itself, only its server list."
+        ),
+    ),
+    # v1.10: IPv6 write parity - closes the follow-up ROADMAP.md's Tier 3
+    # "IPv6 parity" item flagged when v1.9 shipped IPv6 reads. Each entry
+    # below mirrors an existing IPv4 write operation field-for-field on the
+    # equivalent /ipv6/* path: enable_ipv6_firewall_rule/
+    # disable_ipv6_firewall_rule mirror enable_firewall_rule/
+    # disable_firewall_rule (toggle an EXISTING rule by comment, never
+    # create); add_ipv6_route/remove_ipv6_route mirror add_route/
+    # remove_route (including remove_ipv6_route's refusal to remove a
+    # dynamic route); add_to_ipv6_address_list/remove_from_ipv6_address_list
+    # mirror add_to_address_list/remove_from_address_list. See each
+    # function's own docstring below for the (thin) shared-helper reuse and
+    # what differs from its IPv4 counterpart (IPv6-only address validation).
+    "enable_ipv6_firewall_rule": WriteOperation(
+        name="enable_ipv6_firewall_rule",
+        path=("ipv6", "firewall", "filter"),
+        action="update",
+        description=(
+            "Enable an EXISTING IPv6 firewall filter rule (disabled=no), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule. Mirrors enable_firewall_rule for IPv6."
+        ),
+    ),
+    "disable_ipv6_firewall_rule": WriteOperation(
+        name="disable_ipv6_firewall_rule",
+        path=("ipv6", "firewall", "filter"),
+        action="update",
+        description=(
+            "Disable an EXISTING IPv6 firewall filter rule (disabled=yes), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule. Mirrors disable_firewall_rule for IPv6."
+        ),
+    ),
+    "add_ipv6_route": WriteOperation(
+        name="add_ipv6_route",
+        path=("ipv6", "route"),
+        action="add",
+        description=(
+            "Add a static IPv6 route (dst-address+gateway, optional distance/comment). Never refuses a "
+            "duplicate dst-address - multiple routes sharing one is the normal failover shape. Adding/"
+            "overriding the default route (::/0) redirects all IPv6 traffic through the new gateway. "
+            "Mirrors add_route for IPv6."
+        ),
+    ),
+    "remove_ipv6_route": WriteOperation(
+        name="remove_ipv6_route",
+        path=("ipv6", "route"),
+        action="remove",
+        description=(
+            "Remove a static IPv6 route; resolved by dst-address, narrowed by gateway if ambiguous. Refuses "
+            "to remove a dynamic/connected route (dynamic=true) outright. Removing the default route (::/0) "
+            "cuts outbound IPv6 traffic through that gateway. Mirrors remove_route for IPv6."
+        ),
+    ),
+    "add_to_ipv6_address_list": WriteOperation(
+        name="add_to_ipv6_address_list",
+        path=("ipv6", "firewall", "address-list"),
+        action="add",
+        description=(
+            "Add an IPv6 address/subnet to a named IPv6 firewall address-list entry. Mirrors "
+            "add_to_address_list for IPv6."
+        ),
+    ),
+    "remove_from_ipv6_address_list": WriteOperation(
+        name="remove_from_ipv6_address_list",
+        path=("ipv6", "firewall", "address-list"),
+        action="remove",
+        description=(
+            "Remove an IPv6 address/subnet entry from a named IPv6 firewall address-list. Mirrors "
+            "remove_from_address_list for IPv6."
         ),
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
@@ -1077,34 +1149,42 @@ def _find_address_list_row(rows: list[dict[str, Any]], list_name: str, address: 
     return None
 
 
-@_audited("add_to_address_list")
-def add_to_address_list(
+def _add_to_address_list(
     client: MikrotikClient,
     settings: Settings,
+    operation_name: str,
     list_name: str,
     address: str,
     confirm: bool,
     comment: str | None = None,
     timeout: str | None = None,
+    address_validator: Callable[[str], str] = validate_target,
 ) -> WritePreview:
-    """Add `address` (an IP or subnet) to a named firewall address-list
-    (/ip/firewall/address-list). This only manages the *list* - it does NOT
-    create or modify any firewall rule. Blocking or allowing traffic based on
-    this list requires a separate `/ip/firewall/filter` (or NAT) rule that
-    references `list_name` (e.g. `src-address-list=blocked-clients`,
-    action=drop); that rule is not created here and must already exist on
-    the device - see README's "Blocking/allowing a client via address lists"
-    section.
+    """Shared implementation behind add_to_address_list/add_to_ipv6_address_list
+    - both add `address` (an IP/subnet) to a named firewall address-list.
+    This only manages the *list* - it does NOT create or modify any firewall
+    rule. Blocking or allowing traffic based on this list requires a
+    separate firewall filter (or NAT) rule that references `list_name`
+    (e.g. `src-address-list=blocked-clients`, action=drop); that rule is not
+    created here and must already exist on the device - see README's
+    "Blocking/allowing a client via address lists" section.
 
     Refuses to add a duplicate (same `list_name`+`address` pair already
     present) - raises ResourceAlreadyExistsError instead of creating a
     second entry. This tool only ever adds; it never updates or removes an
     existing entry.
+
+    `operation_name` selects the ALLOWLIST entry (and therefore which
+    `op.path` menu - `/ip/firewall/address-list` or
+    `/ipv6/firewall/address-list`); `address_validator` selects which shape
+    `address` must match - `validate_target` (IPv4-or-IPv6) for the IPv4
+    tool, `validate_ipv6_target` (IPv6-only, rejects an IPv4 address/subnet)
+    for the IPv6 tool.
     """
-    op = _require_allowed(settings, "add_to_address_list")
+    op = _require_allowed(settings, operation_name)
 
     validated_list = validate_address_list_name(list_name)
-    validated_address = validate_target(address)
+    validated_address = address_validator(address)
     validated_comment = validate_comment(comment) if comment is not None else None
     validated_timeout = validate_timeout(timeout) if timeout is not None else None
 
@@ -1132,6 +1212,107 @@ def add_to_address_list(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+@_audited("add_to_address_list")
+def add_to_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    list_name: str,
+    address: str,
+    confirm: bool,
+    comment: str | None = None,
+    timeout: str | None = None,
+) -> WritePreview:
+    """Add `address` (an IP or subnet) to a named firewall address-list
+    (/ip/firewall/address-list). This only manages the *list* - it does NOT
+    create or modify any firewall rule. Blocking or allowing traffic based on
+    this list requires a separate `/ip/firewall/filter` (or NAT) rule that
+    references `list_name` (e.g. `src-address-list=blocked-clients`,
+    action=drop); that rule is not created here and must already exist on
+    the device - see README's "Blocking/allowing a client via address lists"
+    section.
+
+    Refuses to add a duplicate (same `list_name`+`address` pair already
+    present) - raises ResourceAlreadyExistsError instead of creating a
+    second entry. This tool only ever adds; it never updates or removes an
+    existing entry.
+    """
+    return _add_to_address_list(client, settings, "add_to_address_list", list_name, address, confirm, comment, timeout)
+
+
+@_audited("add_to_ipv6_address_list")
+def add_to_ipv6_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    list_name: str,
+    address: str,
+    confirm: bool,
+    comment: str | None = None,
+    timeout: str | None = None,
+) -> WritePreview:
+    """Add `address` (an IPv6 address or subnet) to a named IPv6 firewall
+    address-list (/ipv6/firewall/address-list). Mirrors add_to_address_list
+    field-for-field on the IPv6 menu - see its docstring for the "list only,
+    never touches a rule" caveat and the duplicate-refusal behavior.
+
+    `address` is validated as IPv6-only (`validate_ipv6_target`) - an IPv4
+    address/subnet is rejected before the device is ever touched, since
+    `/ipv6/firewall/address-list` has no IPv4 concept.
+    """
+    return _add_to_address_list(
+        client,
+        settings,
+        "add_to_ipv6_address_list",
+        list_name,
+        address,
+        confirm,
+        comment,
+        timeout,
+        address_validator=validate_ipv6_target,
+    )
+
+
+def _remove_from_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    list_name: str,
+    address: str,
+    confirm: bool,
+    address_validator: Callable[[str], str] = validate_target,
+) -> WritePreview:
+    """Shared implementation behind remove_from_address_list/
+    remove_from_ipv6_address_list - both remove the entry matching
+    `list_name`+`address` from a firewall address-list. Raises
+    ResourceNotFoundError if no such entry exists - never removes more than
+    the one matching row.
+
+    Like _add_to_address_list, this only manages the *list* - removing an
+    entry stops that specific list membership, but has no effect on
+    traffic unless a firewall rule referencing `list_name` also changes or
+    is removed separately. See _add_to_address_list's docstring for what
+    `operation_name`/`address_validator` select.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_list = validate_address_list_name(list_name)
+    validated_address = address_validator(address)
+
+    rows = client.path(*op.path)
+    row = _find_address_list_row(rows, validated_list, validated_address)
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "Address-list entry", f"{validated_list}:{validated_address}")
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
 @_audited("remove_from_address_list")
 def remove_from_address_list(
     client: MikrotikClient,
@@ -1149,25 +1330,33 @@ def remove_from_address_list(
     traffic unless a firewall rule referencing `list_name` also changes or
     is removed separately.
     """
-    op = _require_allowed(settings, "remove_from_address_list")
+    return _remove_from_address_list(client, settings, "remove_from_address_list", list_name, address, confirm)
 
-    validated_list = validate_address_list_name(list_name)
-    validated_address = validate_target(address)
 
-    rows = client.path(*op.path)
-    row = _find_address_list_row(rows, validated_list, validated_address)
-    if row is None:
-        raise ResourceNotFoundError(client.device.name, "Address-list entry", f"{validated_list}:{validated_address}")
+@_audited("remove_from_ipv6_address_list")
+def remove_from_ipv6_address_list(
+    client: MikrotikClient,
+    settings: Settings,
+    list_name: str,
+    address: str,
+    confirm: bool,
+) -> WritePreview:
+    """Remove the entry matching `list_name`+`address` from an IPv6 firewall
+    address-list (/ipv6/firewall/address-list). Mirrors
+    remove_from_address_list field-for-field on the IPv6 menu.
 
-    before = dict(row)
-    after: dict[str, Any] = {}
-
-    if not confirm:
-        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
-
-    write = getattr(client, op.action)
-    write(*op.path, ids=(row.get(".id"),))
-    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+    `address` is validated as IPv6-only (`validate_ipv6_target`) - an IPv4
+    address/subnet is rejected before the device is ever touched.
+    """
+    return _remove_from_address_list(
+        client,
+        settings,
+        "remove_from_ipv6_address_list",
+        list_name,
+        address,
+        confirm,
+        address_validator=validate_ipv6_target,
+    )
 
 
 # --- v0.6: physical layer / PoE control -------------------------------------
@@ -1511,24 +1700,26 @@ def disable_route(
 # defined earlier in this file rather than re-deriving route resolution.
 
 
-@_audited("add_route")
-def add_route(
+def _add_route(
     client: MikrotikClient,
     settings: Settings,
+    operation_name: str,
     dst_address: str,
     gateway: str,
     confirm: bool,
     distance: int | None = None,
     comment: str | None = None,
+    dst_address_validator: Callable[[str], str] = validate_dst_address,
+    gateway_validator: Callable[[str], str] = validate_route_gateway,
 ) -> WritePreview:
-    """Add a static route (`/ip/route add`): `dst_address` and `gateway`
-    are required, `distance` (failover priority - lower wins) and `comment`
-    are optional.
+    """Shared implementation behind add_route/add_ipv6_route: `dst_address`
+    and `gateway` are required, `distance` (failover priority - lower wins)
+    and `comment` are optional.
 
     Never refuses a duplicate `dst_address`+`gateway` pair (unlike
     add_vlan/add_static_dns) - multiple routes sharing a `dst-address` is
     the normal failover shape (see _resolve_route's own docstring), so this
-    tool never raises ResourceAlreadyExistsError.
+    never raises ResourceAlreadyExistsError.
 
     If `dst_address` is the default route (`0.0.0.0/0`/`::/0` - see
     _DEFAULT_ROUTE_DST_ADDRESSES), the returned WritePreview's `warning`
@@ -1537,11 +1728,19 @@ def add_route(
     set on BOTH the preview (`confirm=False`) and the applied result
     (`confirm=True`), same pattern as disable_route's default-route
     warning.
-    """
-    op = _require_allowed(settings, "add_route")
 
-    validated_dst = validate_dst_address(dst_address)
-    validated_gateway = validate_route_gateway(gateway)
+    `operation_name` selects the ALLOWLIST entry (and therefore which
+    `op.path` menu - `/ip/route` or `/ipv6/route`); `dst_address_validator`/
+    `gateway_validator` select which shape those two fields must match -
+    the IPv4-or-IPv6 `validate_dst_address`/`validate_route_gateway` for the
+    IPv4 tool, the IPv6-only `validate_ipv6_dst_address`/
+    `validate_ipv6_route_gateway` (each rejects an IPv4 match) for the IPv6
+    tool.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_dst = dst_address_validator(dst_address)
+    validated_gateway = gateway_validator(gateway)
     validated_distance = validate_route_distance(distance) if distance is not None else None
     validated_comment = validate_comment(comment) if comment is not None else None
 
@@ -1569,6 +1768,160 @@ def add_route(
 
     write = getattr(client, op.action)
     write(*op.path, **payload)
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+@_audited("add_route")
+def add_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    gateway: str,
+    confirm: bool,
+    distance: int | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Add a static route (`/ip/route add`): `dst_address` and `gateway`
+    are required, `distance` (failover priority - lower wins) and `comment`
+    are optional.
+
+    Never refuses a duplicate `dst_address`+`gateway` pair (unlike
+    add_vlan/add_static_dns) - multiple routes sharing a `dst-address` is
+    the normal failover shape (see _resolve_route's own docstring), so this
+    tool never raises ResourceAlreadyExistsError.
+
+    If `dst_address` is the default route (`0.0.0.0/0`/`::/0` - see
+    _DEFAULT_ROUTE_DST_ADDRESSES), the returned WritePreview's `warning`
+    field is set to a clear, non-null message: adding/overriding the
+    default route redirects all traffic through the new gateway. This is
+    set on BOTH the preview (`confirm=False`) and the applied result
+    (`confirm=True`), same pattern as disable_route's default-route
+    warning.
+    """
+    return _add_route(client, settings, "add_route", dst_address, gateway, confirm, distance, comment)
+
+
+@_audited("add_ipv6_route")
+def add_ipv6_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    gateway: str,
+    confirm: bool,
+    distance: int | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Add a static IPv6 route (`/ipv6/route add`): `dst_address` and
+    `gateway` are required, `distance`/`comment` optional. Mirrors add_route
+    field-for-field on the IPv6 menu - see its docstring for the
+    never-refuses-a-duplicate behavior and the default-route `warning`.
+
+    `dst_address`/`gateway` are validated as IPv6-only
+    (`validate_ipv6_dst_address`/`validate_ipv6_route_gateway`) - an IPv4
+    address/subnet in either is rejected before the device is ever touched.
+    The default-route check here is against `::/0` (IPv6's default route -
+    `0.0.0.0/0` can never match, since `dst_address` is already IPv6-only by
+    the time it's checked).
+    """
+    return _add_route(
+        client,
+        settings,
+        "add_ipv6_route",
+        dst_address,
+        gateway,
+        confirm,
+        distance,
+        comment,
+        dst_address_validator=validate_ipv6_dst_address,
+        gateway_validator=validate_ipv6_route_gateway,
+    )
+
+
+def _remove_route(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    dst_address: str,
+    confirm: bool,
+    gateway: str | None = None,
+    dst_address_validator: Callable[[str], str] = validate_dst_address,
+    gateway_validator: Callable[[str], str] = validate_route_gateway,
+) -> WritePreview:
+    """Shared implementation behind remove_route/remove_ipv6_route, resolved
+    by `dst_address` - narrowed by `gateway` when more than one route shares
+    that `dst_address` (see _resolve_route). Raises ResourceNotFoundError if
+    nothing matches, or AmbiguousResourceError if the match is still
+    ambiguous after narrowing.
+
+    REFUSES to remove a DYNAMIC route: if the resolved row's `dynamic`
+    field coerces to `True` (see `coerce_ros_bool`) - a connected/DHCP/
+    OSPF/BGP-installed route, not one an operator created by hand - this
+    raises ValidationError instead of removing anything - a hard refusal,
+    not just a warning. Removing a device's connected/dynamic route can
+    sever the network, and this only ever manages static, admin-created
+    routes. Remove a dynamic route manually on the device if that is
+    genuinely intended.
+
+    SECURITY NOTE (fixed in 1.5.0, confirmed against real ROS6/ROS7
+    hardware): librouteros returns RouterOS boolean fields as Python `bool`
+    (or omits them entirely, `None`) - NEVER the strings "true"/"false". An
+    earlier version of this refusal compared `row.get("dynamic")` directly
+    against the string `"true"`; since `True == "true"` is `False` in
+    Python, that comparison never matched on a real device, so this
+    refusal silently never fired outside the test suite's own
+    string-typed fakes - a dynamic/connected/default route could be
+    removed outright. See `coerce_ros_bool`'s docstring (formatting.py) for
+    the full ROS6/ROS7 split (ROS6 omits `dynamic` entirely when false;
+    ROS7 sends `False` explicitly) this fix accounts for. The IPv6 route
+    family reuses this exact same check - a dynamic IPv6 route (e.g. a
+    router-advertisement-installed default route) faces the identical
+    refusal.
+
+    If the resolved (static) route's `dst_address` is the default route
+    (`0.0.0.0/0`/`::/0` - see _DEFAULT_ROUTE_DST_ADDRESSES), the returned
+    WritePreview's `warning` field is set to a clear, non-null message
+    (this direction is a warning, not a refusal - removing a static
+    default route is a legitimate operation). Set on BOTH the preview
+    (`confirm=False`) and the applied result (`confirm=True`).
+
+    See _add_route's docstring for what `operation_name`/
+    `dst_address_validator`/`gateway_validator` select.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_dst = dst_address_validator(dst_address)
+    validated_gateway = gateway_validator(gateway) if gateway is not None else None
+
+    row = _resolve_route(client, op, validated_dst, gateway=validated_gateway)
+
+    if coerce_ros_bool(row.get("dynamic")) is True:
+        raise ValidationError(
+            f"refuses to remove {validated_dst} via {row.get('gateway', '?')!r}: this route is dynamic "
+            "(dynamic=true) - a connected/DHCP/OSPF/BGP-installed route, not one this tool creates. Only "
+            "static, admin-created routes can be removed by this tool; remove a connected/DHCP/OSPF/"
+            "BGP-installed route manually on the device if that is genuinely intended."
+        )
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    warning: str | None = None
+    if validated_dst in _DEFAULT_ROUTE_DST_ADDRESSES:
+        warning = (
+            f"{validated_dst} is the DEFAULT ROUTE - removing it will cut outbound traffic that relies on "
+            f"gateway {row.get('gateway', '?')!r}. Confirm a working alternate route/gateway is already "
+            "active before applying this with confirm=true."
+        )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
     return WritePreview(
         operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
     )
@@ -1616,41 +1969,40 @@ def remove_route(
     default route is a legitimate operation). Set on BOTH the preview
     (`confirm=False`) and the applied result (`confirm=True`).
     """
-    op = _require_allowed(settings, "remove_route")
+    return _remove_route(client, settings, "remove_route", dst_address, confirm, gateway)
 
-    validated_dst = validate_dst_address(dst_address)
-    validated_gateway = validate_route_gateway(gateway) if gateway is not None else None
 
-    row = _resolve_route(client, op, validated_dst, gateway=validated_gateway)
+@_audited("remove_ipv6_route")
+def remove_ipv6_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    confirm: bool,
+    gateway: str | None = None,
+) -> WritePreview:
+    """Remove a static IPv6 route (`/ipv6/route remove`), resolved by
+    `dst_address` - narrowed by `gateway` when more than one route shares
+    it. Mirrors remove_route field-for-field on the IPv6 menu, INCLUDING its
+    most important safety property: **REFUSES to remove a DYNAMIC route**
+    (`dynamic=true`, via `coerce_ros_bool` - never a `== "true"` string
+    comparison) - see remove_route's/`_remove_route`'s docstring for the
+    full 1.5.0 security-fix rationale this reuses unchanged.
 
-    if coerce_ros_bool(row.get("dynamic")) is True:
-        raise ValidationError(
-            f"refuses to remove {validated_dst} via {row.get('gateway', '?')!r}: this route is dynamic "
-            "(dynamic=true) - a connected/DHCP/OSPF/BGP-installed route, not one this tool creates. Only "
-            "static, admin-created routes can be removed by this tool; remove a connected/DHCP/OSPF/"
-            "BGP-installed route manually on the device if that is genuinely intended."
-        )
-
-    before = dict(row)
-    after: dict[str, Any] = {}
-
-    warning: str | None = None
-    if validated_dst in _DEFAULT_ROUTE_DST_ADDRESSES:
-        warning = (
-            f"{validated_dst} is the DEFAULT ROUTE - removing it will cut outbound traffic that relies on "
-            f"gateway {row.get('gateway', '?')!r}. Confirm a working alternate route/gateway is already "
-            "active before applying this with confirm=true."
-        )
-
-    if not confirm:
-        return WritePreview(
-            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
-        )
-
-    write = getattr(client, op.action)
-    write(*op.path, ids=(row.get(".id"),))
-    return WritePreview(
-        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    `dst_address`/`gateway` are validated as IPv6-only
+    (`validate_ipv6_dst_address`/`validate_ipv6_route_gateway`) - an IPv4
+    address/subnet in either is rejected before the device is ever touched.
+    The default-route `warning` here fires for `::/0` (IPv6's default
+    route).
+    """
+    return _remove_route(
+        client,
+        settings,
+        "remove_ipv6_route",
+        dst_address,
+        confirm,
+        gateway,
+        dst_address_validator=validate_ipv6_dst_address,
+        gateway_validator=validate_ipv6_route_gateway,
     )
 
 
@@ -2227,6 +2579,62 @@ def disable_firewall_rule(
     shares that comment. NEVER creates a rule."""
     return _set_firewall_rule_disabled(
         client, settings, "disable_firewall_rule", comment, disabled=True, confirm=confirm, chain=chain
+    )
+
+
+# --- v1.10: IPv6 firewall filter toggle (by comment, never create) -------
+#
+# enable_ipv6_firewall_rule/disable_ipv6_firewall_rule extend v0.11's
+# enable_firewall_rule/disable_firewall_rule pattern to /ipv6/firewall/
+# filter, the same way v1.4's enable_nat_rule/enable_mangle_rule extended it
+# to /ip/firewall/nat and /ip/firewall/mangle: both are thin wrappers around
+# the SAME `_set_firewall_rule_disabled` helper (already generalized over
+# `operation_name`/`resource_label` since v1.4 - no changes needed there),
+# only `operation_name` (-> op.path = ("ipv6", "firewall", "filter")) and
+# `resource_label` differ. Same admin-creates/LLM-enables workflow, same
+# never-creates guarantee, same comment(+chain)-only resolution as the IPv4
+# pair. No reorder equivalent (`move_firewall_rule` has no IPv6 counterpart
+# in this release - see ROADMAP.md).
+
+
+@_audited("enable_ipv6_firewall_rule")
+def enable_ipv6_firewall_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Enable an EXISTING IPv6 firewall filter rule (`disabled=no`),
+    resolved by its `comment` - optionally narrowed by `chain` if more than
+    one rule shares that comment. NEVER creates a rule. Mirrors
+    enable_firewall_rule on `/ipv6/firewall/filter` - see this section's
+    module comment above."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "enable_ipv6_firewall_rule",
+        comment,
+        disabled=False,
+        confirm=confirm,
+        chain=chain,
+        resource_label="IPv6 firewall filter rule",
+    )
+
+
+@_audited("disable_ipv6_firewall_rule")
+def disable_ipv6_firewall_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Disable an EXISTING IPv6 firewall filter rule (`disabled=yes`),
+    resolved by its `comment` - optionally narrowed by `chain`. NEVER
+    creates a rule. Mirrors disable_firewall_rule on
+    `/ipv6/firewall/filter`."""
+    return _set_firewall_rule_disabled(
+        client,
+        settings,
+        "disable_ipv6_firewall_rule",
+        comment,
+        disabled=True,
+        confirm=confirm,
+        chain=chain,
+        resource_label="IPv6 firewall filter rule",
     )
 
 
