@@ -1,10 +1,10 @@
 [project]
 name = "mcp-mikrotik"
-version = "1.0.0"
+version = "1.1.0"
 description = "Model Context Protocol server for managing MikroTik RouterOS devices"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Thalis Antunes" }]
 keywords = ["mcp", "mikrotik", "routeros", "model-context-protocol"]
 dependencies = [
@@ -18,6 +18,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
+    "ruff>=0.15",
+    "mypy>=1.13",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -36,3 +39,62 @@ packages = ["src/mcp_mikrotik"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["mcp_mikrotik"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# A deliberately moderate rule set for a mature, already-reviewed codebase:
+# pyflakes (F) + pycodestyle errors (E) catch real bugs/style drift,
+# isort (I) keeps imports sorted, pyupgrade (UP) nudges modern syntax,
+# flake8-bugbear (B) catches common gotchas, flake8-comprehensions (C4) and
+# flake8-simplify (SIM) suggest clearer equivalents. Deliberately NOT
+# enabling pydocstyle (D) or flake8-annotations (ANN) - this codebase's
+# docstrings are prose explanations (see README's "Philosophy"), not a
+# fixed docstring-convention target, and its type coverage is handled by
+# mypy instead.
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    # Long lines happen in explanatory docstrings/error messages throughout
+    # this codebase (see e.g. guard.py's module docstring) - `ruff format`
+    # already wraps what it safely can; the rest is intentional prose, not
+    # a lint violation worth failing CI over.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files intentionally construct edge-case values (e.g. bare `except
+# Exception` stand-ins, long parametrize tables) that don't need the same
+# scrutiny as library code.
+"tests/*" = ["SIM108"]
+
+[tool.ruff.format]
+# Defaults (double quotes, trailing commas where safe) - listed explicitly
+# so a future ruff upgrade with a different default can't silently reformat
+# the whole codebase in one unrelated PR.
+quote-style = "double"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/mcp_mikrotik"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+# librouteros ships no py.typed marker and no third-party stub package
+# exists for it - every call into it is already wrapped by client.py's own
+# RouterosConnection/RouterosPath Protocols (see client.py), which is what
+# the rest of the codebase is actually type-checked against.
+[[tool.mypy.overrides]]
+module = "librouteros.*"
+ignore_missing_imports = true

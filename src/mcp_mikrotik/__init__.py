@@ -9,8 +9,8 @@ try:
     # `pip install -e .` (or a normal build) after a version bump is enough
     # for this to pick it up, with nothing to remember to edit twice.
     __version__ = version("mcp-mikrotik")
-except PackageNotFoundError:
-    # Fallback for the rare case this module is imported without the
-    # package being installed at all (e.g. a stray `sys.path` hack) - never
-    # raise just to report a version.
+except PackageNotFoundError:  # pragma: no cover - only reachable when the
+    # package is imported without being installed at all (e.g. a stray
+    # sys.path hack); the test suite always runs against an installed
+    # (editable) package, so this fallback is never exercised in CI.
     __version__ = "1.0.0"

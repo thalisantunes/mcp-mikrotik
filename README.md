@@ -1,5 +1,10 @@
 # mcp-mikrotik
 
+[![CI](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml/badge.svg)](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml)
+[![Python 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
+[![Coverage ≥95% enforced in CI](https://img.shields.io/badge/coverage-%E2%89%A595%25%20enforced-brightgreen)](.github/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server for
 [MikroTik RouterOS](https://mikrotik.com/software) devices. It lets an MCP
 client (Claude Desktop, Claude Code, or any other MCP-compatible LLM tool)
@@ -41,8 +46,9 @@ fleet - audit journal, correlation IDs, read retry, circuit breaker. See
 each v0.x round), and "Roadmap & non-goals" below for what's deliberately
 still out of scope, and why.
 
-The full pytest suite currently has 988 tests, all passing against an
-in-memory fake device layer (`pytest -q`) - see "Development" below.
+The full pytest suite currently has 1128 tests, all passing against an
+in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
+a 95% floor) - see "Development & CI" below.
 
 ## Installation
 
@@ -1180,21 +1186,31 @@ pytest -q
 The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
-`client_factory` parameter on `build_server()`. It currently has 988 tests,
-zero of which touch a real device or the network.
+`client_factory` parameter on `build_server()`. It currently has 1128 tests,
+zero of which touch a real device or the network, at 100% line coverage.
 
-CI (`.github/workflows/ci.yml`, GitHub Actions) runs the full `pytest` suite
-on every push to `main` and every pull request, against both Python 3.11 and
-3.12 - both must pass before a change is considered mergeable.
+CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every push to `main`
+and every pull request, as three separate jobs that must all pass before a
+change is considered mergeable:
 
-**Contributing:** a new write tool must go through `guard.py`'s
-`ALLOWLIST` pattern (one named `WriteOperation` + one dedicated function -
-see the comment block at the top of `guard.py`) - never a generic
-"run this path" tool. Add tests alongside any new behavior (both the guard
-function in `tests/test_guard.py`/`test_guard_audit.py` and the tool
-registration in `tests/test_server.py`, following existing tests as a
-template), and make sure `pytest -q` is green locally before opening a PR -
-CI runs the identical suite.
+- **`test`** - the full `pytest` suite against a matrix of Python 3.11,
+  3.12, and 3.13, with coverage measured (`pytest --cov=mcp_mikrotik
+  --cov-fail-under=95`). The 95% floor is deliberately a little below the
+  repo's actual coverage (100%, with two narrow `# pragma: no cover`
+  exceptions - see CONTRIBUTING.md's "Test coverage") so a PR isn't blocked
+  on a fraction-of-a-percent of genuinely hard-to-reach code, while still
+  failing the build if coverage regresses meaningfully.
+- **`lint`** - `ruff check .` (lint) and `ruff format --check .`
+  (formatting), configured in `pyproject.toml`'s `[tool.ruff]`.
+- **`typecheck`** - `mypy src/mcp_mikrotik`, configured in `pyproject.toml`'s
+  `[tool.mypy]`. `librouteros` ships no type stubs, so it's covered instead
+  by `client.py`'s own `RouterosConnection`/`RouterosPath` Protocols, which
+  the rest of the codebase is type-checked against.
+
+Run all three locally before opening a PR - see `CONTRIBUTING.md` for the
+exact commands, plus the full checklist a PR is reviewed against (the
+security-model rules every write tool must follow, and the step-by-step
+guide for adding a new tool, read or write).
 
 ## Roadmap & non-goals
 
@@ -1295,4 +1311,4 @@ sufficient protection for them on its own - see the comment above
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+Apache-2.0 - see [LICENSE](LICENSE).

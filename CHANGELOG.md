@@ -3,6 +3,88 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+Open-source-readiness pass: no new tool, no behavior change - CI hardening,
+contributor onboarding, and closing every remaining test-coverage gap.
+
+- **CI now runs three jobs** (`.github/workflows/ci.yml`): `test` (the full
+  `pytest` suite across a Python 3.11/3.12/3.13 matrix, with
+  `--cov-fail-under=95`), `lint` (`ruff check` + `ruff format --check`), and
+  `typecheck` (`mypy src/mcp_mikrotik`). Previously CI only ran `pytest` on
+  3.11/3.12 with no lint/type/coverage gate.
+- **`ruff` adopted** for lint + formatting (`[tool.ruff]` in
+  `pyproject.toml`): the whole codebase reformatted to a consistent
+  120-column style and 13 pre-existing lint findings fixed (all style-only -
+  sorted imports, `collections.abc` over deprecated `typing` aliases, a
+  `dict()` call rewritten as a literal, a `try`/`except`/`pass` rewritten as
+  `contextlib.suppress`, an inlined boolean return - no behavior change).
+- **`mypy` adopted** for type-checking (`[tool.mypy]` in `pyproject.toml`):
+  `client.py`'s `RouterosConnection` Protocol split into
+  `RouterosConnection`/`RouterosPath` so `.path(...)`'s return type
+  correctly describes the `.add()`/`.update()`/`.remove()`/callable shape
+  callers actually use (previously typed as plain `Iterable[dict[str,
+  Any]]`, which mypy correctly flagged as not supporting those); a genuine
+  `os.environ` vs `dict[str, str]` type mismatch fixed in
+  `config.load_settings` (widened to `Mapping[str, str]`, since
+  `os.environ` is an `_Environ[str]`, not a `dict`). `librouteros` ships no
+  type stubs, so it's exempted via `[[tool.mypy.overrides]]` and covered
+  instead by the Protocols above.
+- **Test coverage closed to 100%** (from 97%; CI's floor is 95% - see
+  `CONTRIBUTING.md`'s "Test coverage" for why the floor sits below the
+  actual number), adding 140 tests across error/security paths that were
+  previously untested end-to-end:
+  - Direct unit tests for validators that had none at all despite being
+    used in guarded write tools (`validate_port`, `validate_wireguard_key`,
+    `validate_allowed_address_list`, `validate_hotspot_username`/
+    `_password`/`_profile`, `validate_backup_name`/`_password`), plus the
+    "too long" branch of `validate_ip_address`/`validate_target`/
+    `validate_dst_address`/`validate_route_gateway`.
+  - `config.py`'s YAML-shape error paths (non-mapping top level, non-list
+    `devices` key, non-mapping device entry, a boolean/`None` `name`/`host`
+    field) and `client.py`'s env-var parsing fallbacks
+    (`MIKROTIK_READ_RETRIES`/`_BREAKER_THRESHOLD`/`_BREAKER_COOLDOWN`/
+    `_TIMEOUT` given an unparseable or out-of-range value).
+  - A new `tests/test_formatting.py` (this module had none): `ros_bool`'s
+    non-bool/non-recognized-string fallback, `split_address_port`'s
+    bracketed-IPv6 edge cases.
+  - `guard.py`'s `set_wifi_ssid` configuration-read-failure wrapping (a
+    `/interface/wifi/configuration` read failing after the interface's
+    `configuration` reference already resolved) and
+    `set_client_bandwidth`'s `limit_at` handling on the update (not just
+    create) path.
+  - `security.py`'s outer `except DeviceCommandError` backstop in
+    `run_security_audit` (every real check already catches its own; this
+    proves the second, outer layer works too, via a monkeypatched fake
+    check).
+  - `server.py`: `ip_addresses`/`neighbors`/`logs` (including its `topics`
+    filter) had zero tool-call-level tests beyond registration; the
+    lifespan hook's `pool.close_all()` on shutdown, driven through
+    FastMCP's actual lifespan protocol rather than only unit-testing
+    `ClientPool.close_all()` in isolation; `netwatch`'s and `lte_status`'s
+    "optional package absent" `DeviceCommandError → empty` fallback (the
+    existing tests for this used `FakeConnection`'s path-keyed `raise_for`,
+    which doesn't intercept `lte_monitor`'s callable-form read - fixed to
+    use `TransportErrorConnection`, which does); `torch`'s unparseable
+    `tx`/`rx` handling (treated as 0 traffic, sorted last, not dropped).
+  - Two lines legitimately excluded via `# pragma: no cover`, not chased
+    with contrived tests: the process entrypoint (`main()`/`if __name__ ==
+    "__main__":` in `server.py`, which blocks on stdio) and
+    `__init__.py`'s `except PackageNotFoundError` fallback (only reachable
+    when imported without being installed at all).
+- **Contributor onboarding**: `CONTRIBUTING.md` (setup, the full
+  security-model checklist every write-tool PR must satisfy, and a
+  step-by-step guide for adding a new read or write tool),
+  `.github/ISSUE_TEMPLATE/bug_report.md` + `feature_request.md`,
+  `.github/PULL_REQUEST_TEMPLATE.md`, `CODE_OF_CONDUCT.md` (Contributor
+  Covenant 2.1), and `SECURITY.md` (private vulnerability reporting via
+  GitHub Security Advisories, scoped to this project's specific threat
+  model - write-guard bypass, secret-in-log/journal, command injection,
+  TLS-verification bypass).
+- **README**: CI/Python-version/coverage/license badges at the top; the
+  "Development & CI" section rewritten to describe all three CI jobs and
+  the 95% coverage floor; test count updated (1128, up from 988).
+
 ## [1.0.0] - 2026-07-10
 
 The first stable release. Every tool round planned since v0.1.0 has

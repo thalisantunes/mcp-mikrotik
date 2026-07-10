@@ -13,6 +13,7 @@ See .env.example for the full list.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -177,14 +178,16 @@ def load_devices(path: Path) -> dict[str, Device]:
     return devices
 
 
-def load_settings(devices_path: Path | None = None, env: dict[str, str] | None = None) -> Settings:
+def load_settings(devices_path: Path | None = None, env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from environment variables plus the devices YAML file.
 
     `env` defaults to os.environ; passing an explicit mapping is mainly useful
-    for tests so they never depend on the real process environment.
+    for tests so they never depend on the real process environment. Typed as
+    `Mapping` (read-only) rather than `dict` since `os.environ` itself is an
+    `_Environ[str]`, not a `dict` - both satisfy `Mapping[str, str]`.
     """
-    env = env if env is not None else os.environ
-    path = devices_path or Path(env.get("MIKROTIK_DEVICES_FILE", DEFAULT_DEVICES_FILE))
+    resolved_env: Mapping[str, str] = env if env is not None else os.environ
+    path = devices_path or Path(resolved_env.get("MIKROTIK_DEVICES_FILE", DEFAULT_DEVICES_FILE))
     devices = load_devices(path)
-    allow_write = _bool_env(env.get("MIKROTIK_ALLOW_WRITE"), default=False)
+    allow_write = _bool_env(resolved_env.get("MIKROTIK_ALLOW_WRITE"), default=False)
     return Settings(allow_write=allow_write, devices=devices)

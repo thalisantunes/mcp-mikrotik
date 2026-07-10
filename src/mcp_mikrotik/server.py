@@ -29,8 +29,9 @@ import contextlib
 import functools
 import logging
 import os
+from collections.abc import AsyncIterator
 from dataclasses import asdict
-from typing import Any, AsyncIterator
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -997,9 +998,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
-    def security_events(
-        device_name: str, limit: int = DEFAULT_SECURITY_EVENTS_LIMIT
-    ) -> list[dict[str, Any]]:
+    def security_events(device_name: str, limit: int = DEFAULT_SECURITY_EVENTS_LIMIT) -> list[dict[str, Any]]:
         """Recent RouterOS log entries filtered down to security-relevant
         ones - login/logout/authentication-failure events (topic
         "account"), "critical"/"error" topic entries, and generic
@@ -1075,9 +1074,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
-    def set_wifi_ssid(
-        device_name: str, interface_name: str, new_ssid: str, confirm: bool = False
-    ) -> dict[str, Any]:
+    def set_wifi_ssid(device_name: str, interface_name: str, new_ssid: str, confirm: bool = False) -> dict[str, Any]:
         """Set a wireless interface's SSID.
 
         WRITE tool, guarded: blocked entirely unless the server is running
@@ -1252,9 +1249,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
-    def set_poe_out(
-        device_name: str, interface_name: str, poe_out: str, confirm: bool = False
-    ) -> dict[str, Any]:
+    def set_poe_out(device_name: str, interface_name: str, poe_out: str, confirm: bool = False) -> dict[str, Any]:
         """Set a PoE-capable ethernet port's PoE output mode
         (/interface/ethernet set [interface_name] poe-out=<poe_out>).
 
@@ -1274,9 +1269,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         coerces anything.
         """
         client = _client(device_name)
-        preview = guard.set_poe_out(
-            client, settings, interface_name=interface_name, poe_out=poe_out, confirm=confirm
-        )
+        preview = guard.set_poe_out(client, settings, interface_name=interface_name, poe_out=poe_out, confirm=confirm)
         return asdict(preview)
 
     @mcp.tool()
@@ -1440,9 +1433,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         it never creates a duplicate.
         """
         client = _client(device_name)
-        preview = guard.add_netwatch(
-            client, settings, host=host, interval=interval, comment=comment, confirm=confirm
-        )
+        preview = guard.add_netwatch(client, settings, host=host, interval=interval, comment=comment, confirm=confirm)
         return asdict(preview)
 
     @mcp.tool()
@@ -1570,9 +1561,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         it. Errors clearly if nothing matches.
         """
         client = _client(device_name)
-        preview = guard.remove_dhcp_lease(
-            client, settings, address=address, mac_address=mac_address, confirm=confirm
-        )
+        preview = guard.remove_dhcp_lease(client, settings, address=address, mac_address=mac_address, confirm=confirm)
         return asdict(preview)
 
     @mcp.tool()
@@ -1593,9 +1582,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         anything; call again with confirm=True to actually send it.
         """
         client = _client(device_name)
-        preview = guard.wake_on_lan(
-            client, settings, mac_address=mac_address, interface=interface, confirm=confirm
-        )
+        preview = guard.wake_on_lan(client, settings, mac_address=mac_address, interface=interface, confirm=confirm)
         return asdict(preview)
 
     # --- v0.11: firewall rule toggle (by comment, never create) ---------
@@ -1680,9 +1667,7 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         exists - never creates a duplicate.
         """
         client = _client(device_name)
-        preview = guard.add_wireguard_interface(
-            client, settings, name=name, listen_port=listen_port, confirm=confirm
-        )
+        preview = guard.add_wireguard_interface(client, settings, name=name, listen_port=listen_port, confirm=confirm)
         return asdict(preview)
 
     @mcp.tool()
@@ -1888,11 +1873,15 @@ def _resolve_log_level(raw: str | None) -> str:
     return level
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover - process entrypoint; server.run()
+    # blocks on stdio for the life of the process, so this is exercised by
+    # actually running `mcp-mikrotik`/`python -m mcp_mikrotik.server`, not
+    # by the test suite. build_server() (everything up to the blocking
+    # run() call) is exactly what tests/test_server.py exercises instead.
     logging.basicConfig(level=_resolve_log_level(os.environ.get("MIKROTIK_LOG_LEVEL")))
     server = build_server()
     server.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - see main() above
     main()

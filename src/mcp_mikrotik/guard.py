@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import functools
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from . import audit
 from .client import MikrotikClient
@@ -998,9 +999,7 @@ def remove_from_address_list(
     rows = client.path(*op.path)
     row = _find_address_list_row(rows, validated_list, validated_address)
     if row is None:
-        raise ResourceNotFoundError(
-            client.device.name, "Address-list entry", f"{validated_list}:{validated_address}"
-        )
+        raise ResourceNotFoundError(client.device.name, "Address-list entry", f"{validated_list}:{validated_address}")
 
     before = dict(row)
     after: dict[str, Any] = {}
@@ -1557,9 +1556,7 @@ def add_static_dns(
 
     rows = client.path(*op.path)
     if _find_static_dns_rows(rows, validated_name, validated_type):
-        raise ResourceAlreadyExistsError(
-            client.device.name, "Static DNS entry", f"{validated_name} ({validated_type})"
-        )
+        raise ResourceAlreadyExistsError(client.device.name, "Static DNS entry", f"{validated_name} ({validated_type})")
 
     payload: dict[str, Any] = {"name": validated_name, "type": validated_type}
     if validated_type == "CNAME":

@@ -10,16 +10,16 @@ from mcp_mikrotik import audit
 
 
 def _record(**overrides):
-    kwargs = dict(
-        correlation_id="cid-0001",
-        device_name="core-switch",
-        tool="set_identity",
-        operation="set_identity",
-        action="update",
-        confirm=False,
-        outcome="preview",
-        summary={"before": {"name": "old"}, "after": {"name": "new"}},
-    )
+    kwargs = {
+        "correlation_id": "cid-0001",
+        "device_name": "core-switch",
+        "tool": "set_identity",
+        "operation": "set_identity",
+        "action": "update",
+        "confirm": False,
+        "outcome": "preview",
+        "summary": {"before": {"name": "old"}, "after": {"name": "new"}},
+    }
     kwargs.update(overrides)
     audit.record(**kwargs)
 
@@ -179,9 +179,7 @@ def test_record_never_includes_wifi_passphrase_field(tmp_path: Path, monkeypatch
         "preshared",
     ],
 )
-def test_record_strips_every_wifi_secret_key_spelling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
-):
+def test_record_strips_every_wifi_secret_key_spelling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str):
     log_path = tmp_path / "audit.jsonl"
     monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
 
@@ -219,9 +217,7 @@ def test_record_strips_nested_wifi_passphrase(tmp_path: Path, monkeypatch: pytes
     assert event["summary"]["after"]["ssid"] == "safe-value"
 
 
-def test_record_never_logs_password_to_stderr_either(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-):
+def test_record_never_logs_password_to_stderr_either(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
     monkeypatch.delenv("MIKROTIK_AUDIT_LOG", raising=False)
 
     with caplog.at_level(logging.INFO, logger="mcp_mikrotik.audit"):

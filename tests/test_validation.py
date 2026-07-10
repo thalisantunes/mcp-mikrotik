@@ -5,6 +5,10 @@ import pytest
 from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
     validate_address_list_name,
+    validate_allowed_address_list,
+    validate_backup_name,
+    validate_backup_password,
+    validate_byte_count,
     validate_comment,
     validate_conntrack_dst_port,
     validate_conntrack_protocol,
@@ -14,16 +18,21 @@ from mcp_mikrotik.validation import (
     validate_dst_address,
     validate_firewall_chain,
     validate_firewall_rule_comment,
+    validate_hotspot_password,
+    validate_hotspot_profile,
+    validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
     validate_ping_address,
     validate_poe_out,
+    validate_port,
     validate_rate_pair,
     validate_route_distance,
     validate_route_gateway,
     validate_target,
     validate_timeout,
+    validate_wireguard_key,
 )
 
 
@@ -99,6 +108,11 @@ def test_validate_ip_address_rejects_non_string():
         validate_ip_address(None)  # type: ignore[arg-type]
 
 
+def test_validate_ip_address_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_ip_address("1" * 254)
+
+
 # --- validate_target (Simple Queue target: address or address/prefix) -----
 
 
@@ -132,6 +146,11 @@ def test_validate_target_rejects_invalid(target: str):
 def test_validate_target_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_target(None)  # type: ignore[arg-type]
+
+
+def test_validate_target_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_target("1" * 254)
 
 
 # --- validate_mac_address --------------------------------------------------
@@ -195,9 +214,7 @@ def test_validate_rate_pair_error_message_includes_field_name():
 # --- validate_address_list_name (v0.4) -------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name", ["blocked-clients", "allowed_clients", "list.1", "A", "9-clients", "a" * 64]
-)
+@pytest.mark.parametrize("name", ["blocked-clients", "allowed_clients", "list.1", "A", "9-clients", "a" * 64])
 def test_validate_address_list_name_accepts_valid(name: str):
     assert validate_address_list_name(name) == name
 
@@ -247,16 +264,12 @@ def test_validate_comment_error_message_includes_field_name():
 # --- validate_timeout (v0.4) -------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "value", ["1d", "2h30m", "1w2d3h4m5s", "10s", "0s", "01:30:00", "0:05", "00:00:10"]
-)
+@pytest.mark.parametrize("value", ["1d", "2h30m", "1w2d3h4m5s", "10s", "0s", "01:30:00", "0:05", "00:00:10"])
 def test_validate_timeout_accepts_valid(value: str):
     assert validate_timeout(value) == value
 
 
-@pytest.mark.parametrize(
-    "value", ["", "   ", "not-a-timeout", "1x", "10s; reboot", "a" * 40, "1h2w"]
-)
+@pytest.mark.parametrize("value", ["", "   ", "not-a-timeout", "1x", "10s; reboot", "a" * 40, "1h2w"])
 def test_validate_timeout_rejects_invalid(value: str):
     with pytest.raises(ValidationError):
         validate_timeout(value)
@@ -270,9 +283,7 @@ def test_validate_timeout_rejects_non_string():
 # --- validate_interface_name (v0.6) ------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name", ["ether1", "sfp-sfpplus1", "wlan1", "bridge1", "vlan100", "ether1-poe", "a", "A0"]
-)
+@pytest.mark.parametrize("name", ["ether1", "sfp-sfpplus1", "wlan1", "bridge1", "vlan100", "ether1-poe", "a", "A0"])
 def test_validate_interface_name_accepts_valid(name: str):
     assert validate_interface_name(name) == name
 
@@ -281,9 +292,7 @@ def test_validate_interface_name_strips_whitespace():
     assert validate_interface_name("  ether1  ") == "ether1"
 
 
-@pytest.mark.parametrize(
-    "name", ["", "   ", "ether1; reboot", "ether 1", "ether/1", "ether\n1", "a" * 65]
-)
+@pytest.mark.parametrize("name", ["", "   ", "ether1; reboot", "ether 1", "ether/1", "ether\n1", "a" * 65])
 def test_validate_interface_name_rejects_invalid(name: str):
     with pytest.raises(ValidationError):
         validate_interface_name(name)
@@ -374,6 +383,11 @@ def test_validate_dst_address_strips_whitespace():
     assert validate_dst_address("  0.0.0.0/0  ") == "0.0.0.0/0"
 
 
+def test_validate_dst_address_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_dst_address("1" * 254)
+
+
 # --- validate_route_gateway (v0.9) --------------------------------------------
 
 
@@ -389,7 +403,7 @@ def test_validate_route_gateway_rejects_invalid(value: str):
 
 
 def test_validate_route_gateway_accepts_dotted_digit_string_as_interface_shape():
-    """"999.1.1.1" is not a valid IPv4 (999 is out of range), but it IS a
+    """ "999.1.1.1" is not a valid IPv4 (999 is out of range), but it IS a
     valid interface-name shape (letters/digits/'.'/'_'/'-') - gateway is
     validated as "IP OR interface name" (see validate_route_gateway's
     docstring: RouterOS accepts a gateway expressed as an outgoing
@@ -404,6 +418,11 @@ def test_validate_route_gateway_accepts_dotted_digit_string_as_interface_shape()
 def test_validate_route_gateway_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_route_gateway(None)  # type: ignore[arg-type]
+
+
+def test_validate_route_gateway_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_route_gateway("1" * 254)
 
 
 # --- validate_route_distance (v0.9) -------------------------------------------
@@ -429,9 +448,7 @@ def test_validate_route_distance_rejects_non_int(value):
 # --- validate_dns_name (v0.10) -------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "value", ["example.com", "blocked.example.com", "a.b.c.example.co", "xn--80ak6aa92e.com", "a"]
-)
+@pytest.mark.parametrize("value", ["example.com", "blocked.example.com", "a.b.c.example.co", "xn--80ak6aa92e.com", "a"])
 def test_validate_dns_name_accepts_valid(value: str):
     assert validate_dns_name(value) == value
 
@@ -444,7 +461,7 @@ def test_validate_dns_name_strips_whitespace():
     "value", ["", "   ", "10.0.0.1", "999.1.1.1", "example.com; reboot", "example .com", "a" * 254]
 )
 def test_validate_dns_name_rejects_invalid(value: str):
-    """"10.0.0.1"/"999.1.1.1" are rejected - a static DNS entry's `name`
+    """ "10.0.0.1"/"999.1.1.1" are rejected - a static DNS entry's `name`
     (or a CNAME target) is a hostname, never a literal IP/IP-look-alike, so
     - unlike validate_route_gateway's deliberate "999.1.1.1 is accepted as
     an interface-name shape" exception - both are rejected here."""
@@ -564,3 +581,222 @@ def test_validate_conntrack_protocol_rejects_invalid(value: str):
 def test_validate_conntrack_protocol_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_conntrack_protocol(None)  # type: ignore[arg-type]
+
+
+# --- validate_port (v0.13) --------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [1, 22, 8728, 8729, 65535])
+def test_validate_port_accepts_valid(value: int):
+    assert validate_port(value) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 65536, 100000])
+def test_validate_port_rejects_out_of_range(value: int):
+    with pytest.raises(ValidationError, match="out of range"):
+        validate_port(value)
+
+
+@pytest.mark.parametrize("value", ["8728", None, 1.5, True, False])
+def test_validate_port_rejects_non_int(value):
+    with pytest.raises(ValidationError, match="must be an integer"):
+        validate_port(value)  # type: ignore[arg-type]
+
+
+def test_validate_port_uses_field_name_in_error():
+    with pytest.raises(ValidationError, match="listen_port"):
+        validate_port(0, "listen_port")
+
+
+# --- validate_wireguard_key (v0.13) -----------------------------------------
+
+
+def test_validate_wireguard_key_accepts_valid():
+    key = "xTIBA5rboUvnH4htodxbtqE4CE0Rg8v+CFAM6XWQAn8="
+    assert validate_wireguard_key(key) == key
+
+
+def test_validate_wireguard_key_strips_whitespace():
+    key = "xTIBA5rboUvnH4htodxbtqE4CE0Rg8v+CFAM6XWQAn8="
+    assert validate_wireguard_key(f"  {key}  ") == key
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "too-short",
+        "xTIBA5rboUvnH4htodxbtqE4CE0Rg8v+CFAM6XWQAn8",  # missing '=' padding
+        "xTIBA5rboUvnH4htodxbtqE4CE0Rg8v+CFAM6XWQAn8==",  # extra padding
+        "xTIBA5rboUvnH4htodxbtqE4CE0Rg8v+CFAM6XWQAn8; rm -rf /=",
+    ],
+)
+def test_validate_wireguard_key_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not a valid WireGuard key"):
+        validate_wireguard_key(value)
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_wireguard_key_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_wireguard_key(value)  # type: ignore[arg-type]
+
+
+def test_validate_wireguard_key_uses_field_name_in_error():
+    with pytest.raises(ValidationError, match="public_key"):
+        validate_wireguard_key("", "public_key")
+
+
+# --- validate_allowed_address_list (v0.13) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["10.0.0.2/32", "10.0.0.2/32,10.0.0.3/32", "2001:db8::1/128", "10.0.0.0/24, 10.0.1.0/24"],
+)
+def test_validate_allowed_address_list_accepts_valid(value: str):
+    result = validate_allowed_address_list(value)
+    assert isinstance(result, str)
+    assert "," in result or "/" in result
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_allowed_address_list_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_allowed_address_list(value)  # type: ignore[arg-type]
+
+
+def test_validate_allowed_address_list_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_allowed_address_list("10.0.0.0/32," * 100)
+
+
+def test_validate_allowed_address_list_rejects_empty_entry():
+    with pytest.raises(ValidationError, match="empty entry"):
+        validate_allowed_address_list("10.0.0.2/32,,10.0.0.3/32")
+
+
+def test_validate_allowed_address_list_rejects_invalid_entry():
+    with pytest.raises(ValidationError):
+        validate_allowed_address_list("10.0.0.2/32,not-an-ip")
+
+
+# --- validate_hotspot_username (v0.14) --------------------------------------
+
+
+@pytest.mark.parametrize("value", ["visitor-42", "guest.1", "a", "A1_b-c.d"])
+def test_validate_hotspot_username_accepts_valid(value: str):
+    assert validate_hotspot_username(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_hotspot_username_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_hotspot_username(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["-leading-dash", "has space", "has;semicolon", "a" * 65])
+def test_validate_hotspot_username_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_hotspot_username(value)
+
+
+# --- validate_hotspot_password (v0.14) --------------------------------------
+
+
+@pytest.mark.parametrize("value", ["Xk7mQ2p9", "a", "!@#$%^&*()"])
+def test_validate_hotspot_password_accepts_valid(value: str):
+    assert validate_hotspot_password(value) == value
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_validate_hotspot_password_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_hotspot_password(value)  # type: ignore[arg-type]
+
+
+def test_validate_hotspot_password_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_hotspot_password("a" * 129)
+
+
+def test_validate_hotspot_password_rejects_control_characters():
+    with pytest.raises(ValidationError, match="control characters"):
+        validate_hotspot_password("bad\npassword")
+
+
+# --- validate_hotspot_profile (v0.14) ---------------------------------------
+
+
+@pytest.mark.parametrize("value", ["default", "5M-limit", "profile.1"])
+def test_validate_hotspot_profile_accepts_valid(value: str):
+    assert validate_hotspot_profile(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_hotspot_profile_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_hotspot_profile(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["-leading-dash", "has space", "has;semicolon", "a" * 65])
+def test_validate_hotspot_profile_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_hotspot_profile(value)
+
+
+# --- validate_byte_count (v0.14) --------------------------------------------
+
+
+@pytest.mark.parametrize("value,expected", [(1, "1"), (1024, "1024"), (1_000_000_000, "1000000000")])
+def test_validate_byte_count_accepts_valid(value: int, expected: str):
+    assert validate_byte_count(value) == expected
+
+
+@pytest.mark.parametrize("value", [0, -1, "1024", None, 1.5, True, False])
+def test_validate_byte_count_rejects_invalid(value):
+    with pytest.raises(ValidationError, match="positive integer"):
+        validate_byte_count(value)  # type: ignore[arg-type]
+
+
+# --- validate_backup_name (v0.14) -------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["core-switch-2026-07-09", "backup1", "a.backup"])
+def test_validate_backup_name_accepts_valid(value: str):
+    assert validate_backup_name(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_backup_name_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_backup_name(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["-leading-dash", "has space", "has;semicolon", "a" * 129])
+def test_validate_backup_name_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_backup_name(value)
+
+
+# --- validate_backup_password (v0.14) ---------------------------------------
+
+
+@pytest.mark.parametrize("value", ["S3cret!", "a", "!@#$%^&*()"])
+def test_validate_backup_password_accepts_valid(value: str):
+    assert validate_backup_password(value) == value
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_validate_backup_password_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_backup_password(value)  # type: ignore[arg-type]
+
+
+def test_validate_backup_password_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_backup_password("a" * 129)
+
+
+def test_validate_backup_password_rejects_control_characters():
+    with pytest.raises(ValidationError, match="control characters"):
+        validate_backup_password("bad\npassword")

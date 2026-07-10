@@ -7,11 +7,13 @@ end-to-end tool-call tests).
 
 from __future__ import annotations
 
+import pytest
 from librouteros.exceptions import LibRouterosError
 
 from mcp_mikrotik import security
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device
+from mcp_mikrotik.exceptions import DeviceCommandError
 
 from .fakes import FakeConnection
 
@@ -272,11 +274,7 @@ def test_dns_skips_when_menu_absent(device: Device):
 def test_routeros_version_flags_outdated(device: Device):
     client = _client(
         device,
-        data={
-            ("system", "package", "update"): [
-                {"installed-version": "7.14", "latest-version": "7.16.1"}
-            ]
-        },
+        data={("system", "package", "update"): [{"installed-version": "7.14", "latest-version": "7.16.1"}]},
     )
     findings = security._check_routeros_version(client)
     assert len(findings) == 1
@@ -288,11 +286,7 @@ def test_routeros_version_flags_outdated(device: Device):
 def test_routeros_version_no_finding_when_up_to_date(device: Device):
     client = _client(
         device,
-        data={
-            ("system", "package", "update"): [
-                {"installed-version": "7.16.1", "latest-version": "7.16.1"}
-            ]
-        },
+        data={("system", "package", "update"): [{"installed-version": "7.16.1", "latest-version": "7.16.1"}]},
     )
     assert security._check_routeros_version(client) == []
 
@@ -436,9 +430,7 @@ def test_run_security_audit_sorts_by_severity_and_summarizes(device: Device):
         data={
             ("ip", "service"): [{"name": "telnet", "disabled": "false", "address": ""}],  # high
             ("snmp", "community"): [{"name": "public", "addresses": "0.0.0.0/0"}],  # medium
-            ("system", "package", "update"): [
-                {"installed-version": "7.14", "latest-version": "7.16"}
-            ],  # low
+            ("system", "package", "update"): [{"installed-version": "7.14", "latest-version": "7.16"}],  # low
             ("user",): [{"name": "admin", "group": "full"}],  # info
             ("ip", "firewall", "filter"): [{"chain": "input", "action": "drop", "disabled": "false"}],
             ("ip", "dns"): [{"allow-remote-requests": "false"}],
@@ -487,6 +479,48 @@ def test_run_security_audit_never_fails_when_every_menu_is_absent(device: Device
     assert result["summary"] == {"high": 0, "medium": 0, "low": 0, "info": 0}
 
 
+def test_run_security_audit_outer_backstop_survives_a_check_raising_directly(
+    device: Device, monkeypatch: pytest.MonkeyPatch
+):
+    """Every real `_check_*` already catches its own `DeviceCommandError`
+    (see test_run_security_audit_never_fails_when_every_menu_is_absent
+    above) - `run_security_audit`'s own `except DeviceCommandError:
+    continue` is a second, outer backstop for a hypothetical future check
+    that doesn't. Proven directly here by monkeypatching `_CHECKS` with one
+    check that raises without catching, alongside a normal one - the audit
+    must still return the normal check's findings rather than raising."""
+
+    def _broken_check(client: MikrotikClient) -> list[security.Finding]:
+        raise DeviceCommandError(client.device.name, "some/broken/menu", "simulated failure")
+
+    working_finding = security.Finding(
+        severity="info",
+        category="test",
+        title="Working check ran",
+        detail="detail",
+        recommendation="recommendation",
+    )
+
+    def _working_check(client: MikrotikClient) -> list[security.Finding]:
+        return [working_finding]
+
+    monkeypatch.setattr(security, "_CHECKS", (_broken_check, _working_check))
+
+    client = _client(device)
+    result = security.run_security_audit(client)
+
+    assert result["findings"] == [
+        {
+            "severity": "info",
+            "category": "test",
+            "title": "Working check ran",
+            "detail": "detail",
+            "recommendation": "recommendation",
+        }
+    ]
+    assert result["summary"]["info"] == 1
+
+
 def test_run_security_audit_never_leaks_a_secret(device: Device):
     """Every menu that can carry a secret-shaped field is populated with a
     distinctive marker value; multiple checks are made to actually FIRE
@@ -501,13 +535,9 @@ def test_run_security_audit_never_leaks_a_secret(device: Device):
                 {"name": "telnet", "disabled": "false", "address": "", "password": marker},
             ],
             ("ip", "firewall", "filter"): [{"chain": "input", "action": "accept", "disabled": "false"}],
-            ("snmp", "community"): [
-                {"name": "public", "addresses": "0.0.0.0/0", "authentication-password": marker}
-            ],
+            ("snmp", "community"): [{"name": "public", "addresses": "0.0.0.0/0", "authentication-password": marker}],
             ("ip", "dns"): [{"allow-remote-requests": "true"}],
-            ("system", "package", "update"): [
-                {"installed-version": "7.14", "latest-version": "7.16"}
-            ],
+            ("system", "package", "update"): [{"installed-version": "7.14", "latest-version": "7.16"}],
             ("interface", "wireless", "security-profiles"): [
                 {"name": "default", "mode": "none", "wpa2-pre-shared-key": marker},
             ],

@@ -18,12 +18,14 @@ same MikrotikClient layer - see the TODO at the bottom of this file.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import ssl
 import threading
 import time
+from collections.abc import Callable, Iterable, Iterator
 from functools import partial
-from typing import Any, Callable, Iterable, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import librouteros
 from librouteros.exceptions import LibRouterosError
@@ -166,20 +168,33 @@ class CircuitBreaker:
             return self._opened_at is not None
 
 
+class RouterosPath(Protocol):
+    """Shape of the object `RouterosConnection.path(*segments)` returns:
+    iterable (yields row dicts) and also supports .add()/.update()/.remove(),
+    plus the callable action-command form used by MikrotikClient.start/.stop
+    (e.g. `path("container")("start", **{".id": id})`, mirroring
+    librouteros' own Path.__call__). A separate Protocol from
+    RouterosConnection itself purely so mypy knows `.path(...)`'s return
+    value supports these members - `Iterable[dict[str, Any]]` alone (its
+    externally-visible iteration shape) doesn't."""
+
+    def __iter__(self) -> Iterator[dict[str, Any]]: ...
+    def __call__(self, cmd: str, **kwargs: Any) -> Iterable[dict[str, Any]]: ...
+    def add(self, **fields: Any) -> Any: ...
+    def update(self, **fields: Any) -> None: ...
+    def remove(self, *ids: str) -> None: ...
+
+
 class RouterosConnection(Protocol):
     """Shape of a connected RouterOS API session that MikrotikClient needs."""
 
-    def path(self, *path: str) -> Iterable[dict[str, Any]]:
-        """Return an object that, when iterated, yields rows (dicts) and that
-        also supports .add(**fields) / .update(**fields) / .remove(*ids), plus
-        the callable action-command form used by MikrotikClient.start/.stop
-        (e.g. `path("container")("start", **{".id": id})`, mirroring
-        librouteros' own Path.__call__)."""
-        ...
+    def path(self, *path: str) -> RouterosPath:
+        """Return an object shaped like RouterosPath above."""
+        ...  # pragma: no cover - Protocol stub, never actually called
 
     def __call__(self, cmd: str, **kwargs: Any) -> Iterable[dict[str, Any]]:
         """Run a one-off command (e.g. "/ping") and return its replies."""
-        ...
+        ...  # pragma: no cover - Protocol stub, never actually called
 
     def close(self) -> None: ...
 
@@ -658,10 +673,8 @@ class MikrotikClient:
 
     def close(self) -> None:
         if self._connection is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._connection.close()
-            except Exception:
-                pass
             self._connection = None
 
 

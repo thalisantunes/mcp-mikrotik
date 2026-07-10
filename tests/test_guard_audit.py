@@ -68,9 +68,7 @@ def test_confirmed_call_journals_outcome_applied(
     assert events[0]["confirm"] is True
 
 
-def test_write_disabled_error_still_journals_outcome_error(
-    audit_log: Path, client: MikrotikClient, settings: Settings
-):
+def test_write_disabled_error_still_journals_outcome_error(audit_log: Path, client: MikrotikClient, settings: Settings):
     """The read-only gate blocks the write before the device is ever
     touched, but that attempted write is still audit-worthy."""
     with pytest.raises(WriteDisabledError):
@@ -96,9 +94,7 @@ def test_resource_not_found_error_journals_outcome_error(
     assert events[0]["operation"] == "enable_interface"
 
 
-def test_device_command_error_journals_outcome_error(
-    audit_log: Path, settings_write_enabled: Settings, device: Device
-):
+def test_device_command_error_journals_outcome_error(audit_log: Path, settings_write_enabled: Settings, device: Device):
     """A genuine device-side transport failure (not the read-only gate)
     still produces exactly one "error" journal entry."""
     from mcp_mikrotik.exceptions import DeviceCommandError
@@ -185,15 +181,11 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     guard.enable_interface(client, settings_write_enabled, interface_name="ether2", confirm=False)
     guard.enable_interface(client, settings_write_enabled, interface_name="ether2", confirm=True)
     guard.disable_interface(client, settings_write_enabled, interface_name="ether1", confirm=True)
-    guard.set_client_bandwidth(
-        client, settings_write_enabled, target="10.0.0.77", max_limit="5M/5M", confirm=True
-    )
+    guard.set_client_bandwidth(client, settings_write_enabled, target="10.0.0.77", max_limit="5M/5M", confirm=True)
     guard.add_static_dhcp_lease(
         client, settings_write_enabled, address="10.0.0.88", mac_address="AA:BB:CC:DD:EE:99", confirm=True
     )
-    guard.add_to_address_list(
-        client, settings_write_enabled, list_name="watch", address="10.0.0.61", confirm=True
-    )
+    guard.add_to_address_list(client, settings_write_enabled, list_name="watch", address="10.0.0.61", confirm=True)
     guard.remove_from_address_list(
         client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=True
     )
@@ -204,12 +196,8 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     guard.set_route_distance(
         client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", distance=5, confirm=True
     )
-    guard.disable_route(
-        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
-    )
-    guard.enable_route(
-        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
-    )
+    guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
+    guard.enable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
     guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
     guard.remove_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
     guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
@@ -254,9 +242,7 @@ def test_dynamic_dispatch_journal_uses_resolved_operation_on_success(
 ):
     fake_connection._data[("interface", "wireless")] = [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]
 
-    guard.set_wifi_ssid(
-        client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True
-    )
+    guard.set_wifi_ssid(client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
 
     events = _events(audit_log)
     assert len(events) == 1
@@ -271,9 +257,7 @@ def test_dynamic_dispatch_journal_uses_anchor_operation_on_error(
     the error happens before dispatch resolves which of the two candidate
     operations applies, so the anchor ("set_wifi_ssid_ros7") is reported."""
     with pytest.raises(ResourceNotFoundError):
-        guard.set_wifi_ssid(
-            client, settings_write_enabled, interface_name="ghost-radio", new_ssid="x", confirm=True
-        )
+        guard.set_wifi_ssid(client, settings_write_enabled, interface_name="ghost-radio", new_ssid="x", confirm=True)
 
     events = _events(audit_log)
     assert len(events) == 1
@@ -651,7 +635,9 @@ def test_add_static_dns_duplicate_journals_outcome_error(
     guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
 
     with pytest.raises(ResourceAlreadyExistsError):
-        guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="1.2.3.4", confirm=True)
+        guard.add_static_dns(
+            client, settings_write_enabled, name="blocked.example.com", address="1.2.3.4", confirm=True
+        )
 
     events = _events(audit_log)
     assert len(events) == 2
@@ -911,9 +897,7 @@ def test_add_wireguard_interface_confirmed_call_never_leaks_private_key_into_jou
     audit journal's `before` OR `after`, even though guard.py had to re-read
     the freshly created row (which genuinely carries it) to report the
     public-key."""
-    applied = guard.add_wireguard_interface(
-        client, settings_write_enabled, name="wg-audit-test", confirm=True
-    )
+    applied = guard.add_wireguard_interface(client, settings_write_enabled, name="wg-audit-test", confirm=True)
     assert "public-key" in applied.after
     assert "private-key" not in applied.after
 
@@ -1053,7 +1037,11 @@ def test_remove_wireguard_peer_not_found_journals_outcome_error(
 ):
     with pytest.raises(ResourceNotFoundError):
         guard.remove_wireguard_peer(
-            client, settings_write_enabled, interface="wg1", public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=", confirm=True
+            client,
+            settings_write_enabled,
+            interface="wg1",
+            public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
+            confirm=True,
         )
 
     events = _events(audit_log)
@@ -1068,9 +1056,7 @@ def test_remove_wireguard_peer_not_found_journals_outcome_error(
 def test_add_hotspot_user_confirmed_call_journals_outcome_applied(
     audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
 ):
-    guard.add_hotspot_user(
-        client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True
-    )
+    guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
 
     events = _events(audit_log)
     assert len(events) == 1
@@ -1133,9 +1119,7 @@ def test_add_hotspot_user_duplicate_journals_outcome_error(
 ):
     guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
     with pytest.raises(ResourceAlreadyExistsError):
-        guard.add_hotspot_user(
-            client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True
-        )
+        guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True)
 
     events = _events(audit_log)
     assert len(events) == 2

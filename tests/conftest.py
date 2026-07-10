@@ -27,9 +27,7 @@ def fake_connection() -> FakeConnection:
     return FakeConnection(
         data={
             ("system", "identity"): [{"name": "MikroTik"}],
-            ("system", "resource"): [
-                {"board-name": "hAP ac2", "version": "7.21", "uptime": "3d5h"}
-            ],
+            ("system", "resource"): [{"board-name": "hAP ac2", "version": "7.21", "uptime": "3d5h"}],
             ("interface",): [
                 {".id": "*1", "name": "ether1", "disabled": "false"},
                 {".id": "*2", "name": "ether2", "disabled": "true"},
@@ -52,9 +50,7 @@ def fake_connection() -> FakeConnection:
                     "comment": "",
                 }
             ],
-            ("ip", "dns", "cache"): [
-                {"name": "example.com", "type": "A", "data": "93.184.216.34", "ttl": "1h"}
-            ],
+            ("ip", "dns", "cache"): [{"name": "example.com", "type": "A", "data": "93.184.216.34", "ttl": "1h"}],
             ("ip", "firewall", "filter"): [
                 {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established"},
                 # v0.11: a pre-created, disabled rule an admin left ready for
@@ -143,9 +139,7 @@ def fake_connection() -> FakeConnection:
                     "disabled": "false",
                 }
             ],
-            ("ip", "pool"): [
-                {".id": "*1", "name": "dhcp-pool", "ranges": "10.0.0.100-10.0.0.200"}
-            ],
+            ("ip", "pool"): [{".id": "*1", "name": "dhcp-pool", "ranges": "10.0.0.100-10.0.0.200"}],
             # v0.6: physical layer / PoE - a CRS318-16P-2S+-like mix of
             # PoE-capable ethernet ports (ether1: high/48V, ether2: low/24V)
             # and a non-PoE-capable one (sfp1: no `poe-out` field at all,
@@ -290,7 +284,7 @@ def fake_connection() -> FakeConnection:
                     "interval": "10s",
                     "since": "jan/01/2030 00:00:00",
                     "up-script": "",
-                    "down-script": ":log warning \"gw down\"",
+                    "down-script": ':log warning "gw down"',
                     "comment": "primary gateway",
                     "disabled": "false",
                 }
@@ -311,7 +305,12 @@ def fake_connection() -> FakeConnection:
             # filtering can be exercised against the shared fixture too, not
             # just a dedicated FakeConnection.
             ("file",): [
-                {".id": "*1", "name": "core-switch-2026-01-01.backup", "size": "524288", "creation-time": "jan/01/2026 00:00:00"},
+                {
+                    ".id": "*1",
+                    "name": "core-switch-2026-01-01.backup",
+                    "size": "524288",
+                    "creation-time": "jan/01/2026 00:00:00",
+                },
                 {".id": "*2", "name": "flash/skins", "type": "directory"},
             ],
         },
@@ -360,7 +359,13 @@ def fake_connection() -> FakeConnection:
         },
         torch_replies={
             "ether1": [
-                {"src-address": "10.0.0.50", "dst-address": "93.184.216.34", "protocol": "tcp", "tx": "500000", "rx": "1500000"},
+                {
+                    "src-address": "10.0.0.50",
+                    "dst-address": "93.184.216.34",
+                    "protocol": "tcp",
+                    "tx": "500000",
+                    "rx": "1500000",
+                },
                 {"src-address": "10.0.0.60", "dst-address": "8.8.8.8", "protocol": "udp", "tx": "1000", "rx": "2000"},
             ],
         },

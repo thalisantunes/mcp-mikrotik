@@ -17,7 +17,7 @@ from mcp_mikrotik.config import Device, Settings
 from mcp_mikrotik.exceptions import DeviceCommandError
 from mcp_mikrotik.server import _resolve_log_level, build_server
 
-from .fakes import FakeConnection, FakePath, RaisingConnection
+from .fakes import FakeConnection, FakePath, RaisingConnection, TransportErrorConnection
 
 EXPECTED_TOOLS = {
     "list_devices",
@@ -110,6 +110,25 @@ async def test_all_expected_tools_are_registered(settings: Settings):
 
 
 @pytest.mark.asyncio
+async def test_lifespan_closes_every_pooled_client_on_shutdown(settings: Settings, fake_connection: FakeConnection):
+    """build_server's lifespan hook must close every pooled MikrotikClient
+    (N2+N3 - see client.ClientPool's docstring) when the MCP session ends,
+    not leak sockets until GC. Drives the actual FastMCP lifespan protocol
+    (not just ClientPool.close_all() directly) to prove the hook is wired
+    up, not just that the method it calls works in isolation."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+
+    # Populate the pool with one client by making a normal tool call first.
+    await mcp.call_tool("system_info", {"device_name": "core-switch"})
+    assert fake_connection.closed is False
+
+    async with mcp._mcp_server.lifespan(mcp._mcp_server):
+        pass
+
+    assert fake_connection.closed is True
+
+
+@pytest.mark.asyncio
 async def test_list_devices_never_exposes_password(settings: Settings):
     mcp = build_server(settings=settings, client_factory=lambda s, n: None)
     _content, result = await mcp.call_tool("list_devices", {})
@@ -132,11 +151,23 @@ async def test_interfaces_filters_disabled_by_default(settings: Settings, fake_c
     names = {row["name"] for row in result["result"]}
     assert names == {"ether1"}
 
-    _content, result_all = await mcp.call_tool(
-        "interfaces", {"device_name": "core-switch", "include_disabled": True}
-    )
+    _content, result_all = await mcp.call_tool("interfaces", {"device_name": "core-switch", "include_disabled": True})
     names_all = {row["name"] for row in result_all["result"]}
     assert names_all == {"ether1", "ether2"}
+
+
+@pytest.mark.asyncio
+async def test_ip_addresses_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ip_addresses", {"device_name": "core-switch"})
+    assert result["result"][0]["address"] == "10.0.0.1/24"
+
+
+@pytest.mark.asyncio
+async def test_neighbors_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("neighbors", {"device_name": "core-switch"})
+    assert result["result"][0]["identity"] == "ap-1"
 
 
 @pytest.mark.asyncio
@@ -295,9 +326,7 @@ async def test_wireguard_peers_never_exposes_private_key(settings: Settings):
 
 @pytest.mark.asyncio
 async def test_wireguard_peers_returns_empty_when_no_wireguard(settings: Settings):
-    fake = FakeConnection(
-        raise_for={("interface", "wireguard", "peers"): LibRouterosError("no such command")}
-    )
+    fake = FakeConnection(raise_for={("interface", "wireguard", "peers"): LibRouterosError("no such command")})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("wireguard_peers", {"device_name": "core-switch"})
     assert result["result"] == []
@@ -475,6 +504,19 @@ async def test_netwatch_returns_empty_when_no_entries(settings: Settings):
 
 
 @pytest.mark.asyncio
+async def test_netwatch_returns_empty_when_device_has_no_netwatch_package(settings: Settings):
+    """Distinct from the "zero entries configured" case above: here the
+    /tool/netwatch menu itself is unreadable (DeviceCommandError), which
+    must degrade to an empty list rather than propagate as an error - same
+    convention as poe_status/system_health/lte_status for optional
+    hardware/packages."""
+    fake = FakeConnection(raise_for={("tool", "netwatch"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("netwatch", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
 async def test_unknown_device_returns_clean_error_not_a_crash(settings: Settings):
     mcp = build_server(settings=settings, client_factory=lambda s, n: s.get_device(n))
     with pytest.raises(ToolError) as exc_info:
@@ -558,9 +600,7 @@ async def test_traceroute_rejects_non_positive_count(settings: Settings, fake_co
 async def test_set_identity_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True}
-        )
+        await mcp.call_tool("set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True})
     assert "read-only" in str(exc_info.value)
     # Device was never touched.
     assert fake_connection.path("system", "identity")._rows == [{"name": "MikroTik"}]
@@ -626,9 +666,7 @@ async def test_bridge_hosts_happy_path(settings: Settings, fake_connection: Fake
 @pytest.mark.asyncio
 async def test_interface_traffic_happy_path(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
-    _content, result = await mcp.call_tool(
-        "interface_traffic", {"device_name": "core-switch", "interface": "ether1"}
-    )
+    _content, result = await mcp.call_tool("interface_traffic", {"device_name": "core-switch", "interface": "ether1"})
     # A dict-returning tool's structured content is the dict itself - not
     # wrapped under a "result" key (that wrapping only applies to
     # list-returning tools; see e.g. set_identity's `preview["applied"]`).
@@ -637,14 +675,10 @@ async def test_interface_traffic_happy_path(settings: Settings, fake_connection:
 
 
 @pytest.mark.asyncio
-async def test_interface_traffic_does_not_require_write_enabled(
-    settings: Settings, fake_connection: FakeConnection
-):
+async def test_interface_traffic_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
     assert settings.allow_write is False
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
-    _content, result = await mcp.call_tool(
-        "interface_traffic", {"device_name": "core-switch", "interface": "ether1"}
-    )
+    _content, result = await mcp.call_tool("interface_traffic", {"device_name": "core-switch", "interface": "ether1"})
     assert result
 
 
@@ -655,9 +689,7 @@ async def test_interface_traffic_rejects_invalid_interface_name_before_touching_
         client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
     )
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "interface_traffic", {"device_name": "core-switch", "interface": "ether1; reboot"}
-        )
+        await mcp.call_tool("interface_traffic", {"device_name": "core-switch", "interface": "ether1; reboot"})
     assert "not valid" in str(exc_info.value)
 
 
@@ -765,9 +797,21 @@ async def test_lte_status_returns_empty_dict_for_device_with_no_lte(settings: Se
     """A device with no LTE hardware/package raises DeviceCommandError from
     the monitor-once call - lte_status must return an empty dict instead of
     propagating that as an error, same convention as poe_status/
-    system_health for optional hardware."""
-    fake = FakeConnection(raise_for={("interface", "lte"): LibRouterosError("no such command")})
-    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    system_health for optional hardware.
+
+    lte_monitor's read goes through the connection's CALLABLE form
+    (connection("/interface/lte/monitor", ...)), not .path() - so
+    FakeConnection's path-keyed `raise_for` can't intercept it (an empty
+    `lte_monitor_replies` mapping already yields {} "for free", without ever
+    exercising server.py's own except DeviceCommandError branch).
+    TransportErrorConnection raises on every operation, including the
+    callable form, so it genuinely exercises that branch."""
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(
+            s.get_device(n), connection=TransportErrorConnection(LibRouterosError("no such command"))
+        ),
+    )
     _content, result = await mcp.call_tool("lte_status", {"device_name": "core-switch", "interface": "lte1"})
     assert result == {}
 
@@ -932,9 +976,7 @@ async def test_disable_interface_preview_then_confirm(device: Device, fake_conne
 
 
 @pytest.mark.asyncio
-async def test_enable_interface_unknown_interface_raises_clear_error(
-    device: Device, fake_connection: FakeConnection
-):
+async def test_enable_interface_unknown_interface_raises_clear_error(device: Device, fake_connection: FakeConnection):
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
@@ -1424,9 +1466,7 @@ async def test_start_container_unknown_container_raises_clear_error(device: Devi
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_containers_factory(fake))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "start_container", {"device_name": "core-switch", "container": "ghost", "confirm": True}
-        )
+        await mcp.call_tool("start_container", {"device_name": "core-switch", "container": "ghost", "confirm": True})
     assert "ghost" in str(exc_info.value)
 
 
@@ -1453,7 +1493,13 @@ async def test_set_route_distance_blocked_read_only_by_default(settings: Setting
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
             "set_route_distance",
-            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+            {
+                "device_name": "core-switch",
+                "dst_address": "0.0.0.0/0",
+                "gateway": "10.0.0.254",
+                "distance": 5,
+                "confirm": True,
+            },
         )
     assert "read-only" in str(exc_info.value)
     assert "distance" not in fake_connection.path("ip", "route")._rows[0]
@@ -1466,7 +1512,13 @@ async def test_set_route_distance_preview_then_confirm(device: Device, fake_conn
 
     _content, preview = await mcp.call_tool(
         "set_route_distance",
-        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": False},
+        {
+            "device_name": "core-switch",
+            "dst_address": "0.0.0.0/0",
+            "gateway": "10.0.0.254",
+            "distance": 5,
+            "confirm": False,
+        },
     )
     assert preview["applied"] is False
     assert preview["after"]["distance"] == "5"
@@ -1474,7 +1526,13 @@ async def test_set_route_distance_preview_then_confirm(device: Device, fake_conn
 
     _content, applied = await mcp.call_tool(
         "set_route_distance",
-        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+        {
+            "device_name": "core-switch",
+            "dst_address": "0.0.0.0/0",
+            "gateway": "10.0.0.254",
+            "distance": 5,
+            "confirm": True,
+        },
     )
     assert applied["applied"] is True
     assert fake_connection.path("ip", "route")._rows[0]["distance"] == "5"
@@ -1487,7 +1545,13 @@ async def test_set_route_distance_unknown_route_raises_clear_error(device: Devic
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
             "set_route_distance",
-            {"device_name": "core-switch", "dst_address": "10.10.10.0/24", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+            {
+                "device_name": "core-switch",
+                "dst_address": "10.10.10.0/24",
+                "gateway": "10.0.0.254",
+                "distance": 5,
+                "confirm": True,
+            },
         )
     assert "10.10.10.0/24" in str(exc_info.value)
 
@@ -1507,7 +1571,13 @@ async def test_set_route_distance_ambiguous_route_raises_clear_error(device: Dev
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
             "set_route_distance",
-            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 5, "confirm": True},
+            {
+                "device_name": "core-switch",
+                "dst_address": "0.0.0.0/0",
+                "gateway": "10.0.0.254",
+                "distance": 5,
+                "confirm": True,
+            },
         )
     assert "ambiguous" in str(exc_info.value).lower()
 
@@ -1522,7 +1592,13 @@ async def test_set_route_distance_rejects_invalid_distance_before_touching_devic
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
             "set_route_distance",
-            {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.254", "distance": 999, "confirm": True},
+            {
+                "device_name": "core-switch",
+                "dst_address": "0.0.0.0/0",
+                "gateway": "10.0.0.254",
+                "distance": 999,
+                "confirm": True,
+            },
         )
     assert "1-255" in str(exc_info.value) or "out of range" in str(exc_info.value)
 
@@ -1681,9 +1757,7 @@ async def test_add_netwatch_rejects_invalid_host_before_touching_device(settings
         client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
     )
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "add_netwatch", {"device_name": "core-switch", "host": "not-an-ip", "confirm": True}
-        )
+        await mcp.call_tool("add_netwatch", {"device_name": "core-switch", "host": "not-an-ip", "confirm": True})
     assert "not a valid" in str(exc_info.value)
 
 
@@ -1748,7 +1822,8 @@ async def test_add_static_dns_blocked_read_only_by_default(settings: Settings, f
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
-            "add_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True}
+            "add_static_dns",
+            {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True},
         )
     assert "read-only" in str(exc_info.value)
     names = {row["name"] for row in fake_connection.path("ip", "dns", "static")._rows}
@@ -1804,7 +1879,8 @@ async def test_add_static_dns_rejects_duplicate_name_and_type(device: Device, fa
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
     await mcp.call_tool(
-        "add_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True}
+        "add_static_dns",
+        {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True},
     )
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
@@ -1823,24 +1899,35 @@ async def test_add_static_dns_rejects_invalid_name_before_touching_device(settin
     )
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
-            "add_static_dns", {"device_name": "core-switch", "name": "not a host", "address": "0.0.0.0", "confirm": True}
+            "add_static_dns",
+            {"device_name": "core-switch", "name": "not a host", "address": "0.0.0.0", "confirm": True},
         )
     assert "not a valid" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_remove_static_dns_blocked_read_only_by_default(device: Device):
-    fake = FakeConnection(data={("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]})
+    fake = FakeConnection(
+        data={
+            ("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]
+        }
+    )
     settings = Settings(allow_write=False, devices={device.name: device})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "confirm": True})
+        await mcp.call_tool(
+            "remove_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "confirm": True}
+        )
     assert "read-only" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_remove_static_dns_preview_then_confirm(device: Device):
-    fake = FakeConnection(data={("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]})
+    fake = FakeConnection(
+        data={
+            ("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]
+        }
+    )
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake))
 
@@ -1864,7 +1951,9 @@ async def test_remove_static_dns_unknown_name_raises_clear_error(device: Device,
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "ghost.example.com", "confirm": True})
+        await mcp.call_tool(
+            "remove_static_dns", {"device_name": "core-switch", "name": "ghost.example.com", "confirm": True}
+        )
     assert "ghost.example.com" in str(exc_info.value)
 
 
@@ -1881,7 +1970,9 @@ async def test_remove_static_dns_ambiguous_without_record_type_raises_clear_erro
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "roundrobin.example.com", "confirm": True})
+        await mcp.call_tool(
+            "remove_static_dns", {"device_name": "core-switch", "name": "roundrobin.example.com", "confirm": True}
+        )
     assert "ambiguous" in str(exc_info.value).lower()
 
 
@@ -1932,7 +2023,9 @@ async def test_remove_dhcp_lease_blocked_read_only_by_default(device: Device):
     settings = Settings(allow_write=False, devices={device.name: device})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool("remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": True})
+        await mcp.call_tool(
+            "remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": True}
+        )
     assert "read-only" in str(exc_info.value)
 
 
@@ -1976,7 +2069,9 @@ async def test_remove_dhcp_lease_unknown_raises_clear_error(device: Device):
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool("remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:99", "confirm": True})
+        await mcp.call_tool(
+            "remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:99", "confirm": True}
+        )
     assert "AA:BB:CC:DD:EE:99" in str(exc_info.value)
 
 
@@ -1998,7 +2093,8 @@ async def test_wake_on_lan_blocked_read_only_by_default(settings: Settings, fake
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
-            "wake_on_lan", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1", "confirm": True}
+            "wake_on_lan",
+            {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1", "confirm": True},
         )
     assert "read-only" in str(exc_info.value)
 
@@ -2032,7 +2128,8 @@ async def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings: 
     )
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool(
-            "wake_on_lan", {"device_name": "core-switch", "mac_address": "not-a-mac", "interface": "ether1", "confirm": True}
+            "wake_on_lan",
+            {"device_name": "core-switch", "mac_address": "not-a-mac", "interface": "ether1", "confirm": True},
         )
     assert "not valid" in str(exc_info.value)
 
@@ -2046,9 +2143,7 @@ async def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings: 
 
 
 @pytest.mark.asyncio
-async def test_connection_tracking_requires_at_least_one_filter(
-    settings: Settings, fake_connection: FakeConnection
-):
+async def test_connection_tracking_requires_at_least_one_filter(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("connection_tracking", {"device_name": "core-switch"})
@@ -2060,9 +2155,7 @@ async def test_connection_tracking_not_gated_by_read_only(settings: Settings, fa
     """Read-only, unlike every write tool - must work with the default
     (allow_write=False) settings fixture."""
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
-    _content, result = await mcp.call_tool(
-        "connection_tracking", {"device_name": "core-switch", "protocol": "tcp"}
-    )
+    _content, result = await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "protocol": "tcp"})
     assert result["total_matched"] == 1
 
 
@@ -2095,9 +2188,7 @@ async def test_connection_tracking_filters_by_dst_address(settings: Settings, fa
 @pytest.mark.asyncio
 async def test_connection_tracking_filters_by_dst_port(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
-    _content, result = await mcp.call_tool(
-        "connection_tracking", {"device_name": "core-switch", "dst_port": 53}
-    )
+    _content, result = await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "dst_port": 53})
     assert result["total_matched"] == 1
     assert result["connections"][0]["dst-address"] == "8.8.8.8"
 
@@ -2107,9 +2198,7 @@ async def test_connection_tracking_filters_by_protocol_only_returns_matches(
     settings: Settings, fake_connection: FakeConnection
 ):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
-    _content, result = await mcp.call_tool(
-        "connection_tracking", {"device_name": "core-switch", "protocol": "udp"}
-    )
+    _content, result = await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "protocol": "udp"})
     assert result["total_matched"] == 1
     assert result["connections"][0]["src-address"] == "10.0.0.60"
     assert result["truncated"] is False
@@ -2143,9 +2232,7 @@ async def test_connection_tracking_truncates_and_signals_it(device: Device):
     settings = Settings(allow_write=False, devices={device.name: device})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
 
-    _content, result = await mcp.call_tool(
-        "connection_tracking", {"device_name": "core-switch", "protocol": "tcp"}
-    )
+    _content, result = await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "protocol": "tcp"})
     assert result["total_matched"] == 150
     assert len(result["connections"]) == 100
     assert result["truncated"] is True
@@ -2163,9 +2250,7 @@ async def test_connection_tracking_rejects_invalid_dst_port(settings: Settings, 
 async def test_connection_tracking_rejects_invalid_src_address(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "connection_tracking", {"device_name": "core-switch", "src_address": "not-an-ip"}
-        )
+        await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "src_address": "not-an-ip"})
     assert "not a valid" in str(exc_info.value)
 
 
@@ -2204,9 +2289,7 @@ async def test_connection_tracking_handles_bracketed_ipv6_and_portless_addresses
     assert entry["src-address"] == "2001:db8::1"
     assert entry["src-port"] == "443"
 
-    _content, result = await mcp.call_tool(
-        "connection_tracking", {"device_name": "core-switch", "protocol": "icmp"}
-    )
+    _content, result = await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "protocol": "icmp"})
     assert result["total_matched"] == 1
     entry = result["connections"][0]
     assert entry["src-address"] == "10.0.0.5"
@@ -2341,7 +2424,9 @@ _REMOTE_PEER_PUBKEY_2 = "idtcei5gRabTeh7XqgAXUdSWE5+QsiES7xHooeHonO8="
 
 
 @pytest.mark.asyncio
-async def test_add_wireguard_interface_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+async def test_add_wireguard_interface_blocked_read_only_by_default(
+    settings: Settings, fake_connection: FakeConnection
+):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("add_wireguard_interface", {"device_name": "core-switch", "name": "wg2", "confirm": True})
@@ -2380,9 +2465,7 @@ async def test_add_wireguard_interface_rejects_duplicate_name(device: Device, fa
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "add_wireguard_interface", {"device_name": "core-switch", "name": "wg1", "confirm": True}
-        )
+        await mcp.call_tool("add_wireguard_interface", {"device_name": "core-switch", "name": "wg1", "confirm": True})
     assert "wg1" in str(exc_info.value)
     assert len(fake_connection.path("interface", "wireguard")._rows) == 1
 
@@ -2536,7 +2619,11 @@ async def test_add_wireguard_peer_rejects_duplicate_public_key_on_same_interface
             },
         )
     assert _REMOTE_PEER_PUBKEY_1 in str(exc_info.value)
-    peers = [row for row in fake_connection.path("interface", "wireguard", "peers")._rows if row.get("public-key") == _REMOTE_PEER_PUBKEY_1]
+    peers = [
+        row
+        for row in fake_connection.path("interface", "wireguard", "peers")._rows
+        if row.get("public-key") == _REMOTE_PEER_PUBKEY_1
+    ]
     assert len(peers) == 1
 
 
@@ -2798,9 +2885,7 @@ async def test_security_events_not_gated_by_read_only(settings: Settings, device
 
 @pytest.mark.asyncio
 async def test_security_events_default_limit_and_ordering(device: Device):
-    rows = [
-        {".id": f"*{i}", "topics": "system,info,account", "message": f"login {i}"} for i in range(5)
-    ]
+    rows = [{".id": f"*{i}", "topics": "system,info,account", "message": f"login {i}"} for i in range(5)]
     fake = FakeConnection(data={("log",): rows})
     settings = Settings(allow_write=False, devices={device.name: device})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
@@ -2840,6 +2925,25 @@ async def test_list_write_operations_does_not_require_write_enabled(settings: Se
 
 
 # --- R3: limit/count <= 0 must raise a validation error, not clamp -------
+
+
+@pytest.mark.asyncio
+async def test_logs_happy_path_returns_most_recent_entries_up_to_limit(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("logs", {"device_name": "core-switch", "limit": 1})
+    # fake_connection's ("log",) fixture has 2 rows - limit=1 keeps the most
+    # recent one only.
+    assert len(result["result"]) == 1
+    assert result["result"][0]["message"] == "ether1 up"
+
+
+@pytest.mark.asyncio
+async def test_logs_filters_by_topics_substring(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("logs", {"device_name": "core-switch", "topics": "interface"})
+    assert [row["message"] for row in result["result"]] == ["ether1 up"]
 
 
 @pytest.mark.asyncio
@@ -2983,9 +3087,7 @@ async def test_blocked_write_tool_call_still_journals_an_error(
 
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError):
-        await mcp.call_tool(
-            "set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True}
-        )
+        await mcp.call_tool("set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True})
 
     lines = log_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
@@ -3005,9 +3107,8 @@ async def test_unhandled_error_log_line_is_prefixed_with_a_correlation_id(
 
     mcp = build_server(settings=settings, client_factory=_broken_factory)
 
-    with caplog.at_level("ERROR", logger="mcp_mikrotik"):
-        with pytest.raises(ToolError):
-            await mcp.call_tool("system_info", {"device_name": "core-switch"})
+    with caplog.at_level("ERROR", logger="mcp_mikrotik"), pytest.raises(ToolError):
+        await mcp.call_tool("system_info", {"device_name": "core-switch"})
 
     matches = [r for r in caplog.records if "Unhandled error in tool system_info" in r.message]
     assert len(matches) == 1
@@ -3028,9 +3129,7 @@ async def test_hotspot_active_happy_path(settings: Settings, fake_connection: Fa
 
 
 @pytest.mark.asyncio
-async def test_hotspot_active_does_not_require_write_enabled(
-    settings: Settings, fake_connection: FakeConnection
-):
+async def test_hotspot_active_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
     assert settings.allow_write is False
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("hotspot_active", {"device_name": "core-switch"})
@@ -3043,16 +3142,18 @@ async def test_hotspot_active_returns_empty_list_for_device_with_no_hotspot(sett
     DeviceCommandError from client.path() - treated the same as "no active
     sessions here" rather than a hard failure, same convention as
     ppp_active/ipsec_active_peers."""
-    fake = FakeConnection(raise_for={("ip", "hotspot", "active"): DeviceCommandError("core-switch", "ip/hotspot/active", "no such command")})
+    fake = FakeConnection(
+        raise_for={
+            ("ip", "hotspot", "active"): DeviceCommandError("core-switch", "ip/hotspot/active", "no such command")
+        }
+    )
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("hotspot_active", {"device_name": "core-switch"})
     assert result["result"] == []
 
 
 @pytest.mark.asyncio
-async def test_torch_happy_path_sorts_by_traffic_volume_descending(
-    settings: Settings, fake_connection: FakeConnection
-):
+async def test_torch_happy_path_sorts_by_traffic_volume_descending(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
     # Fixture's ether1 torch data: flow 1 has tx=500000+rx=1500000=2,000,000;
@@ -3079,6 +3180,28 @@ async def test_torch_returns_empty_flows_for_interface_with_no_traffic(
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether2"})
     assert result == {"flows": [], "total_matched": 0, "truncated": False}
+
+
+@pytest.mark.asyncio
+async def test_torch_treats_unparseable_tx_rx_as_zero_instead_of_failing(settings: Settings):
+    """RouterOS's own torch field names/types for a flow's traffic volume
+    aren't perfectly uniform - a flow whose tx/rx can't be parsed as an int
+    must sort last (treated as 0 traffic), not blow up the whole call."""
+    fake = FakeConnection(
+        torch_replies={
+            "ether1": [
+                {"src-address": "10.0.0.70", "tx": "not-a-number", "rx": None},
+                {"src-address": "10.0.0.50", "tx": "500000", "rx": "1500000"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
+    assert result["total_matched"] == 2
+    # The well-formed, higher-traffic flow sorts first; the unparseable one
+    # is treated as 0 traffic and sorts last, not dropped or erroring out.
+    assert result["flows"][0]["src-address"] == "10.0.0.50"
+    assert result["flows"][1]["src-address"] == "10.0.0.70"
 
 
 @pytest.mark.asyncio
@@ -3120,9 +3243,7 @@ async def test_torch_sends_optional_filters_and_once_flag_as_structured_params(s
 @pytest.mark.asyncio
 async def test_torch_caps_results_at_max_torch_limit_and_sets_truncated(settings: Settings):
     fake = FakeConnection(
-        torch_replies={
-            "ether1": [{"src-address": f"10.0.0.{i}", "tx": str(i), "rx": "0"} for i in range(60)]
-        }
+        torch_replies={"ether1": [{"src-address": f"10.0.0.{i}", "tx": str(i), "rx": "0"} for i in range(60)]}
     )
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
@@ -3134,9 +3255,7 @@ async def test_torch_caps_results_at_max_torch_limit_and_sets_truncated(settings
 
 
 @pytest.mark.asyncio
-async def test_list_backups_happy_path_filters_to_backup_files(
-    settings: Settings, fake_connection: FakeConnection
-):
+async def test_list_backups_happy_path_filters_to_backup_files(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("list_backups", {"device_name": "core-switch"})
     names = {row["name"] for row in result["result"]}
@@ -3259,9 +3378,7 @@ async def test_add_hotspot_user_password_in_result_but_never_in_audit_journal(
 async def test_create_backup_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     with pytest.raises(ToolError) as exc_info:
-        await mcp.call_tool(
-            "create_backup", {"device_name": "core-switch", "name": "nightly-backup", "confirm": True}
-        )
+        await mcp.call_tool("create_backup", {"device_name": "core-switch", "name": "nightly-backup", "confirm": True})
     assert "read-only" in str(exc_info.value)
 
 
@@ -3324,7 +3441,10 @@ async def test_create_backup_password_never_in_result_or_audit_journal(
     )
     assert "password" not in applied["after"]
     assert "file-encrypt-key" not in str(applied)
-    assert ("/system/backup/save", {"name": "encrypted-backup", "password": "file-encrypt-key"}) in fake_connection.calls
+    assert (
+        "/system/backup/save",
+        {"name": "encrypted-backup", "password": "file-encrypt-key"},
+    ) in fake_connection.calls
 
     raw = log_path.read_text(encoding="utf-8")
     assert "file-encrypt-key" not in raw

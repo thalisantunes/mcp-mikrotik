@@ -254,7 +254,6 @@ def validate_timeout(value: str, field_name: str = "timeout") -> str:
     )
 
 
-
 # --- v0.6: physical layer / PoE ------------------------------------------
 
 # RouterOS interface name: letters/digits plus '.', '_', '-' (covers real
@@ -492,9 +491,7 @@ def validate_dns_record_type(value: str) -> str:
 
     normalized = value.strip().upper()
     if normalized not in _DNS_RECORD_TYPES:
-        raise ValidationError(
-            f"DNS record type {value!r} is not valid (expected one of {_DNS_RECORD_TYPES})."
-        )
+        raise ValidationError(f"DNS record type {value!r} is not valid (expected one of {_DNS_RECORD_TYPES}).")
     return normalized
 
 

@@ -6,11 +6,18 @@ import pytest
 from librouteros.exceptions import LibRouterosError
 
 from mcp_mikrotik.client import (
+    DEFAULT_BREAKER_COOLDOWN,
+    DEFAULT_BREAKER_THRESHOLD,
+    DEFAULT_READ_RETRIES,
     DEFAULT_TIMEOUT,
     ClientPool,
     MikrotikClient,
+    _breaker_cooldown,
+    _breaker_threshold,
     _build_ssl_context,
     _connect,
+    _read_retries,
+    _read_retry_delay,
     _resolve_timeout,
     get_client,
 )
@@ -40,9 +47,7 @@ def test_update_mutates_underlying_data(client: MikrotikClient, fake_connection:
     assert fake_connection.path("system", "identity")._rows == [{"name": "renamed"}]
 
 
-def test_ping_forwards_structured_params_not_a_command_string(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_ping_forwards_structured_params_not_a_command_string(client: MikrotikClient, fake_connection: FakeConnection):
     replies = client.ping("8.8.8.8", count=2)
     assert replies == [
         {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
@@ -76,9 +81,7 @@ def test_poe_monitor_forwards_structured_params_not_a_command_string(
     reply = client.poe_monitor("ether1")
     assert reply["poe-out-status"] == "powered-on"
     assert reply["poe-out-voltage"] == "48.0"
-    assert fake_connection.calls == [
-        ("/interface/ethernet/poe/monitor", {"interface": "ether1", "once": ""})
-    ]
+    assert fake_connection.calls == [("/interface/ethernet/poe/monitor", {"interface": "ether1", "once": ""})]
 
 
 def test_poe_monitor_returns_empty_dict_when_device_replies_nothing(
@@ -126,18 +129,14 @@ def test_lte_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
 # --- v0.14: torch (live traffic snapshot - a MULTI-row "once" command) -----
 
 
-def test_torch_forwards_structured_params_not_a_command_string(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_torch_forwards_structured_params_not_a_command_string(client: MikrotikClient, fake_connection: FakeConnection):
     rows = client.torch("ether1")
     assert len(rows) == 2
     assert rows[0]["src-address"] == "10.0.0.50"
     assert fake_connection.calls == [("/tool/torch", {"interface": "ether1", "once": ""})]
 
 
-def test_torch_sends_optional_filters_as_structured_params(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_torch_sends_optional_filters_as_structured_params(client: MikrotikClient, fake_connection: FakeConnection):
     client.torch("ether1", src_address="10.0.0.50", dst_address="8.8.8.8", port=443)
     assert fake_connection.calls == [
         (
@@ -161,9 +160,7 @@ def test_torch_omits_filters_that_were_not_given(client: MikrotikClient, fake_co
     assert "port" not in kwargs
 
 
-def test_torch_returns_empty_list_when_device_replies_nothing(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_torch_returns_empty_list_when_device_replies_nothing(client: MikrotikClient, fake_connection: FakeConnection):
     assert client.torch("ether2") == []
 
 
@@ -253,9 +250,7 @@ def test_monitor_once_methods_handle_a_non_empty_generator_reply(
     "method_name,interface",
     [("monitor_traffic", "sfp1"), ("poe_monitor", "sfp1"), ("lte_monitor", "lte99")],
 )
-def test_monitor_once_methods_handle_an_empty_generator_reply(
-    client: MikrotikClient, method_name: str, interface: str
-):
+def test_monitor_once_methods_handle_an_empty_generator_reply(client: MikrotikClient, method_name: str, interface: str):
     """Empty generator case (device has nothing to report for this
     interface): must not raise TypeError, must return {}."""
     reply = getattr(client, method_name)(interface)
@@ -265,18 +260,14 @@ def test_monitor_once_methods_handle_an_empty_generator_reply(
 # --- v0.7: start/stop (RouterOS ACTION commands, not update/add/remove) ----
 
 
-def test_start_dispatches_as_action_command_with_structured_id(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_start_dispatches_as_action_command_with_structured_id(client: MikrotikClient, fake_connection: FakeConnection):
     fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "stopped"}]
     client.start("container", id="*1")
     rows = fake_connection.path("container")._rows
     assert rows[0]["status"] == "running"
 
 
-def test_stop_dispatches_as_action_command_with_structured_id(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_stop_dispatches_as_action_command_with_structured_id(client: MikrotikClient, fake_connection: FakeConnection):
     fake_connection._data[("container",)] = [{".id": "*1", "name": "grafana", "status": "running"}]
     client.stop("container", id="*1")
     rows = fake_connection.path("container")._rows
@@ -317,13 +308,9 @@ def test_flush_sends_the_fixed_command_string(client: MikrotikClient, fake_conne
     assert fake_connection.calls == [("/ip/dns/cache/flush", {})]
 
 
-def test_wol_forwards_structured_params_not_a_command_string(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_wol_forwards_structured_params_not_a_command_string(client: MikrotikClient, fake_connection: FakeConnection):
     client.wol("tool", mac_address="AA:BB:CC:DD:EE:FF", interface="ether1")
-    assert fake_connection.calls == [
-        ("/tool/wol", {"mac-address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"})
-    ]
+    assert fake_connection.calls == [("/tool/wol", {"mac-address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"})]
 
 
 @pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
@@ -345,18 +332,12 @@ def test_wol_wraps_transport_errors_as_device_command_error(device: Device, exc:
 # --- v0.14: save (RouterOS ACTION command - backup creation, callable form) -
 
 
-def test_save_forwards_structured_params_not_a_command_string(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_save_forwards_structured_params_not_a_command_string(client: MikrotikClient, fake_connection: FakeConnection):
     client.save("system", "backup", name="core-switch-2026-01-01")
-    assert fake_connection.calls == [
-        ("/system/backup/save", {"name": "core-switch-2026-01-01"})
-    ]
+    assert fake_connection.calls == [("/system/backup/save", {"name": "core-switch-2026-01-01"})]
 
 
-def test_save_forwards_password_as_structured_param_when_given(
-    client: MikrotikClient, fake_connection: FakeConnection
-):
+def test_save_forwards_password_as_structured_param_when_given(client: MikrotikClient, fake_connection: FakeConnection):
     client.save("system", "backup", name="core-switch-2026-01-01", password="s3cr3t-file-key")
     assert fake_connection.calls == [
         (
@@ -562,6 +543,12 @@ def test_resolve_timeout_falls_back_to_default(monkeypatch: pytest.MonkeyPatch):
     assert _resolve_timeout(device) == DEFAULT_TIMEOUT
 
 
+def test_resolve_timeout_falls_back_to_default_on_unparseable_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_TIMEOUT", "not-a-number")
+    device = Device(name="d1", host="10.0.0.1")
+    assert _resolve_timeout(device) == DEFAULT_TIMEOUT
+
+
 # --- N2+N3: ClientPool reuses one MikrotikClient per device and closes ---
 # --- every pooled connection deterministically ----------------------------
 
@@ -610,9 +597,7 @@ def test_client_pool_close_all_closes_every_pooled_connection_and_clears_cache(d
 
 
 def test_path_retries_on_transient_oserror_and_succeeds(device: Device):
-    flaky = FlakyConnection(
-        OSError("link blip"), fail_times=1, data={("system", "identity"): [{"name": "MikroTik"}]}
-    )
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1, data={("system", "identity"): [{"name": "MikroTik"}]})
     client = MikrotikClient(device, connection=flaky)
 
     rows = client.path("system", "identity")
@@ -715,6 +700,80 @@ def test_writes_never_retry_on_transient_oserror(device: Device, write_call):
         write_call(client)
 
     assert flaky.calls_made == 1  # writes get exactly one attempt, ever
+
+
+# --- N5: env-var parsing fallbacks (read retries / breaker threshold+cooldown) --
+
+
+def test_read_retries_falls_back_to_default_when_unset(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIKROTIK_READ_RETRIES", raising=False)
+    assert _read_retries() == DEFAULT_READ_RETRIES
+
+
+def test_read_retries_falls_back_to_default_on_unparseable_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "not-a-number")
+    assert _read_retries() == DEFAULT_READ_RETRIES
+
+
+def test_read_retries_negative_env_clamped_to_zero(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "-5")
+    assert _read_retries() == 0
+
+
+def test_breaker_threshold_falls_back_to_default_when_unset(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIKROTIK_BREAKER_THRESHOLD", raising=False)
+    assert _breaker_threshold() == DEFAULT_BREAKER_THRESHOLD
+
+
+def test_breaker_threshold_falls_back_to_default_on_unparseable_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "not-a-number")
+    assert _breaker_threshold() == DEFAULT_BREAKER_THRESHOLD
+
+
+def test_breaker_threshold_falls_back_to_default_on_non_positive_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "0")
+    assert _breaker_threshold() == DEFAULT_BREAKER_THRESHOLD
+
+
+def test_breaker_cooldown_falls_back_to_default_when_unset(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIKROTIK_BREAKER_COOLDOWN", raising=False)
+    assert _breaker_cooldown() == DEFAULT_BREAKER_COOLDOWN
+
+
+def test_breaker_cooldown_falls_back_to_default_on_unparseable_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_COOLDOWN", "not-a-number")
+    assert _breaker_cooldown() == DEFAULT_BREAKER_COOLDOWN
+
+
+def test_breaker_cooldown_falls_back_to_default_on_negative_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_COOLDOWN", "-1")
+    assert _breaker_cooldown() == DEFAULT_BREAKER_COOLDOWN
+
+
+def test_breaker_cooldown_accepts_zero(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_COOLDOWN", "0")
+    assert _breaker_cooldown() == 0.0
+
+
+def test_read_retry_delay_within_schedule():
+    assert _read_retry_delay(0) == 0.5
+    assert _read_retry_delay(1) == 1.0
+
+
+def test_read_retry_delay_reuses_last_delay_past_schedule_length():
+    # MIKROTIK_READ_RETRIES can be set higher than the number of hardcoded
+    # backoff delays - every attempt beyond the schedule reuses the last one
+    # rather than indexing out of range.
+    assert _read_retry_delay(2) == _read_retry_delay(99) == 1.0
+
+
+def test_close_swallows_an_exception_from_the_underlying_connection(device: Device):
+    class RaisingCloseConnection:
+        def close(self) -> None:
+            raise RuntimeError("already gone")
+
+    client = MikrotikClient(device, connection=RaisingCloseConnection())
+    client.close()  # must not raise, even though the underlying close() does
 
 
 # --- v0.5: circuit breaker --------------------------------------------------
@@ -827,9 +886,7 @@ def test_breaker_allows_a_trial_connection_after_cooldown_elapses(device: Device
     assert not isinstance(exc_info.value, CircuitOpenError)
 
 
-def test_breaker_applies_to_writes_too_but_never_skips_a_gate_check(
-    device: Device, monkeypatch: pytest.MonkeyPatch
-):
+def test_breaker_applies_to_writes_too_but_never_skips_a_gate_check(device: Device, monkeypatch: pytest.MonkeyPatch):
     """The breaker fails a write fast once open - but this is purely about
     the CONNECTION step. guard.py's read-only gate + allowlist check
     (guard._require_allowed) always runs first, entirely before

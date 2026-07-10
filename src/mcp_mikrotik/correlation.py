@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from collections.abc import Iterator
 from contextvars import ContextVar
-from typing import Iterator
 
 _current: ContextVar[str | None] = ContextVar("mcp_mikrotik_correlation_id", default=None)
 

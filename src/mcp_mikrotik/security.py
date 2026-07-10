@@ -35,8 +35,9 @@ address restriction, boolean presence checks, counts) - see
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from .client import MikrotikClient
 from .exceptions import DeviceCommandError
@@ -139,10 +140,7 @@ def _check_management_services(client: MikrotikClient) -> list[Finding]:
                         "/ip/service 'winbox' has no 'address' restriction (empty or 0.0.0.0/0) - "
                         "reachable from anywhere that can route to this device."
                     ),
-                    recommendation=(
-                        "Restrict winbox's 'address' field to a known management subnet or VPN "
-                        "range."
-                    ),
+                    recommendation=("Restrict winbox's 'address' field to a known management subnet or VPN range."),
                 )
             )
     return findings
@@ -309,8 +307,7 @@ def _check_routeros_version(client: MikrotikClient) -> list[Finding]:
                 category="routeros-version",
                 title="RouterOS is not on the latest available version",
                 detail=(
-                    f"/system/package/update reports installed version {installed!r}, latest "
-                    f"available {latest!r}."
+                    f"/system/package/update reports installed version {installed!r}, latest available {latest!r}."
                 ),
                 recommendation=(
                     "Review the RouterOS changelog and schedule an update - newer releases "
@@ -489,9 +486,7 @@ def _is_security_event(row: dict[str, Any]) -> bool:
     if any(keyword in topics for keyword in _SECURITY_TOPIC_KEYWORDS):
         return True
     message = (row.get("message") or "").lower()
-    if "system" in topics and "info" in topics and any(keyword in message for keyword in _LOGIN_MESSAGE_KEYWORDS):
-        return True
-    return False
+    return "system" in topics and "info" in topics and any(keyword in message for keyword in _LOGIN_MESSAGE_KEYWORDS)
 
 
 def filter_security_events(rows: Iterable[dict[str, Any]], limit: int) -> list[dict[str, Any]]:

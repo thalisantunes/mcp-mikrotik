@@ -27,9 +27,7 @@ def test_set_identity_blocked_when_write_disabled(client: MikrotikClient, settin
         guard.set_identity(client, settings, new_name="new-name", confirm=True)
 
 
-def test_set_identity_read_only_gate_applies_even_with_confirm_true(
-    device: Device, settings: Settings
-):
+def test_set_identity_read_only_gate_applies_even_with_confirm_true(device: Device, settings: Settings):
     """Read-only gate must block *before* touching the device at all, regardless of confirm."""
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(WriteDisabledError):
@@ -205,9 +203,7 @@ def test_set_wifi_ssid_falls_back_to_ros6_when_ros7_unsupported(settings_write_e
     assert fake.path("interface", "wireless")._rows[0]["ssid"] == "new-ssid"
 
 
-def test_set_wifi_ssid_unknown_interface_raises_resource_not_found(
-    settings_write_enabled: Settings, device: Device
-):
+def test_set_wifi_ssid_unknown_interface_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
     fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]})
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(ResourceNotFoundError) as exc_info:
@@ -229,9 +225,7 @@ def test_set_wifi_ssid_ros7_with_named_configuration_writes_to_configuration_row
     fake = FakeConnection(
         data={
             ("interface", "wifi"): [{".id": "*1", "name": "wifi1", "configuration": "cfg1"}],
-            ("interface", "wifi", "configuration"): [
-                {".id": "*5", "name": "cfg1", "ssid": "old-ssid", "mode": "ap"}
-            ],
+            ("interface", "wifi", "configuration"): [{".id": "*5", "name": "cfg1", "ssid": "old-ssid", "mode": "ap"}],
         }
     )
     client = MikrotikClient(device, connection=fake)
@@ -293,6 +287,26 @@ def test_set_wifi_ssid_ros7_unknown_configuration_name_raises_resource_not_found
     assert fake.path("interface", "wifi", "configuration")._rows[0]["ssid"] == "old-ssid"
 
 
+def test_set_wifi_ssid_ros7_configuration_read_failure_wrapped_with_clear_context(
+    settings_write_enabled: Settings, device: Device
+):
+    """If the interface references a `configuration` name but
+    /interface/wifi/configuration itself can't be read (e.g. a transient
+    device-side failure), the resulting DeviceCommandError must be
+    re-raised with a message naming BOTH the referenced configuration and
+    the underlying failure - never a bare, context-free error."""
+    fake = FakeConnection(
+        data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "configuration": "cfg1"}]},
+        raise_for={("interface", "wifi", "configuration"): LibRouterosError("no such command")},
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError) as exc_info:
+        guard.set_wifi_ssid(client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
+    assert "cfg1" in str(exc_info.value)
+    assert "could not be read" in str(exc_info.value)
+
+
 def test_set_wifi_ssid_ros7_ambiguous_interface_raises_clear_device_command_error(
     settings_write_enabled: Settings, device: Device
 ):
@@ -329,9 +343,7 @@ def test_set_client_bandwidth_read_only_gate_applies_before_touching_device(devi
         guard.set_client_bandwidth(guarded_client, settings, target="10.0.0.50", max_limit="10M/5M", confirm=True)
 
 
-def test_set_client_bandwidth_creates_queue_when_none_exists(
-    settings_write_enabled: Settings, device: Device
-):
+def test_set_client_bandwidth_creates_queue_when_none_exists(settings_write_enabled: Settings, device: Device):
     fake = FakeConnection(data={("queue", "simple"): []})
     client = MikrotikClient(device, connection=fake)
 
@@ -358,14 +370,10 @@ def test_set_client_bandwidth_creates_queue_when_none_exists(
     assert rows[0]["max-limit"] == "10M/5M"
 
 
-def test_set_client_bandwidth_updates_existing_queue_for_same_target(
-    settings_write_enabled: Settings, device: Device
-):
+def test_set_client_bandwidth_updates_existing_queue_for_same_target(settings_write_enabled: Settings, device: Device):
     fake = FakeConnection(
         data={
-            ("queue", "simple"): [
-                {".id": "*1", "name": "limit-10-0-0-50", "target": "10.0.0.50", "max-limit": "1M/1M"}
-            ]
+            ("queue", "simple"): [{".id": "*1", "name": "limit-10-0-0-50", "target": "10.0.0.50", "max-limit": "1M/1M"}]
         }
     )
     client = MikrotikClient(device, connection=fake)
@@ -400,13 +408,44 @@ def test_set_client_bandwidth_sets_limit_at_when_given(settings_write_enabled: S
     assert fake.path("queue", "simple")._rows[0]["limit-at"] == "2M/1M"
 
 
+def test_set_client_bandwidth_updates_limit_at_on_existing_queue(settings_write_enabled: Settings, device: Device):
+    # Same "update" path as test_set_client_bandwidth_updates_existing_queue_for_same_target
+    # above, but also passing limit_at - covers the update branch's own
+    # (separate) "if limit_at given" handling, not just the create path's.
+    fake = FakeConnection(
+        data={
+            ("queue", "simple"): [{".id": "*1", "name": "limit-10-0-0-50", "target": "10.0.0.50", "max-limit": "1M/1M"}]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_client_bandwidth(
+        client,
+        settings_write_enabled,
+        target="10.0.0.50",
+        max_limit="10M/5M",
+        limit_at="2M/1M",
+        confirm=False,
+    )
+    assert preview.after["limit-at"] == "2M/1M"
+
+    applied = guard.set_client_bandwidth(
+        client,
+        settings_write_enabled,
+        target="10.0.0.50",
+        max_limit="10M/5M",
+        limit_at="2M/1M",
+        confirm=True,
+    )
+    assert applied.applied is True
+    assert fake.path("queue", "simple")._rows[0]["limit-at"] == "2M/1M"
+
+
 def test_set_client_bandwidth_rejects_invalid_target(settings_write_enabled: Settings, device: Device):
     fake = FakeConnection(data={("queue", "simple"): []})
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(ValidationError):
-        guard.set_client_bandwidth(
-            client, settings_write_enabled, target="not-an-ip", max_limit="10M/5M", confirm=True
-        )
+        guard.set_client_bandwidth(client, settings_write_enabled, target="not-an-ip", max_limit="10M/5M", confirm=True)
     assert fake.path("queue", "simple")._rows == []
 
 
@@ -532,9 +571,7 @@ def test_remove_simple_queue_requires_target_or_name(client: MikrotikClient, set
 def test_remove_simple_queue_by_target_preview_then_confirm(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    preview = guard.remove_simple_queue(
-        client, settings_write_enabled, target="10.0.0.50/32", confirm=False
-    )
+    preview = guard.remove_simple_queue(client, settings_write_enabled, target="10.0.0.50/32", confirm=False)
     assert preview.applied is False
     assert preview.before["name"] == "limit-10-0-0-50"
     # Preview must not have removed anything.
@@ -579,9 +616,7 @@ def test_remove_simple_queue_rejects_invalid_target_before_touching_device(
 def test_add_to_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
     assert settings.allow_write is False
     with pytest.raises(WriteDisabledError):
-        guard.add_to_address_list(
-            client, settings, list_name="blocked-clients", address="10.0.0.61", confirm=True
-        )
+        guard.add_to_address_list(client, settings, list_name="blocked-clients", address="10.0.0.61", confirm=True)
 
 
 def test_add_to_address_list_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
@@ -713,14 +748,10 @@ def test_add_to_address_list_rejects_invalid_input_before_touching_device(
 def test_remove_from_address_list_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
     assert settings.allow_write is False
     with pytest.raises(WriteDisabledError):
-        guard.remove_from_address_list(
-            client, settings, list_name="blocked-clients", address="10.0.0.60", confirm=True
-        )
+        guard.remove_from_address_list(client, settings, list_name="blocked-clients", address="10.0.0.60", confirm=True)
 
 
-def test_remove_from_address_list_read_only_gate_applies_before_touching_device(
-    device: Device, settings: Settings
-):
+def test_remove_from_address_list_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(WriteDisabledError):
         guard.remove_from_address_list(
@@ -797,9 +828,7 @@ def test_set_poe_out_read_only_gate_applies_before_touching_device(device: Devic
 def test_set_poe_out_preview_does_not_apply(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    preview = guard.set_poe_out(
-        client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=False
-    )
+    preview = guard.set_poe_out(client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=False)
 
     assert preview.applied is False
     assert preview.before["poe-out"] == "auto-on"
@@ -812,9 +841,7 @@ def test_set_poe_out_preview_does_not_apply(
 def test_set_poe_out_confirm_true_applies(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    preview = guard.set_poe_out(
-        client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True
-    )
+    preview = guard.set_poe_out(client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True)
 
     assert preview.applied is True
     assert preview.before["poe-out"] == "auto-on"
@@ -942,7 +969,7 @@ def test_start_container_confirm_true_applies_by_name(settings_write_enabled: Se
 
 
 def test_stop_container_confirm_true_applies_by_tag(settings_write_enabled: Settings, device: Device):
-    """"alpine:latest" has no `name` field on the fixture row - resolution
+    """ "alpine:latest" has no `name` field on the fixture row - resolution
     must fall back to matching on `tag`."""
     fake = _containers_fixture()
     client = MikrotikClient(device, connection=fake)
@@ -968,9 +995,7 @@ def test_start_container_dispatches_via_allowlist_id_only_targeted_row_changes(
     assert rows == {"grafana": "running", "alpine:latest": "running"}
 
 
-def test_start_container_unknown_container_raises_resource_not_found(
-    settings_write_enabled: Settings, device: Device
-):
+def test_start_container_unknown_container_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
     fake = _containers_fixture()
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(ResourceNotFoundError) as exc_info:
@@ -981,9 +1006,7 @@ def test_start_container_unknown_container_raises_resource_not_found(
     assert rows == {"grafana": "stopped", "alpine:latest": "running"}
 
 
-def test_stop_container_unknown_container_raises_resource_not_found(
-    settings_write_enabled: Settings, device: Device
-):
+def test_stop_container_unknown_container_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
     fake = _containers_fixture()
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(ResourceNotFoundError) as exc_info:
@@ -1175,7 +1198,12 @@ def test_set_route_distance_rejects_invalid_dst_address_before_touching_device(
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.set_route_distance(
-            guarded_client, settings_write_enabled, dst_address="not-an-ip", gateway="10.0.0.254", distance=5, confirm=True
+            guarded_client,
+            settings_write_enabled,
+            dst_address="not-an-ip",
+            gateway="10.0.0.254",
+            distance=5,
+            confirm=True,
         )
 
 
@@ -1296,9 +1324,7 @@ def test_disable_route_disambiguated_by_comment(settings_write_enabled: Settings
     assert rows == {"primary": None, "backup": "yes"}
 
 
-def test_disable_route_default_route_preview_carries_warning(
-    client: MikrotikClient, settings_write_enabled: Settings
-):
+def test_disable_route_default_route_preview_carries_warning(client: MikrotikClient, settings_write_enabled: Settings):
     """dst-address "0.0.0.0/0" (the fixture device's only route) IS the
     default route - the preview must carry a non-null, explicit warning
     about cutting outbound traffic, both on preview and on the applied
@@ -1316,9 +1342,7 @@ def test_disable_route_default_route_preview_carries_warning(
     assert applied.warning is not None
 
 
-def test_disable_route_non_default_route_preview_has_no_warning(
-    settings_write_enabled: Settings, device: Device
-):
+def test_disable_route_non_default_route_preview_has_no_warning(settings_write_enabled: Settings, device: Device):
     fake = FakeConnection(
         data={("ip", "route"): [{".id": "*1", "dst-address": "10.10.0.0/24", "gateway": "10.0.0.254"}]}
     )
@@ -1330,9 +1354,7 @@ def test_disable_route_non_default_route_preview_has_no_warning(
     assert preview.warning is None
 
 
-def test_enable_route_of_default_route_carries_no_warning(
-    client: MikrotikClient, settings_write_enabled: Settings
-):
+def test_enable_route_of_default_route_carries_no_warning(client: MikrotikClient, settings_write_enabled: Settings):
     """Re-enabling (restoring traffic) is never the risky direction - only
     disable_route's warning fires."""
     guard.disable_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True)
@@ -1342,7 +1364,9 @@ def test_enable_route_of_default_route_carries_no_warning(
     assert preview.warning is None
 
 
-def test_enable_route_rejects_invalid_dst_address_before_touching_device(settings_write_enabled: Settings, device: Device):
+def test_enable_route_rejects_invalid_dst_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.enable_route(guarded_client, settings_write_enabled, dst_address="not-an-ip", confirm=True)
@@ -1426,7 +1450,7 @@ def test_add_netwatch_never_accepts_up_script_or_down_script(client: MikrotikCli
             settings_write_enabled,
             host="1.1.1.1",
             confirm=True,
-            up_script=":log warning \"gw down\"",  # type: ignore[call-arg]
+            up_script=':log warning "gw down"',  # type: ignore[call-arg]
         )
     with pytest.raises(TypeError):
         guard.add_netwatch(
@@ -1434,7 +1458,7 @@ def test_add_netwatch_never_accepts_up_script_or_down_script(client: MikrotikCli
             settings_write_enabled,
             host="1.1.1.2",
             confirm=True,
-            down_script=":log warning \"gw down\"",  # type: ignore[call-arg]
+            down_script=':log warning "gw down"',  # type: ignore[call-arg]
         )
 
 
@@ -1668,12 +1692,12 @@ def test_add_static_dns_allows_same_name_different_type(settings_write_enabled: 
     assert preview.applied is True
 
 
-def test_add_static_dns_rejects_invalid_name_before_touching_device(
-    settings_write_enabled: Settings, device: Device
-):
+def test_add_static_dns_rejects_invalid_name_before_touching_device(settings_write_enabled: Settings, device: Device):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
-        guard.add_static_dns(guarded_client, settings_write_enabled, name="not a host", address="10.0.0.9", confirm=True)
+        guard.add_static_dns(
+            guarded_client, settings_write_enabled, name="not a host", address="10.0.0.9", confirm=True
+        )
 
 
 def test_add_static_dns_rejects_invalid_address_for_a_record_before_touching_device(
@@ -1736,7 +1760,10 @@ def test_add_static_dns_dispatches_via_allowlist_action(
 
     guard.add_static_dns(client, settings_write_enabled, name="new.example.com", address="10.0.0.9", confirm=True)
 
-    assert called == {"path": patched_op.path, "fields": {"name": "new.example.com", "type": "A", "address": "10.0.0.9"}}
+    assert called == {
+        "path": patched_op.path,
+        "fields": {"name": "new.example.com", "type": "A", "address": "10.0.0.9"},
+    }
 
 
 def test_remove_static_dns_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
@@ -1766,9 +1793,7 @@ def test_remove_static_dns_preview_then_confirm(settings_write_enabled: Settings
     assert "blocked.example.com" not in names
 
 
-def test_remove_static_dns_unknown_name_raises_resource_not_found(
-    settings_write_enabled: Settings, device: Device
-):
+def test_remove_static_dns_unknown_name_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
     fake = _static_dns_fixture()
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(ResourceNotFoundError) as exc_info:
@@ -1776,9 +1801,7 @@ def test_remove_static_dns_unknown_name_raises_resource_not_found(
     assert "ghost.example.com" in str(exc_info.value)
 
 
-def test_remove_static_dns_ambiguous_without_record_type_raises(
-    settings_write_enabled: Settings, device: Device
-):
+def test_remove_static_dns_ambiguous_without_record_type_raises(settings_write_enabled: Settings, device: Device):
     fake = _static_dns_fixture()
     client = MikrotikClient(device, connection=fake)
     with pytest.raises(AmbiguousResourceError):
@@ -1788,9 +1811,7 @@ def test_remove_static_dns_ambiguous_without_record_type_raises(
     assert len(rows) == 2
 
 
-def test_remove_static_dns_resolves_uniquely_when_type_given(
-    settings_write_enabled: Settings, device: Device
-):
+def test_remove_static_dns_resolves_uniquely_when_type_given(settings_write_enabled: Settings, device: Device):
     """Same `name` shared by two rows is only ambiguous when `record_type`
     is also shared - a CNAME and an A record with the same `name` resolve
     unambiguously by `record_type` alone."""
@@ -1933,16 +1954,12 @@ def test_remove_dhcp_lease_by_mac_dynamic_no_warning(settings_write_enabled: Set
     fake = _dhcp_leases_fixture()
     client = MikrotikClient(device, connection=fake)
 
-    preview = guard.remove_dhcp_lease(
-        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=False
-    )
+    preview = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=False)
     assert preview.applied is False
     assert preview.warning is None
     assert preview.before["address"] == "10.0.0.50"
 
-    applied = guard.remove_dhcp_lease(
-        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True
-    )
+    applied = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
     assert applied.applied is True
     assert applied.warning is None
     macs = {row["mac-address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
@@ -1966,16 +1983,12 @@ def test_remove_dhcp_lease_static_lease_carries_warning_on_preview_and_apply(
     fake = _dhcp_leases_fixture()
     client = MikrotikClient(device, connection=fake)
 
-    preview = guard.remove_dhcp_lease(
-        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=False
-    )
+    preview = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=False)
     assert preview.applied is False
     assert preview.warning is not None
     assert "STATIC" in preview.warning
 
-    applied = guard.remove_dhcp_lease(
-        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=True
-    )
+    applied = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=True)
     assert applied.applied is True
     assert applied.warning is not None
     assert "STATIC" in applied.warning
@@ -1983,9 +1996,7 @@ def test_remove_dhcp_lease_static_lease_carries_warning_on_preview_and_apply(
     assert "AA:BB:CC:DD:EE:02" not in macs
 
 
-def test_remove_dhcp_lease_mac_tried_before_address_when_both_given(
-    settings_write_enabled: Settings, device: Device
-):
+def test_remove_dhcp_lease_mac_tried_before_address_when_both_given(settings_write_enabled: Settings, device: Device):
     """mac_address is the more stable identifier - tried first if both are
     given, mirroring remove_netwatch's "host tried first" convention."""
     fake = _dhcp_leases_fixture()
@@ -2012,9 +2023,7 @@ def test_remove_dhcp_lease_unknown_raises_resource_not_found(settings_write_enab
     assert "AA:BB:CC:DD:EE:99" in str(exc_info.value)
 
 
-def test_remove_dhcp_lease_rejects_invalid_mac_before_touching_device(
-    settings_write_enabled: Settings, device: Device
-):
+def test_remove_dhcp_lease_rejects_invalid_mac_before_touching_device(settings_write_enabled: Settings, device: Device):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.remove_dhcp_lease(guarded_client, settings_write_enabled, mac_address="not-a-mac", confirm=True)
@@ -2087,12 +2096,12 @@ def test_wake_on_lan_confirm_true_sends_the_wol_command(
 def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings_write_enabled: Settings, device: Device):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
-        guard.wake_on_lan(guarded_client, settings_write_enabled, mac_address="not-a-mac", interface="ether1", confirm=True)
+        guard.wake_on_lan(
+            guarded_client, settings_write_enabled, mac_address="not-a-mac", interface="ether1", confirm=True
+        )
 
 
-def test_wake_on_lan_rejects_invalid_interface_before_touching_device(
-    settings_write_enabled: Settings, device: Device
-):
+def test_wake_on_lan_rejects_invalid_interface_before_touching_device(settings_write_enabled: Settings, device: Device):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.wake_on_lan(
@@ -2144,9 +2153,7 @@ def test_disable_firewall_rule_blocked_when_write_disabled(client: MikrotikClien
         guard.disable_firewall_rule(client, settings, comment="allow established", confirm=True)
 
 
-def test_enable_firewall_rule_read_only_gate_applies_before_touching_device(
-    device: Device, settings: Settings
-):
+def test_enable_firewall_rule_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(WriteDisabledError):
         guard.enable_firewall_rule(guarded_client, settings, comment="Bloqueio_Ataque_X", confirm=True)
@@ -2155,9 +2162,7 @@ def test_enable_firewall_rule_read_only_gate_applies_before_touching_device(
 def test_enable_firewall_rule_preview_does_not_apply(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    preview = guard.enable_firewall_rule(
-        client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=False
-    )
+    preview = guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=False)
     assert preview.applied is False
     assert preview.before["disabled"] == "true"
     assert preview.after["disabled"] == "no"
@@ -2172,9 +2177,7 @@ def test_enable_firewall_rule_preview_does_not_apply(
 def test_enable_firewall_rule_confirm_true_applies(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    applied = guard.enable_firewall_rule(
-        client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True
-    )
+    applied = guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
     assert applied.applied is True
     row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "Bloqueio_Ataque_X")
     assert row["disabled"] == "no"
@@ -2183,9 +2186,7 @@ def test_enable_firewall_rule_confirm_true_applies(
 def test_disable_firewall_rule_confirm_true_applies(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    applied = guard.disable_firewall_rule(
-        client, settings_write_enabled, comment="allow established", confirm=True
-    )
+    applied = guard.disable_firewall_rule(client, settings_write_enabled, comment="allow established", confirm=True)
     assert applied.applied is True
     row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "allow established")
     assert row["disabled"] == "yes"
@@ -2243,9 +2244,7 @@ def test_enable_firewall_rule_disambiguated_by_chain(settings_write_enabled: Set
     )
     client = MikrotikClient(device, connection=fake)
 
-    applied = guard.enable_firewall_rule(
-        client, settings_write_enabled, comment="dup", chain="forward", confirm=True
-    )
+    applied = guard.enable_firewall_rule(client, settings_write_enabled, comment="dup", chain="forward", confirm=True)
     assert applied.applied is True
     rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "filter")._rows}
     assert rows == {"input": "true", "forward": "no"}
@@ -2306,9 +2305,7 @@ def test_add_wireguard_interface_blocked_when_write_disabled(client: MikrotikCli
         guard.add_wireguard_interface(client, settings, name="wg2", confirm=True)
 
 
-def test_add_wireguard_interface_read_only_gate_applies_before_touching_device(
-    device: Device, settings: Settings
-):
+def test_add_wireguard_interface_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(WriteDisabledError):
         guard.add_wireguard_interface(guarded_client, settings, name="wg2", confirm=True)
@@ -2328,9 +2325,7 @@ def test_add_wireguard_interface_preview_does_not_create(
 def test_add_wireguard_interface_confirm_true_creates_and_reports_public_key_never_private_key(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    preview = guard.add_wireguard_interface(
-        client, settings_write_enabled, name="wg2", listen_port=51821, confirm=True
-    )
+    preview = guard.add_wireguard_interface(client, settings_write_enabled, name="wg2", listen_port=51821, confirm=True)
     assert preview.applied is True
     assert preview.after["name"] == "wg2"
     assert preview.after["listen-port"] == "51821"
@@ -2356,7 +2351,9 @@ def test_add_wireguard_interface_rejects_invalid_listen_port_before_touching_dev
 ):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
-        guard.add_wireguard_interface(guarded_client, settings_write_enabled, name="wg2", listen_port=70000, confirm=True)
+        guard.add_wireguard_interface(
+            guarded_client, settings_write_enabled, name="wg2", listen_port=70000, confirm=True
+        )
 
 
 def test_add_wireguard_interface_never_accepts_a_private_key_parameter(
@@ -2456,7 +2453,9 @@ def test_add_wireguard_peer_confirm_true_creates_with_optional_fields(
     )
     assert preview.applied is True
     row = next(
-        r for r in fake_connection.path("interface", "wireguard", "peers")._rows if r["public-key"] == _REMOTE_PEER_PUBKEY_1
+        r
+        for r in fake_connection.path("interface", "wireguard", "peers")._rows
+        if r["public-key"] == _REMOTE_PEER_PUBKEY_1
     )
     assert row["interface"] == "wg1"
     assert row["allowed-address"] == "10.10.0.5/32,10.10.0.6/32"
@@ -2575,14 +2574,10 @@ def test_remove_wireguard_peer_blocked_when_write_disabled(client: MikrotikClien
 def test_remove_wireguard_peer_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(WriteDisabledError):
-        guard.remove_wireguard_peer(
-            guarded_client, settings, interface="wg1", public_key="PUBKEYAAAA==", confirm=True
-        )
+        guard.remove_wireguard_peer(guarded_client, settings, interface="wg1", public_key="PUBKEYAAAA==", confirm=True)
 
 
-def test_remove_wireguard_peer_requires_public_key_or_comment(
-    client: MikrotikClient, settings_write_enabled: Settings
-):
+def test_remove_wireguard_peer_requires_public_key_or_comment(client: MikrotikClient, settings_write_enabled: Settings):
     with pytest.raises(ValidationError):
         guard.remove_wireguard_peer(client, settings_write_enabled, interface="wg1", confirm=True)
 
@@ -2759,9 +2754,7 @@ def test_add_hotspot_user_rejects_duplicate_name(
 ):
     guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
     with pytest.raises(ResourceAlreadyExistsError) as exc_info:
-        guard.add_hotspot_user(
-            client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True
-        )
+        guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True)
     assert "visitor2" in str(exc_info.value)
     assert len(fake_connection.path("ip", "hotspot", "user")._rows) == 1
 
@@ -2857,9 +2850,7 @@ def test_create_backup_confirm_true_sends_the_save_command(
 def test_create_backup_confirm_true_forwards_password_to_the_device(
     client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
 ):
-    guard.create_backup(
-        client, settings_write_enabled, name="nightly-backup", password="encrypt-me", confirm=True
-    )
+    guard.create_backup(client, settings_write_enabled, name="nightly-backup", password="encrypt-me", confirm=True)
     assert (
         "/system/backup/save",
         {"name": "nightly-backup", "password": "encrypt-me"},
@@ -2894,14 +2885,10 @@ def test_create_backup_rejects_duplicate_name_when_caller_already_included_the_e
     client: MikrotikClient, settings_write_enabled: Settings
 ):
     with pytest.raises(ResourceAlreadyExistsError):
-        guard.create_backup(
-            client, settings_write_enabled, name="core-switch-2026-01-01.backup", confirm=True
-        )
+        guard.create_backup(client, settings_write_enabled, name="core-switch-2026-01-01.backup", confirm=True)
 
 
-def test_create_backup_rejects_invalid_name_before_touching_device(
-    settings_write_enabled: Settings, device: Device
-):
+def test_create_backup_rejects_invalid_name_before_touching_device(settings_write_enabled: Settings, device: Device):
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.create_backup(guarded_client, settings_write_enabled, name="bad name!", confirm=True)

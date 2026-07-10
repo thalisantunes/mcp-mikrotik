@@ -7,7 +7,8 @@ conversion.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 _TRUE_STRINGS = {"true", "yes"}
 _FALSE_STRINGS = {"false", "no"}

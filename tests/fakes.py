@@ -9,10 +9,10 @@ objects look like - see client.py's module docstring.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from librouteros.exceptions import LibRouterosError
-
 
 # v0.13: real RouterOS generates a WireGuard interface's private/public key
 # pair itself on `/interface/wireguard add` - a caller never supplies (or

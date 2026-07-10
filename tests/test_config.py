@@ -186,6 +186,41 @@ def test_load_devices_rejects_non_coercible_host(tmp_path: Path):
         load_devices(path)
 
 
+def test_load_devices_rejects_boolean_name():
+    from mcp_mikrotik.config import ConfigError, _coerce_str
+
+    with pytest.raises(ConfigError, match="must be a string"):
+        _coerce_str(True, "name", Path("devices.yaml"))
+
+
+def test_load_devices_rejects_none_host():
+    from mcp_mikrotik.config import ConfigError, _coerce_str
+
+    with pytest.raises(ConfigError, match="must be a string"):
+        _coerce_str(None, "host", Path("devices.yaml"))
+
+
+# --- top-level YAML shape validation ---------------------------------------
+
+
+def test_load_devices_rejects_non_mapping_top_level(tmp_path: Path):
+    path = _write(tmp_path, "- just\n- a\n- list\n")
+    with pytest.raises(ConfigError, match="top-level YAML must be a mapping"):
+        load_devices(path)
+
+
+def test_load_devices_rejects_non_list_devices_key(tmp_path: Path):
+    path = _write(tmp_path, "devices: not-a-list\n")
+    with pytest.raises(ConfigError, match="'devices' must be a list"):
+        load_devices(path)
+
+
+def test_load_devices_rejects_non_mapping_device_entry(tmp_path: Path):
+    path = _write(tmp_path, "devices:\n  - just-a-string\n")
+    with pytest.raises(ConfigError, match="each device entry must be a mapping"):
+        load_devices(path)
+
+
 # --- SSL1: tls_verify / tls_ca_cert parsing --------------------------------
 
 
