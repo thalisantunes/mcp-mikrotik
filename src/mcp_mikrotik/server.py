@@ -17,8 +17,10 @@ read-only connection_tracking tool (v0.11), the read-only
 security_audit/security_events tools (v0.12 - see security.py), the
 read-only wireguard_interfaces tool (v0.13), three more read-only tools from
 v0.14 - hotspot_active, torch, list_backups - (v1.2) one more read-only
-tool - list_vlans - (v1.3) one more read-only tool - ppp_secrets - and
-(v1.4) one more read-only tool - firewall_mangle.
+tool - list_vlans - (v1.3) one more read-only tool - ppp_secrets - (v1.4)
+one more read-only tool - firewall_mangle - and (v1.6) four more read-only
+tools - certificates, users, user_active, radius - see "AAA/PKI visibility"
+below.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -47,6 +49,7 @@ from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
 from .formatting import (
     WIREGUARD_SENSITIVE_FIELDS,
+    days_until,
     filter_disabled,
     rows_to_list,
     split_address_port,
@@ -109,6 +112,19 @@ _WIREGUARD_REDACTED_FIELDS = WIREGUARD_SENSITIVE_FIELDS
 # `ppp_secrets` - same "never a secret in a read tool's output" rule
 # `_WIREGUARD_REDACTED_FIELDS` above enforces for WireGuard.
 _PPP_SECRET_REDACTED_FIELDS = frozenset({"password"})
+
+# v1.6: /certificate's own API reply never carries a private key (RouterOS
+# only returns certificate metadata over the API) - this is defensive
+# belt-and-suspenders in case a future RouterOS version or firmware quirk
+# ever adds one, same "strip it regardless of whether it's expected today"
+# reasoning `strip_sensitive_fields`' docstring lays out for WireGuard.
+_CERTIFICATE_REDACTED_FIELDS = frozenset({"private-key"})
+
+# v1.6: /radius's `secret` field is the plaintext RADIUS shared secret -
+# must never be returned by `radius`, same "never a secret in a read tool's
+# output" rule as `_PPP_SECRET_REDACTED_FIELDS`/`_WIREGUARD_REDACTED_FIELDS`
+# above.
+_RADIUS_REDACTED_FIELDS = frozenset({"secret"})
 
 
 def build_server(settings: Settings | None = None, client_factory: ClientFactory = get_client) -> FastMCP:
@@ -1020,6 +1036,129 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             for op in guard.ALLOWLIST.values()
         ]
 
+    # --- v1.6: AAA/PKI visibility (certificates, users, RADIUS) --------
+
+    @mcp.tool()
+    @_safe
+    def certificates(device_name: str) -> list[dict[str, Any]]:
+        """List certificates (`/certificate`): `name`, `common-name`,
+        subject/issuer fields (if present), `invalid-before`/`invalid-after`
+        (raw RouterOS date strings, kept as-is), `key-size`/`key-type`,
+        `fingerprint`, and RouterOS's own flags (`expired`, `trusted`) - all
+        returned exactly as the device sends them (booleans may come back as
+        Python `bool` or be omitted entirely; see `formatting.coerce_ros_bool`
+        for a caller that needs to branch on `expired`/`trusted` rather than
+        just display them).
+
+        Adds a computed `daysUntilExpiry` (int, negative once past due) from
+        `invalid-after` whenever it can be parsed - see
+        `formatting.parse_ros_datetime`'s docstring for the two RouterOS date
+        shapes handled (`"2027-01-15 12:00:00"` and
+        `"jan/15/2027 12:00:00"`). RouterOS's own date rendering varies by
+        version/locale; parsing is DEFENSIVE and never raises - a row whose
+        `invalid-after` doesn't match either known shape simply has no
+        `daysUntilExpiry` key added, with the raw `invalid-after` string left
+        untouched so a caller can still see it.
+
+        SECURITY: `/certificate`'s own API reply never carries a private key
+        (RouterOS only returns certificate metadata over the API) - a
+        `private-key` field is nonetheless stripped defensively before
+        returning, in case a future RouterOS version or firmware quirk ever
+        adds one (same `strip_sensitive_fields` mechanism `ppp_secrets`/
+        `wireguard_interfaces` use). See
+        `test_certificates_strips_private_key_defensively`.
+
+        See also `security_audit`'s certificate-expiry check (v1.6), which
+        flags an expired or soon-to-expire (<=30 days) certificate as a
+        finding using this same expiry logic.
+
+        Returns an empty list (never an error) for a device with no
+        certificates configured.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("certificate"))
+        except DeviceCommandError:
+            return []
+        rows = strip_sensitive_fields(rows, _CERTIFICATE_REDACTED_FIELDS)
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            remaining_days = days_until(entry.get("invalid-after"))
+            if remaining_days is not None:
+                entry["daysUntilExpiry"] = remaining_days
+            result.append(entry)
+        return result
+
+    @mcp.tool()
+    @_safe
+    def users(device_name: str) -> list[dict[str, Any]]:
+        """List RouterOS login accounts (`/user`): `name`, `group`,
+        `address` (an allowed-source restriction, if the account has one),
+        `last-logged-in` (if RouterOS exposes it), `disabled`, `comment`.
+
+        `/user`'s own API reply never carries a password at all - RouterOS
+        doesn't expose it over the API, so there is nothing to strip here
+        (unlike `ppp_secrets`/`radius`, whose underlying menus DO carry a
+        secret). This is a READ only: creating/editing a `/user` login stays
+        deliberately out of scope for this package (see `ROADMAP.md`'s
+        "Explicitly NOT on the roadmap" - a router login is a device/API
+        credential, a different risk class from a service credential like a
+        PPP secret or hotspot user).
+
+        Returns an empty list (never an error) if `/user` is unavailable for
+        some reason - `/user` always exists on RouterOS in practice, but this
+        keeps the same "empty, not an error" convention every other optional
+        read in this package uses.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("user"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def user_active(device_name: str) -> list[dict[str, Any]]:
+        """List currently active RouterOS login sessions (`/user/active`):
+        `name`, `address`, `via` (e.g. `api`/`winbox`/`ssh`/`web`), `when`
+        (session start time) - who is logged into the device's own
+        management right now, as opposed to `users`' CONFIGURED accounts.
+
+        Returns an empty list (never an error) for a device with nobody
+        currently logged in, or if `/user/active` is unavailable.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("user", "active"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def radius(device_name: str) -> list[dict[str, Any]]:
+        """List RADIUS server configuration (`/radius`): `service`,
+        `address`, `timeout`, `accounting-port`, `authentication-port`, and
+        whatever other fields RouterOS returns for a given entry.
+
+        SECURITY: RouterOS's own `/radius` reply carries the plaintext
+        shared `secret` - this is ALWAYS stripped before returning
+        (`formatting.strip_sensitive_fields`), the same mechanism
+        `ppp_secrets` uses for `/ppp/secret`'s `password` and
+        `wireguard_interfaces` uses for a tunnel interface's `private-key`.
+        A RADIUS shared secret never leaves this process via this tool. See
+        `test_radius_never_exposes_secret`.
+
+        Returns an empty list (never an error) for a device with no RADIUS
+        servers configured.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("radius"))
+        except DeviceCommandError:
+            return []
+        return strip_sensitive_fields(rows, _RADIUS_REDACTED_FIELDS)
+
     # --- v0.12: security audit + security-relevant log events ----------
 
     @mcp.tool()
@@ -1038,8 +1177,9 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         SNMP community exposure (`/snmp/community`), an open DNS resolver
         (`/ip/dns` allow-remote-requests), outdated RouterOS
         (`/system/package/update`), open wireless/wifi networks (no
-        security profile / no passphrase), and a count of users with a
-        write/full policy.
+        security profile / no passphrase), a count of users with a
+        write/full policy, and (v1.6) an expired or soon-to-expire
+        (<=30 days) certificate (`/certificate`).
 
         Each check reads its own menu(s) and skips itself (contributing no
         findings) if that menu doesn't exist on this device/RouterOS

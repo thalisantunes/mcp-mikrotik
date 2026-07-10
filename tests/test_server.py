@@ -105,6 +105,10 @@ EXPECTED_TOOLS = {
     "disable_nat_rule",
     "enable_mangle_rule",
     "disable_mangle_rule",
+    "certificates",
+    "users",
+    "user_active",
+    "radius",
 }
 
 
@@ -3266,6 +3270,143 @@ async def test_remove_wireguard_peer_requires_public_key_or_comment(device: Devi
             "remove_wireguard_peer", {"device_name": "core-switch", "interface": "wg1", "confirm": True}
         )
     assert "public_key" in str(exc_info.value) or "comment" in str(exc_info.value)
+
+
+# --- AAA/PKI visibility: certificates / users / user_active / radius (v1.6) --
+
+
+@pytest.mark.asyncio
+async def test_certificates_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("certificates", {"device_name": "core-switch"})
+    row = result["result"][0]
+    assert row["name"] == "api-cert"
+    assert row["common-name"] == "core-switch.example.com"
+    assert row["invalid-after"] == "2099-01-15 12:00:00"
+    # Fixture's invalid-after is far in the future - daysUntilExpiry must be
+    # computed (present) and clearly positive.
+    assert row["daysUntilExpiry"] > 0
+
+
+@pytest.mark.asyncio
+async def test_certificates_parses_ros_abbreviated_date_shape(settings: Settings):
+    """RouterOS's OTHER observed invalid-after shape - "jan/15/2027
+    12:00:00" - must parse too, not just the ISO-like one the shared fixture
+    uses."""
+    fake = FakeConnection(
+        data={
+            ("certificate",): [
+                {".id": "*1", "name": "legacy-cert", "invalid-after": "jan/15/2099 12:00:00"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("certificates", {"device_name": "core-switch"})
+    assert result["result"][0]["daysUntilExpiry"] > 0
+
+
+@pytest.mark.asyncio
+async def test_certificates_tolerates_unparseable_invalid_after(settings: Settings):
+    """A device/RouterOS version rendering invalid-after in some other
+    format must never break `certificates` - daysUntilExpiry is simply
+    omitted, and the raw field is left untouched."""
+    fake = FakeConnection(
+        data={
+            ("certificate",): [
+                {".id": "*1", "name": "weird-cert", "invalid-after": "not-a-real-date"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("certificates", {"device_name": "core-switch"})
+    row = result["result"][0]
+    assert row["invalid-after"] == "not-a-real-date"
+    assert "daysUntilExpiry" not in row
+
+
+@pytest.mark.asyncio
+async def test_certificates_strips_private_key_defensively(settings: Settings):
+    """SECURITY: even though RouterOS's own /certificate reply never
+    genuinely carries a private-key over the API, `certificates` must strip
+    one defensively if it's ever present - same belt-and-suspenders
+    reasoning as wireguard_peers/wireguard_interfaces."""
+    fake = FakeConnection(
+        data={
+            ("certificate",): [
+                {".id": "*1", "name": "api-cert", "private-key": "SUPERSECRETPRIVATEKEY=="},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("certificates", {"device_name": "core-switch"})
+    assert "private-key" not in result["result"][0]
+    assert "SUPERSECRETPRIVATEKEY==" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_certificates_returns_empty_when_no_certificates(settings: Settings):
+    fake = FakeConnection(raise_for={("certificate",): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("certificates", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_users_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("users", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "admin"
+    assert result["result"][0]["group"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_users_returns_empty_when_menu_absent(settings: Settings):
+    fake = FakeConnection(raise_for={("user",): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("users", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_user_active_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("user_active", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "admin"
+    assert result["result"][0]["via"] == "api"
+
+
+@pytest.mark.asyncio
+async def test_user_active_returns_empty_when_menu_absent(settings: Settings):
+    fake = FakeConnection(raise_for={("user", "active"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("user_active", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_radius_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("radius", {"device_name": "core-switch"})
+    assert result["result"][0]["service"] == "ppp"
+    assert result["result"][0]["address"] == "10.0.0.200"
+
+
+@pytest.mark.asyncio
+async def test_radius_never_exposes_secret(settings: Settings, fake_connection: FakeConnection):
+    """SECURITY: the RADIUS shared secret must never appear in the tool's
+    result - see the fixture's "fake-shared-secret" marker."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("radius", {"device_name": "core-switch"})
+    assert "secret" not in result["result"][0]
+    assert "fake-shared-secret" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_radius_returns_empty_when_no_radius_configured(settings: Settings):
+    fake = FakeConnection(raise_for={("radius",): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("radius", {"device_name": "core-switch"})
+    assert result["result"] == []
 
 
 # --- security_audit / security_events (v0.12, read-only) -----------------

@@ -3,6 +3,69 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.6.0] - 2026-07-10
+
+**AAA/PKI visibility (Tier 2, all read-only)**: four new read tools closing
+out most of `ROADMAP.md`'s Tier 2 - certificate expiry, users/AAA, and
+RADIUS - the visibility gap this project's own `security_audit` already
+gestured at (`_check_users` has read `/user` internally since v0.12) but
+never surfaced as first-class tools.
+
+- `certificates` (`/certificate`): name, common-name, subject/issuer
+  fields, `invalid-before`/`invalid-after` (raw), key-size/key-type,
+  fingerprint, and RouterOS's own `expired`/`trusted` flags, returned as-is
+  (see `formatting.coerce_ros_bool` for a caller that needs to branch on
+  them). Adds a computed `daysUntilExpiry` (negative once past due) from
+  `invalid-after` whenever it parses.
+  - **New helper `formatting.parse_ros_datetime`**: RouterOS's own date
+    rendering varies by version/locale - two shapes are confirmed and
+    handled (`"2027-01-15 12:00:00"` and `"jan/15/2027 12:00:00"`, the
+    latter matched against a fixed English month-abbreviation table rather
+    than `strptime`'s locale-dependent `%b`, since RouterOS always renders
+    it in English regardless of the server process's own locale). DEFENSIVE
+    BY DESIGN: never raises - an unparseable/unrecognized date returns
+    `None`, so `daysUntilExpiry` is simply omitted (the raw `invalid-after`
+    field is left untouched) rather than the tool breaking or guessing.
+    `formatting.days_until` wraps it into the `(parsed - now).days`
+    computation both `certificates` and the new security-audit check below
+    share, so they can never compute expiry two different ways.
+  - **SECURITY**: `/certificate`'s own API reply never carries a private
+    key (RouterOS only returns certificate metadata over the API) - a
+    `private-key` field is nonetheless stripped defensively before
+    returning, same `strip_sensitive_fields` mechanism `ppp_secrets`/
+    `wireguard_interfaces` already use, in case a future RouterOS version
+    or firmware quirk ever adds one.
+  - **New `security_audit` check (#8)**: flags an expired certificate
+    (`high`) or one expiring within 30 days (`medium`) - an expired
+    certificate on a management/VPN/hotspot service is a silent outage.
+    Trusts RouterOS's own `expired` flag OR a negative `daysUntilExpiry`,
+    either sufficient on its own, so a device that only reliably exposes
+    one of the two still gets a correct answer; a certificate with neither
+    available contributes no finding rather than guessing.
+- `users` (`/user`): name, group, address (allowed-source restriction, if
+  any), last-logged-in, disabled, comment. `/user`'s own API reply never
+  carries a password at all, so there's nothing to strip. READ only -
+  creating/editing a `/user` login stays out of scope (see `ROADMAP.md`'s
+  "Explicitly NOT on the roadmap" - a router login is a device/API
+  credential, a different risk class from a service credential like a PPP
+  secret or hotspot user).
+- `user_active` (`/user/active`): currently logged-in RouterOS management
+  sessions (name, address, via, when) - who's on the box's own admin
+  interface right now, as opposed to `users`' configured accounts.
+- `radius` (`/radius`): service, address, timeout, accounting-port,
+  authentication-port, etc.
+  - **SECURITY**: RouterOS's own `/radius` reply carries the plaintext
+    shared `secret` - ALWAYS stripped before returning
+    (`strip_sensitive_fields`), the exact mechanism `ppp_secrets` uses for
+    `/ppp/secret`'s `password`. A RADIUS shared secret never leaves this
+    process via this tool. See `test_radius_never_exposes_secret`.
+
+All four are read-only, boolean fields are read via `coerce_ros_bool`
+(never a bare `== "true"`/`== "yes"` string comparison - see v1.5's
+security-fix entry below for why that class of bug matters), and every new
+test fixture (`tests/conftest.py`, `tests/fakes.py`) returns Python `bool`
+for boolean fields, matching real hardware.
+
 ## [1.5.0] - 2026-07-10
 
 **Static route add / remove** (`/ip/route`), closing `ROADMAP.md`'s Tier 1

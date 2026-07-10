@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from mcp_mikrotik.formatting import (
     coerce_ros_bool,
+    days_until,
     filter_disabled,
+    parse_ros_datetime,
     ros_bool,
     rows_to_list,
     split_address_port,
@@ -159,3 +163,61 @@ def test_split_address_port_unterminated_bracket_returned_as_is():
 def test_split_address_port_bare_ipv6_multiple_colons_returned_as_is():
     # Multiple ':' and no brackets - ambiguous, not guessed at.
     assert split_address_port("2001:db8::1") == ("2001:db8::1", None)
+
+
+# --- parse_ros_datetime / days_until (v1.6) -----------------------------------
+
+
+def test_parse_ros_datetime_iso_like_shape_with_time():
+    assert parse_ros_datetime("2027-01-15 12:30:45") == datetime(2027, 1, 15, 12, 30, 45)
+
+
+def test_parse_ros_datetime_iso_like_shape_without_time_defaults_midnight():
+    assert parse_ros_datetime("2027-01-15") == datetime(2027, 1, 15, 0, 0, 0)
+
+
+def test_parse_ros_datetime_ros_abbreviated_shape_with_time():
+    assert parse_ros_datetime("jan/15/2027 12:30:45") == datetime(2027, 1, 15, 12, 30, 45)
+
+
+def test_parse_ros_datetime_ros_abbreviated_shape_is_case_insensitive():
+    assert parse_ros_datetime("JAN/15/2027 00:00:00") == datetime(2027, 1, 15, 0, 0, 0)
+
+
+def test_parse_ros_datetime_ros_abbreviated_shape_without_time_defaults_midnight():
+    assert parse_ros_datetime("dec/31/2026") == datetime(2026, 12, 31, 0, 0, 0)
+
+
+def test_parse_ros_datetime_returns_none_for_unrecognized_shape():
+    assert parse_ros_datetime("not-a-date") is None
+    assert parse_ros_datetime("31/12/2026") is None  # day/month/year, not RouterOS's own shape
+
+
+def test_parse_ros_datetime_returns_none_for_invalid_calendar_date():
+    # Matches the ISO-like shape but Feb 30 doesn't exist - must not raise.
+    assert parse_ros_datetime("2027-02-30") is None
+    # Matches the RouterOS-abbreviated shape (valid month name) but Feb 30
+    # still doesn't exist - must not raise either.
+    assert parse_ros_datetime("feb/30/2027 00:00:00") is None
+    assert parse_ros_datetime("foo/15/2027 00:00:00") is None  # unrecognized month abbreviation
+
+
+def test_parse_ros_datetime_returns_none_for_non_string_or_empty():
+    assert parse_ros_datetime(None) is None
+    assert parse_ros_datetime("") is None
+    assert parse_ros_datetime("   ") is None
+    assert parse_ros_datetime(12345) is None
+
+
+def test_days_until_positive_for_future_date():
+    now = datetime(2026, 1, 1)
+    assert days_until("2026-01-11", now=now) == 10
+
+
+def test_days_until_negative_for_past_date():
+    now = datetime(2026, 1, 11)
+    assert days_until("2026-01-01", now=now) == -10
+
+
+def test_days_until_none_when_unparseable():
+    assert days_until("not-a-date") is None

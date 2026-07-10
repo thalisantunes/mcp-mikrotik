@@ -41,7 +41,7 @@ from typing import Any
 
 from .client import MikrotikClient
 from .exceptions import DeviceCommandError
-from .formatting import ros_bool, rows_to_list
+from .formatting import coerce_ros_bool, days_until, ros_bool, rows_to_list
 
 # --- Finding shape -----------------------------------------------------
 
@@ -415,6 +415,72 @@ def _check_users(client: MikrotikClient) -> list[Finding]:
     ]
 
 
+# --- Check 8: certificate expired / expiring soon (/certificate) --------
+
+# v1.6: how far ahead of `invalid-after` a not-yet-expired certificate still
+# gets flagged (`medium`), so an operator has a window to renew before an
+# expired cert causes a silent outage on whatever service references it
+# (HTTPS management, IPsec, WireGuard, hotspot, etc).
+CERT_EXPIRY_WARNING_DAYS = 30
+
+
+def _check_certificate_expiry(client: MikrotikClient) -> list[Finding]:
+    """Flags a certificate that is already expired (`high`) or expiring
+    within `CERT_EXPIRY_WARNING_DAYS` (`medium`).
+
+    "Expired" is determined two ways, either sufficient on its own:
+    RouterOS's own `expired` boolean field on a `/certificate` row (read via
+    `coerce_ros_bool` - never a string-equality trap, see that helper's
+    docstring), OR a `days_until(invalid-after)` that comes out negative.
+    Using both means a device/RouterOS generation that omits `expired`
+    entirely still gets a correct answer from `invalid-after` alone, and one
+    that only has `invalid-after` in an unparseable format (see
+    `formatting.parse_ros_datetime`'s defensive parsing) still gets a correct
+    answer from `expired` alone. If NEITHER is available (no `expired` field
+    and `invalid-after` doesn't parse), this certificate contributes no
+    finding rather than guessing.
+    """
+    try:
+        rows = rows_to_list(client.path("certificate"))
+    except DeviceCommandError:
+        return []
+
+    findings: list[Finding] = []
+    for row in rows:
+        name = row.get("name") or row.get("common-name") or "<unnamed>"
+        invalid_after = row.get("invalid-after")
+        days_left = days_until(invalid_after)
+        is_expired = coerce_ros_bool(row.get("expired")) is True or (days_left is not None and days_left < 0)
+
+        if is_expired:
+            age = f" ({abs(days_left)} day(s) ago)" if days_left is not None else ""
+            findings.append(
+                Finding(
+                    severity="high",
+                    category="certificates",
+                    title=f"Certificate {name!r} is expired",
+                    detail=(
+                        f"/certificate {name!r} has invalid-after={invalid_after!r}{age} - an "
+                        "expired certificate on any service that references it (HTTPS "
+                        "management, IPsec, WireGuard, hotspot, ...) causes a silent outage or "
+                        "client-side trust failure."
+                    ),
+                    recommendation="Renew or replace this certificate.",
+                )
+            )
+        elif days_left is not None and 0 <= days_left <= CERT_EXPIRY_WARNING_DAYS:
+            findings.append(
+                Finding(
+                    severity="medium",
+                    category="certificates",
+                    title=f"Certificate {name!r} expires in {days_left} day(s)",
+                    detail=(f"/certificate {name!r} has invalid-after={invalid_after!r}, {days_left} day(s) from now."),
+                    recommendation="Renew this certificate before it expires to avoid a silent outage.",
+                )
+            )
+    return findings
+
+
 # --- Aggregation ----------------------------------------------------------
 
 _CHECKS: tuple[Callable[[MikrotikClient], list[Finding]], ...] = (
@@ -425,6 +491,7 @@ _CHECKS: tuple[Callable[[MikrotikClient], list[Finding]], ...] = (
     _check_routeros_version,
     _check_open_wireless,
     _check_users,
+    _check_certificate_expiry,
 )
 
 

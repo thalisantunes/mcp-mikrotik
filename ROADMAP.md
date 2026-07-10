@@ -23,21 +23,32 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** Static route add/remove — `add_route` / `remove_route`
-— landed in **v1.5**, closing out Tier 1: `add_route` creates a static route
-(never refusing a duplicate `dst-address` — that's the normal failover
-shape) and `remove_route` deletes one resolved by `dst-address`/`gateway`,
-**refusing outright to remove a dynamic/connected route** (`dynamic=true`) —
-the single most important safety property in that round. Both carry the same
-default-route `warning` `disable_route` (v0.9) already established. NAT rule
-toggle + firewall mangle (read + toggle) — `enable_nat_rule` /
-`disable_nat_rule`, `firewall_mangle` (read), `enable_mangle_rule` /
-`disable_mangle_rule` — landed in **v1.4**, mirroring `enable_firewall_rule` /
-`disable_firewall_rule` (v0.11) exactly: toggle an EXISTING, admin-authored
-rule by `comment`, never create one. PPP/PPPoE secrets — `ppp_secrets`
-(read), `add_ppp_secret` / `remove_ppp_secret` (guarded) — landed in **v1.3**
-(read+add+remove verified against real ROS7 hardware; password redacted in
-the audit journal and never returned by the read).
+**Recently shipped:** AAA/PKI visibility — `certificates`, `users`,
+`user_active`, `radius` — landed in **v1.6**, closing out most of Tier 2:
+`certificates` reads `/certificate` with a computed `daysUntilExpiry`
+(RouterOS's date rendering handled defensively across its two known
+shapes — see `formatting.parse_ros_datetime`) and a new `security_audit`
+check (#8) flagging an expired or soon-to-expire (<=30 days) certificate;
+`users`/`user_active` surface `/user`/`/user/active` for AAA visibility
+(read only — creating/editing a `/user` login stays a non-goal, see
+below); `radius` reads `/radius` with the shared `secret` field ALWAYS
+stripped before returning, same redaction mechanism `ppp_secrets` uses for
+`/ppp/secret`'s `password`. Static route add/remove — `add_route` /
+`remove_route` — landed in **v1.5**, closing out Tier 1: `add_route`
+creates a static route (never refusing a duplicate `dst-address` — that's
+the normal failover shape) and `remove_route` deletes one resolved by
+`dst-address`/`gateway`, **refusing outright to remove a dynamic/connected
+route** (`dynamic=true`) — the single most important safety property in
+that round. Both carry the same default-route `warning` `disable_route`
+(v0.9) already established. NAT rule toggle + firewall mangle (read +
+toggle) — `enable_nat_rule` / `disable_nat_rule`, `firewall_mangle` (read),
+`enable_mangle_rule` / `disable_mangle_rule` — landed in **v1.4**,
+mirroring `enable_firewall_rule` / `disable_firewall_rule` (v0.11) exactly:
+toggle an EXISTING, admin-authored rule by `comment`, never create one.
+PPP/PPPoE secrets — `ppp_secrets` (read), `add_ppp_secret` /
+`remove_ppp_secret` (guarded) — landed in **v1.3** (read+add+remove
+verified against real ROS7 hardware; password redacted in the audit
+journal and never returned by the read).
 
 ## Feasibility note
 
@@ -83,19 +94,14 @@ separately-argued case. The default stance is: stay API-only.
 
 Tier 1 items have all shipped (v1.3 – v1.5: PPP/PPPoE secrets, NAT rule
 toggle + firewall mangle, and static route add/remove — see "Recently
-shipped" above). Tier 2 is now next.
+shipped" above). Tier 2 is well underway.
 
 ## Tier 2 — valued, mostly reads
 
-- **Certificates** (`/certificate`) — read-only list with **expiry**
-  (days-until-`invalid-after`). This would add a *new* check to `security_audit`
-  (which does not check cert expiry today); an expired cert is a silent outage.
-  Implementation note: RouterOS date formats for `invalid-after` vary by
-  version/locale — parsing needs care.
-- **Users / AAA (read)** (`/user`, groups, active sessions, SSH keys) — audit
-  and visibility only (no creation — see non-goals). Low implementation risk:
-  `security_audit` already reads `/user` internally (`security.py`), so the path
-  is warm; this just surfaces groups/sessions/keys as a first-class tool.
+Certificates (with expiry + a new `security_audit` check), Users/AAA read,
+and RADIUS read all shipped in **v1.6** — see "Recently shipped" above.
+Remaining:
+
 - **SFP / interface optical & link monitor** (`/interface/ethernet/monitor`,
   `once`) — read-only. The command path is verified; the **DDM fields**
   (SFP tx/rx power, temperature, vendor) are **not** yet verified against real
@@ -113,7 +119,6 @@ shipped" above). Tier 2 is now next.
 - **NTP / clock** (`/system/ntp/client`, `/system/clock`) — read plus setting
   NTP servers. Clock drift breaks certs, logs and scheduling. ROS6/7 split to
   handle: ROS6 uses `primary-ntp`/`secondary-ntp`; ROS7 uses a `servers` list.
-- **RADIUS (read)** (`/radius`) — visibility into AAA config; pairs with users.
 
 ## Tier 3 — larger or design-gated
 

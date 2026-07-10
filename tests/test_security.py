@@ -7,6 +7,8 @@ end-to-end tool-call tests).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import pytest
 from librouteros.exceptions import LibRouterosError
 
@@ -421,6 +423,69 @@ def test_users_skips_when_menu_absent(device: Device):
     assert security._check_users(client) == []
 
 
+# --- Check 8: certificate expired / expiring soon (v1.6) -----------------
+
+
+def test_certificate_expiry_flags_expired_cert_via_invalid_after(device: Device):
+    client = _client(
+        device,
+        data={("certificate",): [{"name": "old-cert", "invalid-after": "2000-01-01 00:00:00"}]},
+    )
+    findings = security._check_certificate_expiry(client)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert "old-cert" in findings[0].title
+    assert "expired" in findings[0].title.lower()
+
+
+def test_certificate_expiry_flags_expired_cert_via_expired_flag_even_without_parseable_date(device: Device):
+    """RouterOS's own `expired` boolean must be trusted even when
+    `invalid-after` doesn't parse - never guessed as "not expired" just
+    because the date couldn't be read."""
+    client = _client(
+        device,
+        data={("certificate",): [{"name": "old-cert", "invalid-after": "not-a-date", "expired": True}]},
+    )
+    findings = security._check_certificate_expiry(client)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+
+
+def test_certificate_expiry_flags_expiring_soon_as_medium(device: Device):
+    soon = (datetime.now() + timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+    client = _client(device, data={("certificate",): [{"name": "soon-cert", "invalid-after": soon}]})
+    findings = security._check_certificate_expiry(client)
+    assert len(findings) == 1
+    assert findings[0].severity == "medium"
+    assert "soon-cert" in findings[0].title
+
+
+def test_certificate_expiry_no_finding_when_valid_and_not_expiring_soon(device: Device):
+    far_future = (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    client = _client(
+        device,
+        data={("certificate",): [{"name": "fresh-cert", "invalid-after": far_future, "expired": False}]},
+    )
+    assert security._check_certificate_expiry(client) == []
+
+
+def test_certificate_expiry_no_finding_when_date_unparseable_and_no_expired_flag(device: Device):
+    """Neither `expired` nor a parseable `invalid-after` - must not guess,
+    contributes no finding rather than a false positive/negative."""
+    client = _client(device, data={("certificate",): [{"name": "weird-cert", "invalid-after": "??"}]})
+    assert security._check_certificate_expiry(client) == []
+
+
+def test_certificate_expiry_no_finding_when_no_certificates(device: Device):
+    client = _client(device, data={("certificate",): []})
+    assert security._check_certificate_expiry(client) == []
+
+
+def test_certificate_expiry_skips_when_menu_absent(device: Device):
+    client = _client(device, raise_for={("certificate",): LibRouterosError("no such command")})
+    assert security._check_certificate_expiry(client) == []
+
+
 # --- run_security_audit: aggregation, sorting, summary, resilience -------
 
 
@@ -472,6 +537,7 @@ def test_run_security_audit_never_fails_when_every_menu_is_absent(device: Device
             ("interface", "wireless", "security-profiles"): missing,
             ("interface", "wifi", "security"): missing,
             ("user",): missing,
+            ("certificate",): missing,
         },
     )
     result = security.run_security_audit(client)
@@ -545,11 +611,19 @@ def test_run_security_audit_never_leaks_a_secret(device: Device):
                 {"name": "sec1", "passphrase": marker, "authentication-types": "wpa2-psk"},
             ],
             ("user",): [{"name": "admin", "group": "full", "password": marker}],
+            ("certificate",): [
+                {
+                    "name": "expired-cert",
+                    "invalid-after": "2000-01-01 00:00:00",
+                    "private-key": marker,
+                },
+            ],
         },
     )
     result = security.run_security_audit(client)
-    # At least the telnet/snmp/ros6-wireless/user checks should have fired.
-    assert len(result["findings"]) >= 4
+    # At least the telnet/snmp/ros6-wireless/user/certificate checks should
+    # have fired.
+    assert len(result["findings"]) >= 5
     assert marker not in str(result)
 
 

@@ -7,7 +7,9 @@ conversion.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 _TRUE_STRINGS = {"true", "yes"}
@@ -160,3 +162,91 @@ def split_address_port(value: str) -> tuple[str, str | None]:
         address, _, port = value.partition(":")
         return address, port
     return value, None
+
+
+# v1.6: RouterOS's own two observed shapes for a datetime-valued field (e.g.
+# /certificate's invalid-before/invalid-after) - "2027-01-15 12:00:00"
+# (ISO-ish, seen on some RouterOS builds/locales) and "jan/15/2027 12:00:00"
+# (RouterOS's traditional CLI rendering, also used elsewhere in this codebase -
+# see the ("system", "scheduler") fixture's "next-run" in tests/conftest.py).
+# The month abbreviation is matched against a fixed English table rather than
+# via strptime's locale-dependent "%b", because RouterOS always renders it in
+# English regardless of the server process's own locale - relying on "%b"
+# would make parsing depend on whatever locale this package happens to run
+# under, which has nothing to do with the device.
+_MONTH_ABBREVIATIONS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+_ISO_LIKE_DATETIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}):(\d{2}))?$")
+_ROS_ABBR_DATETIME_RE = re.compile(r"^([A-Za-z]{3})/(\d{1,2})/(\d{4})(?:\s+(\d{1,2}):(\d{2}):(\d{2}))?$")
+
+
+def parse_ros_datetime(value: Any) -> datetime | None:
+    """Best-effort parse of a RouterOS datetime-shaped field (e.g.
+    `/certificate`'s `invalid-before`/`invalid-after`) into a naive
+    `datetime`, or `None` if `value` isn't a string or doesn't match either
+    known RouterOS shape.
+
+    DEFENSIVE, NEVER RAISES: RouterOS's own date rendering varies by version/
+    locale (confirmed shapes: `"2027-01-15 12:00:00"` and
+    `"jan/15/2027 12:00:00"`, the latter with English month abbreviations
+    regardless of the device's own locale - see module note above). A caller
+    that can't parse a given value should treat expiry as unknown - keep the
+    raw field, omit any derived value - rather than guess or raise. This is
+    the same "shape-only, best-effort" spirit `split_address_port` above and
+    `validation.py`'s validators already document.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    match = _ISO_LIKE_DATETIME_RE.match(text)
+    if match:
+        year, month, day, hour, minute, second = match.groups()
+        try:
+            return datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0))
+        except ValueError:
+            return None
+
+    match = _ROS_ABBR_DATETIME_RE.match(text)
+    if match:
+        month_name, day, year, hour, minute, second = match.groups()
+        month = _MONTH_ABBREVIATIONS.get(month_name.lower())
+        if month is None:
+            return None
+        try:
+            return datetime(int(year), month, int(day), int(hour or 0), int(minute or 0), int(second or 0))
+        except ValueError:
+            return None
+
+    return None
+
+
+def days_until(value: Any, now: datetime | None = None) -> int | None:
+    """`(parsed_datetime - now).days` for a RouterOS datetime-shaped field,
+    or `None` if `value` can't be parsed (see `parse_ros_datetime`).
+
+    Used by `certificates` (server.py) and the security-audit certificate-
+    expiry check (security.py) so both compute "days until X" the exact same
+    way - negative once the date is in the past, positive while still ahead.
+    `now` is injectable for deterministic tests; defaults to the real current
+    time.
+    """
+    parsed = parse_ros_datetime(value)
+    if parsed is None:
+        return None
+    return (parsed - (now if now is not None else datetime.now())).days

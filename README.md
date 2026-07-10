@@ -232,6 +232,10 @@ representative exchanges:
 | `hotspot_active` | List clients currently logged into the RouterOS hotspot (user, address, mac-address, uptime, bytes-in/bytes-out). Empty list (not an error) with no hotspot server / no one logged in. See "Hotspot vouchers" below. |
 | `torch` | Live traffic snapshot of one `interface` (`/tool/torch once=yes`) - optional `src_address`/`dst_address`/`port` filters. Sorted by traffic volume (biggest talkers first) and capped at 50 flows, with `truncated`/`total_matched`. See "Live traffic monitoring (torch)" below. |
 | `list_backups` | List backup files on the device (`/file`, filtered to `*.backup`): name, size, creation-time. See "Backup" below. |
+| `certificates` | List certificates (`/certificate`): name, common-name, subject/issuer fields, invalid-before/invalid-after (raw), key-size/key-type, fingerprint, `expired`/`trusted` flags. Adds a computed `daysUntilExpiry` from invalid-after when parseable. **Never exposes a `private-key`**, even defensively. See "AAA/PKI visibility" below. |
+| `users` | List RouterOS login accounts (`/user`): name, group, address (allowed-source restriction), last-logged-in, disabled, comment. `/user` never exposes a password over the API. Read only - no `/user` creation/edit (see "Roadmap & non-goals"). See "AAA/PKI visibility" below. |
+| `user_active` | List currently active RouterOS management login sessions (`/user/active`: name, address, via, when) - who's logged into the device's own admin interface right now. |
+| `radius` | List RADIUS server configuration (`/radius`): service, address, timeout, accounting-port, authentication-port. **Never exposes the shared `secret`**, same redaction mechanism as `ppp_secrets`. See "AAA/PKI visibility" below. |
 
 ### Write (guarded)
 
@@ -763,7 +767,7 @@ the "analyze this router's security" use case: an LLM caller reads config
 and recent logs and reports what it sees, rather than an operator manually
 walking every menu.
 
-**`security_audit(device_name)`** runs seven independent, defensive checks
+**`security_audit(device_name)`** runs eight independent, defensive checks
 and returns `{"findings": [{"severity", "category", "title", "detail",
 "recommendation"}, ...], "summary": {"high", "medium", "low", "info"}}` -
 `findings` sorted by severity (high first), `summary` always including all
@@ -802,6 +806,13 @@ four keys (0 for a severity with no findings):
 7. **Users with a write/full policy** (`/user`): an `info` finding counting
    how many configured accounts have a `write`/`full` group - visibility,
    not a vulnerability by itself.
+8. **Certificate expired or expiring soon** (`/certificate`, v1.6): `high`
+   if a certificate is expired, `medium` if it expires within 30 days.
+   Trusts RouterOS's own `expired` flag (via `coerce_ros_bool`) OR a
+   negative `daysUntilExpiry` computed from `invalid-after` - either is
+   sufficient on its own, so a device that only reliably exposes one of the
+   two still gets a correct answer; a certificate with neither available
+   contributes no finding. See "AAA/PKI visibility" below.
 
 Each check is **defensive**: it reads its own menu(s) and, if that menu
 doesn't exist on this device/RouterOS generation (`DeviceCommandError`),
@@ -841,6 +852,69 @@ unfiltered log via `logs`.
 
 Both tools are **read-only** - neither is gated by `MIKROTIK_ALLOW_WRITE`,
 and neither changes anything on the device.
+
+### AAA/PKI visibility (v1.6)
+
+Four **read-only** tools closing out most of `ROADMAP.md`'s Tier 2 -
+certificate expiry, users/AAA, and RADIUS - all in `src/mcp_mikrotik/server.py`.
+
+**`certificates(device_name)`** lists `/certificate`: name, common-name,
+subject/issuer fields (if present), `invalid-before`/`invalid-after` (raw
+RouterOS date strings), key-size/key-type, fingerprint, and RouterOS's own
+`expired`/`trusted` flags returned as-is (use `formatting.coerce_ros_bool`
+if you need to branch on them rather than just display them).
+
+A computed `daysUntilExpiry` (negative once past due) is added from
+`invalid-after` whenever it can be parsed. RouterOS's own date rendering
+varies by version/locale - `formatting.parse_ros_datetime` handles the two
+confirmed shapes (`"2027-01-15 12:00:00"` and `"jan/15/2027 12:00:00"`, the
+latter matched against a fixed English month-abbreviation table rather than
+`strptime`'s locale-dependent `%b`, since RouterOS always renders it in
+English regardless of the server process's own locale) and is DEFENSIVE BY
+DESIGN: an unrecognized/unparseable date never raises - `daysUntilExpiry` is
+simply omitted and the raw `invalid-after` string is left untouched.
+
+**SECURITY**: `/certificate`'s own API reply never carries a private key
+(RouterOS only returns certificate metadata over the API) - a `private-key`
+field is nonetheless stripped defensively before returning
+(`strip_sensitive_fields`), the same mechanism `ppp_secrets`/
+`wireguard_interfaces` already use, in case a future RouterOS version or
+firmware quirk ever adds one.
+
+`security_audit`'s check #8 (see "Security audit" above) uses this exact
+same expiry logic (`formatting.days_until`) to flag an expired or
+soon-to-expire certificate as a finding, so the read tool and the audit
+check can never disagree about what "expiring soon" means.
+
+**`users(device_name)`** lists `/user`: name, group, `address` (an
+allowed-source restriction, if the account has one), `last-logged-in` (if
+RouterOS exposes it), disabled, comment. `/user`'s own API reply never
+carries a password at all - RouterOS doesn't expose it over the API - so
+there's nothing to strip here, unlike `ppp_secrets`/`radius`. This is a READ
+only: creating or editing a `/user` login stays deliberately out of scope
+for this package - see "Roadmap & non-goals" below for why a router login
+is a different risk class from a service credential like a PPP secret or
+hotspot user.
+
+**`user_active(device_name)`** lists `/user/active`: `name`, `address`,
+`via` (e.g. `api`/`winbox`/`ssh`/`web`), `when` - who is currently logged
+into the device's own management right now, as opposed to `users`'
+CONFIGURED accounts.
+
+**`radius(device_name)`** lists `/radius`: `service`, `address`, `timeout`,
+`accounting-port`, `authentication-port`, and whatever other fields
+RouterOS returns for a given entry.
+
+**SECURITY**: RouterOS's own `/radius` reply carries the plaintext shared
+`secret` - this is ALWAYS stripped before returning
+(`strip_sensitive_fields`), the exact mechanism `ppp_secrets` uses for
+`/ppp/secret`'s `password` and `wireguard_interfaces` uses for a tunnel
+interface's `private-key`. A RADIUS shared secret never leaves this process
+via this tool. See `tests/test_server.py`'s `test_radius_never_exposes_secret`.
+
+All four tools return an empty list (never an error) if their menu is
+unavailable on a given device/RouterOS generation - the same convention
+every other optional read in this package uses.
 
 ### WireGuard management (v0.13)
 

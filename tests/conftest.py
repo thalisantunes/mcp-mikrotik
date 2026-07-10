@@ -376,6 +376,62 @@ def fake_connection() -> FakeConnection:
                 },
                 {".id": "*2", "name": "flash/skins", "type": "directory"},
             ],
+            # v1.6: AAA/PKI visibility - certificates, users, RADIUS.
+            # A far-future invalid-after so `certificates`' happy-path tests
+            # get a stable, always-not-expiring `daysUntilExpiry`; the
+            # ISO-like date shape (as opposed to "jan/15/2027 12:00:00")
+            # exercises the other RouterOS date rendering
+            # formatting.parse_ros_datetime handles - see
+            # test_certificates_happy_path/test_certificate_expiry_check
+            # for coverage of the abbreviated shape and unparseable dates.
+            ("certificate",): [
+                {
+                    ".id": "*1",
+                    "name": "api-cert",
+                    "common-name": "core-switch.example.com",
+                    "invalid-before": "2026-01-01 00:00:00",
+                    "invalid-after": "2099-01-15 12:00:00",
+                    "key-size": "2048",
+                    "key-type": "rsa",
+                    "fingerprint": "AA:BB:CC:DD:EE:FF",
+                    "expired": False,
+                    "trusted": True,
+                }
+            ],
+            ("user",): [
+                {
+                    ".id": "*1",
+                    "name": "admin",
+                    "group": "full",
+                    "address": "",
+                    "last-logged-in": "jan/01/2026 08:00:00",
+                    "disabled": False,
+                    "comment": "",
+                }
+            ],
+            ("user", "active"): [
+                {
+                    ".id": "*1",
+                    "name": "admin",
+                    "address": "10.0.0.5",
+                    "via": "api",
+                    "when": "jan/01/2026 08:00:00",
+                }
+            ],
+            # Carries a fake `secret` so `radius`' redaction (never returning
+            # it) has something real to strip in tests, same convention as
+            # ("ppp", "secret")'s fake `password` above.
+            ("radius",): [
+                {
+                    ".id": "*1",
+                    "service": "ppp",
+                    "address": "10.0.0.200",
+                    "secret": "fake-shared-secret",
+                    "timeout": "300ms",
+                    "accounting-port": "1813",
+                    "authentication-port": "1812",
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
