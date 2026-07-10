@@ -6,10 +6,14 @@ from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
     validate_address_list_name,
     validate_comment,
+    validate_conntrack_dst_port,
+    validate_conntrack_protocol,
     validate_container_identifier,
     validate_dns_name,
     validate_dns_record_type,
     validate_dst_address,
+    validate_firewall_chain,
+    validate_firewall_rule_comment,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
@@ -470,3 +474,93 @@ def test_validate_dns_record_type_rejects_unsupported(value: str):
 def test_validate_dns_record_type_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_dns_record_type(None)  # type: ignore[arg-type]
+
+
+# --- validate_firewall_rule_comment (v0.11) -------------------------------
+
+
+def test_validate_firewall_rule_comment_accepts_valid():
+    assert validate_firewall_rule_comment("Bloqueio_Ataque_X") == "Bloqueio_Ataque_X"
+
+
+def test_validate_firewall_rule_comment_strips_whitespace():
+    assert validate_firewall_rule_comment("  Bloqueio_Ataque_X  ") == "Bloqueio_Ataque_X"
+
+
+@pytest.mark.parametrize("value", ["", "   ", "a" * 256, "bad\ncomment", "bad\x00comment"])
+def test_validate_firewall_rule_comment_rejects_invalid(value: str):
+    """Unlike validate_comment (used for OPTIONAL comment fields elsewhere),
+    an empty string is rejected here too - it can never reliably identify
+    one specific existing rule."""
+    with pytest.raises(ValidationError):
+        validate_firewall_rule_comment(value)
+
+
+def test_validate_firewall_rule_comment_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_firewall_rule_comment(None)  # type: ignore[arg-type]
+
+
+# --- validate_firewall_chain (v0.11) --------------------------------------
+
+
+@pytest.mark.parametrize("value", ["input", "forward", "output", "my-custom-chain", "chain_1"])
+def test_validate_firewall_chain_accepts_valid(value: str):
+    assert validate_firewall_chain(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", "bad chain", "bad;chain", "a" * 65])
+def test_validate_firewall_chain_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_firewall_chain(value)
+
+
+def test_validate_firewall_chain_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_firewall_chain(None)  # type: ignore[arg-type]
+
+
+# --- validate_conntrack_dst_port (v0.11) ----------------------------------
+
+
+@pytest.mark.parametrize("value", [1, 53, 443, 65535])
+def test_validate_conntrack_dst_port_accepts_valid(value: int):
+    assert validate_conntrack_dst_port(value) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 65536, 100000])
+def test_validate_conntrack_dst_port_rejects_out_of_range(value: int):
+    with pytest.raises(ValidationError):
+        validate_conntrack_dst_port(value)
+
+
+@pytest.mark.parametrize("value", ["53", None, 1.5, True, False])
+def test_validate_conntrack_dst_port_rejects_non_int(value):
+    with pytest.raises(ValidationError):
+        validate_conntrack_dst_port(value)  # type: ignore[arg-type]
+
+
+# --- validate_conntrack_protocol (v0.11) ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected", [("tcp", "tcp"), ("TCP", "tcp"), ("Udp", "udp"), ("icmp", "icmp"), ("ipsec-esp", "ipsec-esp")]
+)
+def test_validate_conntrack_protocol_accepts_name_and_normalizes_case(value: str, expected: str):
+    assert validate_conntrack_protocol(value) == expected
+
+
+@pytest.mark.parametrize("value,expected", [("6", "6"), ("17", "17"), ("0", "0"), ("255", "255")])
+def test_validate_conntrack_protocol_accepts_numeric(value: str, expected: str):
+    assert validate_conntrack_protocol(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "256", "-1", "bad protocol", "tcp;drop"])
+def test_validate_conntrack_protocol_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_conntrack_protocol(value)
+
+
+def test_validate_conntrack_protocol_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_conntrack_protocol(None)  # type: ignore[arg-type]

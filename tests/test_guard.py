@@ -2079,3 +2079,165 @@ def test_wake_on_lan_dispatches_via_allowlist_action(
         "path": patched_op.path,
         "fields": {"mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"},
     }
+
+
+# --- enable_firewall_rule / disable_firewall_rule (v0.11) -----------------
+#
+# The shared fixture's ("ip", "firewall", "filter") table (see conftest) has
+# two rows: "*1" (comment "allow established", chain "input", enabled) and
+# "*2" (comment "Bloqueio_Ataque_X", chain "forward", action "drop",
+# pre-created DISABLED - the admin-creates/LLM-enables workflow this pair of
+# tools exists for).
+
+
+def test_enable_firewall_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_firewall_rule(client, settings, comment="Bloqueio_Ataque_X", confirm=True)
+
+
+def test_disable_firewall_rule_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.disable_firewall_rule(client, settings, comment="allow established", confirm=True)
+
+
+def test_enable_firewall_rule_read_only_gate_applies_before_touching_device(
+    device: Device, settings: Settings
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.enable_firewall_rule(guarded_client, settings, comment="Bloqueio_Ataque_X", confirm=True)
+
+
+def test_enable_firewall_rule_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.enable_firewall_rule(
+        client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before["disabled"] == "true"
+    assert preview.after["disabled"] == "no"
+    # The full matched row - chain/action included - not just `disabled`,
+    # so the caller can confirm WHICH rule this is before applying.
+    assert preview.before["chain"] == "forward"
+    assert preview.before["action"] == "drop"
+    row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "Bloqueio_Ataque_X")
+    assert row["disabled"] == "true"
+
+
+def test_enable_firewall_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.enable_firewall_rule(
+        client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True
+    )
+    assert applied.applied is True
+    row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "Bloqueio_Ataque_X")
+    assert row["disabled"] == "no"
+
+
+def test_disable_firewall_rule_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    applied = guard.disable_firewall_rule(
+        client, settings_write_enabled, comment="allow established", confirm=True
+    )
+    assert applied.applied is True
+    row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "allow established")
+    assert row["disabled"] == "yes"
+
+
+def test_enable_firewall_rule_never_creates_a_rule(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """A comment that matches nothing must raise, never silently create a
+    new rule - the one invariant this whole tool pair exists to guarantee."""
+    before_count = len(fake_connection.path("ip", "firewall", "filter")._rows)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.enable_firewall_rule(client, settings_write_enabled, comment="no-such-comment", confirm=True)
+    assert "no-such-comment" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "filter")._rows) == before_count
+
+
+def test_disable_firewall_rule_unknown_comment_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.disable_firewall_rule(client, settings_write_enabled, comment="ghost", confirm=True)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_enable_firewall_rule_ambiguous_comment_raises_ambiguous_resource_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """Two rules can legitimately share a comment on different chains - the
+    tool must never guess which one to toggle."""
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.enable_firewall_rule(client, settings_write_enabled, comment="dup", confirm=True)
+    assert "dup" in str(exc_info.value)
+    # Neither row was touched.
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "filter")._rows)
+
+
+def test_enable_firewall_rule_disambiguated_by_chain(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.enable_firewall_rule(
+        client, settings_write_enabled, comment="dup", chain="forward", confirm=True
+    )
+    assert applied.applied is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "filter")._rows}
+    assert rows == {"input": "true", "forward": "no"}
+
+
+def test_enable_firewall_rule_rejects_empty_comment_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.enable_firewall_rule(guarded_client, settings_write_enabled, comment="", confirm=True)
+
+
+def test_disable_firewall_rule_rejects_invalid_chain_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.disable_firewall_rule(
+            guarded_client, settings_write_enabled, comment="allow established", chain="bad chain!", confirm=True
+        )
+
+
+def test_enable_firewall_rule_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["enable_firewall_rule"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "enable_firewall_rule", patched_op)
+
+    guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*2", "disabled": "no"}}

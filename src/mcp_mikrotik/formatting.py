@@ -60,3 +60,38 @@ def strip_sensitive_fields(rows: Iterable[dict[str, Any]], keys: Iterable[str]) 
     """
     key_set = set(keys)
     return [{field: value for field, value in row.items() if field not in key_set} for row in rows]
+
+
+def split_address_port(value: str) -> tuple[str, str | None]:
+    """Split a RouterOS connection-tracking address field into (address, port).
+
+    v0.11: `/ip/firewall/connection`'s `src-address`/`dst-address` fields
+    pack the port into the same string as the address - e.g.
+    "192.0.2.1:80" (IPv4:port), "[2001:db8::1]:80" (bracketed IPv6:port).
+    Used by `connection_tracking` (server.py) to filter/report address and
+    port as separate values instead of a caller having to parse this
+    RouterOS-specific packed format itself.
+
+    Best-effort, not an exhaustive RouterOS grammar (same spirit as
+    validation.py's shape-only checks): a bracketed IPv6 address is parsed
+    by its '[' / ']' delimiters; a value with exactly one ':' is treated as
+    "address:port" (always true for an IPv4:port pair, since a bare IPv4
+    address never itself contains a ':'); anything else - a bare/unbracketed
+    IPv6 address (multiple ':', no brackets), or an empty string - is
+    returned as-is with port=None rather than guessed at.
+    """
+    if not value:
+        return "", None
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            address = value[1:end]
+            rest = value[end + 1 :]
+            if rest.startswith(":"):
+                return address, rest[1:]
+            return address, None
+        return value, None
+    if value.count(":") == 1:
+        address, _, port = value.partition(":")
+        return address, port
+    return value, None

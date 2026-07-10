@@ -3,6 +3,89 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.11.0] - Unreleased
+
+SAFE firewall control round: two new guarded write tools -
+`enable_firewall_rule`/`disable_firewall_rule` - and one new filtered read
+tool - `connection_tracking`. Same write-guard mechanism as every previous
+round (read-only default, central allowlist, confirm/preview, audit
+journal, no secrets logged) - none of it weakened or bypassed; the firewall
+tools' `action` stays a plain `"update"` (no new dispatch mechanism), so
+they need none of the `getattr(client, op.action)` extension work v0.7's
+`start_container`/`stop_container` or v0.10's `clear_dns_cache`/
+`wake_on_lan` needed.
+
+### Added
+
+- **`enable_firewall_rule`** / **`disable_firewall_rule`** (write, guarded,
+  `src/mcp_mikrotik/guard.py` + `server.py`): flip an EXISTING
+  `/ip/firewall/filter` rule's `disabled` field (`/ip/firewall/filter set
+  disabled=no|yes`) - resolved by the rule's `comment` (a STABLE,
+  admin-controlled identifier), optionally narrowed by `chain` if more than
+  one rule shares that comment. **Never creates a rule**: a `comment` that
+  matches nothing raises `ResourceNotFoundError` (never falls back to
+  creating one); a `comment` that still matches more than one row after
+  narrowing raises `AmbiguousResourceError` - the tool never guesses which
+  one to toggle. The returned preview's `before`/`after` are the FULL
+  matched rule (every field RouterOS returned - `chain`/`action`/etc, not
+  just `disabled`), so an operator can confirm WHICH rule this is before
+  ever passing `confirm=true`.
+
+  This is the community-suggested SAFE alternative to a general
+  firewall-filter write tool (still deliberately absent - see
+  `guard.ALLOWLIST`'s comment and README's "Roadmap / non-goals"): an admin
+  creates a rule ahead of time on the device itself (e.g. `comment=
+  "Bloqueio_Ataque_X"`, `disabled=yes`), reviews it once, and an LLM caller
+  later enables it via `enable_firewall_rule` when it detects the condition
+  the rule exists to guard against. If something goes wrong, the admin
+  knows exactly which rule was toggled - the same one they already wrote
+  and reviewed, never one this package authored on its own judgment. See
+  README's "Firewall rule toggle (by comment)".
+
+- **`connection_tracking`** (read, `server.py`): lists active connections
+  from RouterOS's connection tracking table (`/ip/firewall/connection`).
+  Unlike every other read tool in this package, a filter is MANDATORY - at
+  least one of `src_address`/`dst_address`/`dst_port`/`protocol` must be
+  given, or the tool raises `ValidationError` before ever touching the
+  device. This exists specifically to avoid a community-reported gotcha:
+  the full connection-tracking table on a production router can be large
+  enough to blow straight past an LLM caller's context/token budget on its
+  own. Filtering happens client-side after reading the table (the same
+  reasoning `logs`' `topics` filter already documents - RouterOS's
+  structured API doesn't expose a query-by-field read here either), and the
+  result is hard-capped at `MAX_CONNTRACK_LIMIT` (100) rows regardless of
+  how many match - the returned `truncated` field is `true` whenever more
+  rows matched than were returned, and `total_matched` always reports the
+  real, pre-truncation count.
+
+  `src_address`/`dst_address` match a row's IP, ignoring the port RouterOS
+  packs into the same field (e.g. `"192.0.2.1:80"`); `dst_port` matches the
+  destination's port component. `protocol` is a RouterOS protocol name
+  (case-insensitive) or a numeric IP protocol number (0-255). Each returned
+  entry: `protocol`, `src-address`/`src-port`, `dst-address`/`dst-port`
+  (address and port split apart - see `formatting.split_address_port`),
+  `tcp-state` (populated for TCP connections), `timeout`, and the
+  `assured`/`confirmed`/`seen-reply` flags - RouterOS's own closest
+  equivalent to a generic "connection state" for this table. See README's
+  "Connection tracking (filtered)".
+
+- `validation.validate_firewall_rule_comment`/`validate_firewall_chain`
+  (`src/mcp_mikrotik/validation.py`, new): a firewall filter rule's
+  `comment` (MANDATORY and non-empty here, unlike `validate_comment`'s
+  OPTIONAL free-text field elsewhere - an empty comment can never reliably
+  identify one specific existing rule) and its `chain` (shape-only, not
+  restricted to the three built-in chains - RouterOS allows arbitrary
+  custom jump-target chains too).
+- `validation.validate_conntrack_dst_port`/`validate_conntrack_protocol`
+  (new): `connection_tracking`'s `dst_port` (integer, 1-65535) and
+  `protocol` (a RouterOS protocol name, case-insensitive, or a numeric
+  0-255 protocol number) filter values.
+- `formatting.split_address_port` (new): splits a RouterOS
+  connection-tracking address field ("192.0.2.1:80",
+  "[2001:db8::1]:80", or a bare address with no port at all) into
+  `(address, port)` - used by `connection_tracking` to report/filter
+  address and port as separate values instead of RouterOS's packed format.
+
 ## [0.10.0] - Unreleased
 
 DNS/DHCP/Wake-on-LAN **write** round: five new guarded write tools -

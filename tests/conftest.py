@@ -56,7 +56,49 @@ def fake_connection() -> FakeConnection:
                 {"name": "example.com", "type": "A", "data": "93.184.216.34", "ttl": "1h"}
             ],
             ("ip", "firewall", "filter"): [
-                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established"}
+                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established"},
+                # v0.11: a pre-created, disabled rule an admin left ready for
+                # enable_firewall_rule to flip on by `comment` - the
+                # community-suggested "admin creates disabled, LLM enables"
+                # workflow (see README's "Firewall rule toggle (by
+                # comment)").
+                {
+                    ".id": "*2",
+                    "chain": "forward",
+                    "action": "drop",
+                    "comment": "Bloqueio_Ataque_X",
+                    "disabled": "true",
+                },
+            ],
+            # v0.11: connection tracking - one TCP and one UDP entry so
+            # tests can filter by src/dst address, port, and protocol
+            # independently.
+            ("ip", "firewall", "connection"): [
+                {
+                    ".id": "*1",
+                    "protocol": "tcp",
+                    "src-address": "10.0.0.50:51413",
+                    "dst-address": "93.184.216.34:443",
+                    "reply-src-address": "93.184.216.34:443",
+                    "reply-dst-address": "10.0.0.50:51413",
+                    "tcp-state": "established",
+                    "timeout": "1d",
+                    "assured": "true",
+                    "confirmed": "true",
+                    "seen-reply": "true",
+                },
+                {
+                    ".id": "*2",
+                    "protocol": "udp",
+                    "src-address": "10.0.0.60:33221",
+                    "dst-address": "8.8.8.8:53",
+                    "reply-src-address": "8.8.8.8:53",
+                    "reply-dst-address": "10.0.0.60:33221",
+                    "timeout": "10s",
+                    "assured": "false",
+                    "confirmed": "true",
+                    "seen-reply": "true",
+                },
             ],
             ("system", "health"): [
                 {"name": "voltage", "value": "24.1", "type": "V"},

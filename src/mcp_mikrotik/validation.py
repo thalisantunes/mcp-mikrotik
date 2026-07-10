@@ -496,3 +496,100 @@ def validate_dns_record_type(value: str) -> str:
             f"DNS record type {value!r} is not valid (expected one of {_DNS_RECORD_TYPES})."
         )
     return normalized
+
+
+# --- v0.11: firewall rule toggle (by comment) + connection tracking --------
+
+# A firewall filter rule's `chain` (e.g. "input"/"forward"/"output", or a
+# custom jump-target chain) - used only as an OPTIONAL disambiguator when
+# enable_firewall_rule/disable_firewall_rule's `comment` still matches more
+# than one rule (see guard._find_firewall_rule_rows). Shape-only, same
+# conservative charset as `_INTERFACE_NAME`/`_LIST_NAME` - not restricted to
+# a fixed enum, since RouterOS allows arbitrary custom chains too.
+_CHAIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def validate_firewall_rule_comment(value: str) -> str:
+    """Validate a firewall filter rule's `comment` - the STABLE, MANDATORY
+    identifier `enable_firewall_rule`/`disable_firewall_rule` resolve a rule
+    by (never a dynamic `.id`/list index - see guard.py's module docstring
+    for why that matters). Unlike `validate_comment` (used elsewhere for an
+    OPTIONAL free-text field on a write that creates something new), an
+    EMPTY comment is rejected here outright: it can never reliably identify
+    one specific EXISTING rule on a device that may have several
+    undecorated ones.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(
+            "comment must be a non-empty string - it identifies which existing firewall rule to toggle."
+        )
+    value = value.strip()
+    if len(value) > _MAX_COMMENT_LENGTH:
+        raise ValidationError(f"comment is too long (max {_MAX_COMMENT_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("comment contains control characters, which are not allowed.")
+    return value
+
+
+def validate_firewall_chain(value: str) -> str:
+    """Validate a firewall filter rule's `chain`, used only to narrow
+    `enable_firewall_rule`/`disable_firewall_rule`'s `comment` match when it
+    is still ambiguous after matching on `comment` alone. Shape-only (see
+    `_CHAIN_NAME`) - not restricted to the three built-in chains, since
+    RouterOS allows arbitrary custom jump-target chains too.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("chain must be a non-empty string.")
+    value = value.strip()
+    if not _CHAIN_NAME.match(value):
+        raise ValidationError(
+            f"chain {value!r} is not valid "
+            "(letters, digits, '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return value
+
+
+def validate_conntrack_dst_port(value: int) -> int:
+    """Validate `connection_tracking`'s `dst_port` filter: an integer
+    1-65535, the standard TCP/UDP port range.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"dst_port must be an integer, got {value!r}.")
+    if not (1 <= value <= 65535):
+        raise ValidationError(f"dst_port {value!r} is out of range (expected 1-65535).")
+    return value
+
+
+# RouterOS connection-tracking `protocol` values: a protocol name (e.g.
+# "tcp", "udp", "icmp", "gre", "ipsec-esp", ...) or a numeric IP protocol
+# number (0-255). Like `_CHAIN_NAME`/`validate_container_identifier`, the
+# name form is checked for a conservative shape only - not exhaustively
+# enumerated against RouterOS's own (long) protocol name list.
+_PROTOCOL_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
+def validate_conntrack_protocol(value: str) -> str:
+    """Validate `connection_tracking`'s `protocol` filter: a RouterOS
+    protocol name (case-insensitive, normalized to lower-case - e.g. "tcp",
+    "TCP", and "Tcp" all return "tcp") or a numeric IP protocol number as a
+    string ("0"-"255").
+
+    Returns the normalized value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("protocol must be a non-empty string.")
+    value = value.strip().lower()
+    if value.isdigit():
+        number = int(value)
+        if not (0 <= number <= 255):
+            raise ValidationError(f"protocol {value!r} is out of range (expected 0-255 for a numeric protocol).")
+        return value
+    if _PROTOCOL_NAME.match(value):
+        return value
+    raise ValidationError(f"protocol {value!r} is not a valid RouterOS protocol name or number (0-255).")

@@ -76,6 +76,9 @@ EXPECTED_TOOLS = {
     "clear_dns_cache",
     "remove_dhcp_lease",
     "wake_on_lan",
+    "connection_tracking",
+    "enable_firewall_rule",
+    "disable_firewall_rule",
 }
 
 
@@ -1954,6 +1957,295 @@ async def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings: 
             "wake_on_lan", {"device_name": "core-switch", "mac_address": "not-a-mac", "interface": "ether1", "confirm": True}
         )
     assert "not valid" in str(exc_info.value)
+
+
+# --- connection_tracking (v0.11) -----------------------------------------
+#
+# The shared fixture's ("ip", "firewall", "connection") table (see
+# conftest) has two rows: a TCP connection (10.0.0.50:51413 ->
+# 93.184.216.34:443, tcp-state "established") and a UDP one
+# (10.0.0.60:33221 -> 8.8.8.8:53).
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_requires_at_least_one_filter(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("connection_tracking", {"device_name": "core-switch"})
+    assert "filter" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_not_gated_by_read_only(settings: Settings, fake_connection: FakeConnection):
+    """Read-only, unlike every write tool - must work with the default
+    (allow_write=False) settings fixture."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "protocol": "tcp"}
+    )
+    assert result["total_matched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_filters_by_src_address(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "src_address": "10.0.0.50"}
+    )
+    assert result["total_matched"] == 1
+    entry = result["connections"][0]
+    assert entry["src-address"] == "10.0.0.50"
+    assert entry["src-port"] == "51413"
+    assert entry["dst-address"] == "93.184.216.34"
+    assert entry["dst-port"] == "443"
+    assert entry["protocol"] == "tcp"
+    assert entry["tcp-state"] == "established"
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_filters_by_dst_address(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "dst_address": "8.8.8.8"}
+    )
+    assert result["total_matched"] == 1
+    assert result["connections"][0]["protocol"] == "udp"
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_filters_by_dst_port(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "dst_port": 53}
+    )
+    assert result["total_matched"] == 1
+    assert result["connections"][0]["dst-address"] == "8.8.8.8"
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_filters_by_protocol_only_returns_matches(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "protocol": "udp"}
+    )
+    assert result["total_matched"] == 1
+    assert result["connections"][0]["src-address"] == "10.0.0.60"
+    assert result["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_combining_filters_that_match_nothing_returns_empty(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "src_address": "10.0.0.50", "protocol": "udp"}
+    )
+    assert result["connections"] == []
+    assert result["total_matched"] == 0
+    assert result["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_truncates_and_signals_it(device: Device):
+    rows = [
+        {
+            ".id": f"*{i}",
+            "protocol": "tcp",
+            "src-address": f"10.0.0.{i % 250 + 1}:1234",
+            "dst-address": "93.184.216.34:443",
+        }
+        for i in range(150)
+    ]
+    fake = FakeConnection(data={("ip", "firewall", "connection"): rows})
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "protocol": "tcp"}
+    )
+    assert result["total_matched"] == 150
+    assert len(result["connections"]) == 100
+    assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_rejects_invalid_dst_port(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("connection_tracking", {"device_name": "core-switch", "dst_port": 70000})
+    assert "dst_port" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_rejects_invalid_src_address(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "connection_tracking", {"device_name": "core-switch", "src_address": "not-an-ip"}
+        )
+    assert "not a valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_connection_tracking_handles_bracketed_ipv6_and_portless_addresses(device: Device):
+    """RouterOS's src-address/dst-address field packs address+port together
+    - split_address_port (formatting.py) must handle a bracketed IPv6:port
+    pair and a bare address with no port at all (e.g. an ICMP entry, which
+    has no port concept)."""
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "connection"): [
+                {
+                    ".id": "*1",
+                    "protocol": "tcp",
+                    "src-address": "[2001:db8::1]:443",
+                    "dst-address": "[2001:db8::2]:51413",
+                },
+                {
+                    ".id": "*2",
+                    "protocol": "icmp",
+                    "src-address": "10.0.0.5",
+                    "dst-address": "10.0.0.6",
+                },
+            ]
+        }
+    )
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "src_address": "2001:db8::1"}
+    )
+    assert result["total_matched"] == 1
+    entry = result["connections"][0]
+    assert entry["src-address"] == "2001:db8::1"
+    assert entry["src-port"] == "443"
+
+    _content, result = await mcp.call_tool(
+        "connection_tracking", {"device_name": "core-switch", "protocol": "icmp"}
+    )
+    assert result["total_matched"] == 1
+    entry = result["connections"][0]
+    assert entry["src-address"] == "10.0.0.5"
+    assert entry["src-port"] is None
+
+
+# --- enable_firewall_rule / disable_firewall_rule (v0.11) -----------------
+#
+# The shared fixture's ("ip", "firewall", "filter") table (see conftest) has
+# a pre-created, disabled rule with comment "Bloqueio_Ataque_X" (chain
+# "forward", action "drop") - the admin-creates/LLM-enables workflow this
+# tool pair exists for.
+
+
+@pytest.mark.asyncio
+async def test_enable_firewall_rule_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_firewall_rule", {"device_name": "core-switch", "comment": "Bloqueio_Ataque_X", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_firewall_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "enable_firewall_rule", {"device_name": "core-switch", "comment": "Bloqueio_Ataque_X", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["disabled"] == "true"
+    assert preview["after"]["disabled"] == "no"
+    # The full matched rule - not just `disabled` - so the operator can
+    # confirm WHICH rule this is before applying.
+    assert preview["before"]["chain"] == "forward"
+    assert preview["before"]["action"] == "drop"
+    rows = fake_connection.path("ip", "firewall", "filter")._rows
+    assert next(r for r in rows if r["comment"] == "Bloqueio_Ataque_X")["disabled"] == "true"
+
+    _content, applied = await mcp.call_tool(
+        "enable_firewall_rule", {"device_name": "core-switch", "comment": "Bloqueio_Ataque_X", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "filter")._rows
+    assert next(r for r in rows if r["comment"] == "Bloqueio_Ataque_X")["disabled"] == "no"
+    # No rule was created - still exactly the two rules the fixture started with.
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_disable_firewall_rule_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "disable_firewall_rule", {"device_name": "core-switch", "comment": "allow established", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "firewall", "filter")._rows
+    assert next(r for r in rows if r["comment"] == "allow established")["disabled"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_enable_firewall_rule_unknown_comment_raises_clear_error_and_creates_nothing(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_firewall_rule", {"device_name": "core-switch", "comment": "no-such-rule", "confirm": True}
+        )
+    assert "no-such-rule" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "firewall", "filter")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_enable_firewall_rule_ambiguous_comment_raises_and_disambiguated_by_chain(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_firewall_rule", {"device_name": "core-switch", "comment": "dup", "confirm": True})
+    assert "ambiguous" in str(exc_info.value).lower()
+    # Neither row was touched.
+    assert all(row.get("disabled") == "true" for row in fake.path("ip", "firewall", "filter")._rows)
+
+    _content, applied = await mcp.call_tool(
+        "enable_firewall_rule",
+        {"device_name": "core-switch", "comment": "dup", "chain": "forward", "confirm": True},
+    )
+    assert applied["applied"] is True
+    rows = {row["chain"]: row["disabled"] for row in fake.path("ip", "firewall", "filter")._rows}
+    assert rows == {"input": "true", "forward": "no"}
+
+
+@pytest.mark.asyncio
+async def test_enable_firewall_rule_rejects_empty_comment_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("enable_firewall_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
+    assert "non-empty" in str(exc_info.value)
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------

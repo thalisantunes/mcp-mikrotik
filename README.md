@@ -13,26 +13,36 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.10: everything from v0.9 (the core read-tool inventory, `ping`/
-`traceroute` diagnostics, guarded write tools through the v0.9 failover
-round, production-hardening layers - audit journal, correlation ids, read
-retry, circuit breaker), plus a DNS/DHCP/Wake-on-LAN **write** round: five
-new guarded write tools - `add_static_dns`/`remove_static_dns` (a named
-`/ip/dns/static` entry - an "A" address record or a "CNAME" alias, resolved
-by the STABLE `name`+`record_type` pair, never a dynamic `.id`/index),
-`clear_dns_cache` (flush `/ip/dns/cache`), `remove_dhcp_lease` (remove a
-dynamic OR static `/ip/dhcp-server/lease` row - typically to force a client
-to renew its IP), and `wake_on_lan` (send a `/tool/wol` magic packet).
-`clear_dns_cache`/`wake_on_lan` are the second pair of guarded writes (after
-v0.7's `start_container`/`stop_container`) whose RouterOS operation is an
-ACTION command rather than an update/add/remove `set` - see "Security
-model" below. `remove_dhcp_lease`'s preview carries a `warning` field
-whenever the resolved lease is static - see "DHCP lease removal" below. All
-five go through the exact same write-guard mechanism as every other write
-tool. See `CHANGELOG.md` for what changed since v0.1.0, and
+v0.11: everything from v0.10 (the core read-tool inventory, `ping`/
+`traceroute` diagnostics, guarded write tools through the v0.10
+DNS/DHCP/Wake-on-LAN round, production-hardening layers - audit journal,
+correlation ids, read retry, circuit breaker), plus a SAFE firewall control
+round: two new guarded write tools - `enable_firewall_rule`/
+`disable_firewall_rule` - and one new filtered read tool -
+`connection_tracking`.
+
+`enable_firewall_rule`/`disable_firewall_rule` deliberately do **not**
+create or otherwise edit a firewall rule (see "Roadmap / non-goals" below
+for why full firewall filter writes still aren't exposed): they only ever
+flip an **existing** rule's `disabled` field, resolved by its `comment` - a
+STABLE, admin-controlled identifier, never a dynamic `.id`/list index. The
+intended workflow: an admin creates a rule ahead of time, reviews it once,
+and leaves it disabled; an LLM caller enables it later when it detects the
+condition the rule exists to guard against. See "Firewall rule toggle (by
+comment)" below.
+
+`connection_tracking` reads `/ip/firewall/connection`, but - unlike every
+other read tool in this package - REQUIRES at least one filter
+(`src_address`/`dst_address`/`dst_port`/`protocol`): the full table on a
+production router can be large enough to blow past an LLM caller's
+context/token budget on its own. The result is also hard-capped at 100
+rows, with a `truncated` flag whenever more matched than were returned. See
+"Connection tracking (filtered)" below.
+
+See `CHANGELOG.md` for what changed since v0.1.0, and
 `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
-The full pytest suite currently has 732 tests, all passing against the
+The full pytest suite currently has 815 tests, all passing against the
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
@@ -122,6 +132,7 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `netwatch` | List Netwatch host monitors (host, status up/down, interval, since, comment, disabled, plus `has-up-script`/`has-down-script` presence booleans - never the raw script body). The key read for diagnosing/building failover. See "VPN & routing diagnostics" below. |
 | `dns_cache` | List cached DNS records (name, type, data, ttl). |
 | `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
+| `connection_tracking` | List active connections from `/ip/firewall/connection`, **FILTERED** - at least one of `src_address`/`dst_address`/`dst_port`/`protocol` is required (a `ValidationError` otherwise); capped at 100 rows with a `truncated` flag. See "Connection tracking (filtered)" below. |
 | `system_health` | System health metrics (voltage, temperature, ...), if the device exposes any; empty list otherwise. |
 | `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
 | `ping` | Ping an address from the device; `address` is validated as IPv4/IPv6/hostname before use. |
@@ -168,9 +179,13 @@ model" below for the full guard mechanism.
 | `clear_dns_cache` | Flush the device's DNS resolver cache (`/ip/dns/cache/flush`, no arguments). Benign (only cached answers are cleared), but still guarded/confirm-gated. |
 | `remove_dhcp_lease` | Remove a DHCP lease (dynamic OR static) by `address` or `mac_address` - typically to force a client to renew its IP. **The returned preview's `warning` field is non-null if the resolved lease is STATIC** - removing it deletes the pinned IP↔MAC mapping, not just a renewable entry. See "DHCP lease removal" below. |
 | `wake_on_lan` | Send a Wake-on-LAN magic packet (`/tool/wol`) for `mac_address`, out `interface`. Benign and targets no existing device row, but still guarded/confirm-gated. See "Wake-on-LAN" below. |
+| `enable_firewall_rule` | Enable an **EXISTING** firewall filter rule (`disabled=no`), resolved by its `comment` (optionally narrowed by `chain`). **Never creates a rule.** See "Firewall rule toggle (by comment)" below. |
+| `disable_firewall_rule` | Disable an **EXISTING** firewall filter rule (`disabled=yes`). Same resolution/never-creates guarantee as `enable_firewall_rule`. |
 
-Not yet exposed, deliberately: device reboot and firewall rule writes. See
-"Roadmap / non-goals" below for why.
+Not yet exposed, deliberately: device reboot, and creating/generally
+modifying a firewall filter rule (only the narrow `disabled` TOGGLE of an
+existing, admin-authored rule is exposed - see "Firewall rule toggle (by
+comment)" below). See "Roadmap / non-goals" below for why.
 
 ### Limiting a client's bandwidth (v0.3)
 
@@ -193,7 +208,10 @@ so a queue created by `set_client_bandwidth` can silently have zero effect
 on a client whose traffic is already being fasttracked. If a limit doesn't
 seem to be taking effect, check `firewall_filter` for a FastTrack rule and
 adjust/disable it for the traffic you're trying to limit. `mcp-mikrotik`
-does not modify firewall rules itself (see "Roadmap / non-goals" below).
+does not create or generally modify firewall rules - the only firewall
+filter write exposed is the narrow `disabled` toggle of an existing rule
+(`enable_firewall_rule`/`disable_firewall_rule` - see "Firewall rule toggle
+(by comment)" below).
 
 ### Blocking/allowing a client via address lists (v0.4)
 
@@ -207,11 +225,14 @@ same list name, e.g.:
 /ip firewall filter add chain=forward src-address-list=blocked-clients action=drop
 ```
 
-`mcp-mikrotik` does not create, modify, or inspect that rule for you (see
-"Roadmap / non-goals" below for why firewall filter writes aren't exposed at
-all yet) - use `firewall_filter` to check whether a rule referencing your
-list already exists on the device before relying on `add_to_address_list` to
-actually block or allow anyone. The typical flow:
+`mcp-mikrotik` does not create or generally modify that rule for you - the
+only firewall filter write exposed is the narrow `disabled` TOGGLE of an
+existing, admin-authored rule (`enable_firewall_rule`/`disable_firewall_rule`
+- see "Firewall rule toggle (by comment)" below, and "Roadmap / non-goals"
+further below for why rule creation itself still isn't) - use
+`firewall_filter` to check whether a rule referencing your list already
+exists on the device before relying on `add_to_address_list` to actually
+block or allow anyone. The typical flow:
 
 1. Confirm (once, out of band - e.g. via WinBox/CLI, or just by reading
    `firewall_filter`) that a filter rule referencing your list name exists,
@@ -477,6 +498,76 @@ interface name at send time). Benign - it never changes device
 configuration - but still guarded/confirm-gated like every other write
 tool, so an LLM caller can't wake a machine "by accident".
 
+### Firewall rule toggle (by comment) (v0.11)
+
+Creating or generally modifying a firewall filter rule stays out of scope
+(see "Roadmap / non-goals" below): a single wrong rule - e.g. one that
+blocks the API port itself - can lock out all remote management access to
+the device, with no way to recover it over the same connection. That risk
+can't be designed away from inside the tool itself, so instead of exposing
+rule authorship, v0.11 exposes only the narrowest safe operation on top of
+an **existing** rule: flipping its `disabled` field.
+
+**The intended workflow** (the community-suggested design this round
+follows): an admin creates a rule ahead of time, on the device itself,
+reviews it once, and leaves it disabled -
+
+```
+/ip firewall filter add chain=forward src-address-list=attacker-x \
+  action=drop comment="Bloqueio_Ataque_X" disabled=yes
+```
+
+- and an LLM caller later enables it via `enable_firewall_rule` when it
+detects the condition the rule exists to guard against:
+
+```
+enable_firewall_rule(device_name="core-switch", comment="Bloqueio_Ataque_X", confirm=false)  # preview
+enable_firewall_rule(device_name="core-switch", comment="Bloqueio_Ataque_X", confirm=true)   # apply
+```
+
+If something goes wrong, the admin knows exactly which rule was toggled -
+the same one they already wrote and reviewed, never a rule this package
+authored on its own judgment. `disable_firewall_rule` reverses it the same
+way.
+
+**Resolution: `comment`, never a dynamic index.** Both tools resolve the
+target rule by its `comment` - a STABLE, admin-controlled identifier -
+optionally narrowed by `chain` if two rules share the same comment on
+different chains. A `comment` that matches no rule raises
+`ResourceNotFoundError` (never falls back to creating one); a `comment`
+that still matches more than one rule after narrowing raises
+`AmbiguousResourceError` - the tool never guesses which one to toggle. The
+returned preview's `before`/`after` are the **full** matched rule (every
+field RouterOS returned for it - `chain`/`action`/etc, not just
+`disabled`), so the caller can confirm WHICH rule this is before ever
+passing `confirm=true`.
+
+### Connection tracking (filtered) (v0.11)
+
+`connection_tracking` reads RouterOS's connection tracking table
+(`/ip/firewall/connection`) - useful to see what a client is actually
+talking to right now, e.g. while investigating the traffic a
+`set_client_bandwidth`/`add_to_address_list` decision was based on.
+
+**A filter is mandatory** - on a production router, the full table can be
+large enough to blow straight past an LLM caller's context/token budget on
+its own (a community-reported gotcha this tool is built to avoid). Calling
+it with none of `src_address`/`dst_address`/`dst_port`/`protocol` set raises
+a `ValidationError` instead of returning everything.
+
+The result is also hard-capped at 100 rows regardless of how many match:
+`truncated` is `true` whenever more rows matched than were returned, and
+`total_matched` always reports the real, pre-truncation count - so a caller
+always knows whether it's seeing everything or should narrow the filter
+further.
+
+Each returned entry: `protocol`, `src-address`/`src-port` and
+`dst-address`/`dst-port` (RouterOS packs address+port into one field, e.g.
+`"192.0.2.1:80"` - this tool splits them apart), `tcp-state` (populated for
+TCP connections), `timeout`, and the `assured`/`confirmed`/`seen-reply`
+flags - RouterOS's own closest equivalent to a generic "connection state"
+for this table.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -554,19 +645,22 @@ On top of the write guard:
 - **Never creates the target.** Write tools that operate on a named resource
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
   `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`/
-  `set_route_distance`/`enable_route`/`disable_route`/`remove_netwatch`)
-  look it up first - by name, or, for the v0.9 route tools, by the stable
-  `dst-address` (+`gateway`/`comment`) identifier described in "Failover
-  control" above. If nothing matches, the tool raises a clear error instead
-  of creating one - a typo can never silently provision something new.
-  `set_poe_out` additionally requires the matched interface to actually
-  have a `poe-out` field (i.e. be PoE-capable hardware) - a name that
-  exists but isn't a PoE port raises the same clear error rather than doing
-  nothing silently. The v0.9 route tools additionally never resolve by a
-  RouterOS `.id` or a list index (both can shift as routes are added/
-  removed elsewhere on the device); if a route's identifier still matches
-  more than one row after narrowing, `AmbiguousResourceError` is raised
-  instead of guessing which one to touch.
+  `set_route_distance`/`enable_route`/`disable_route`/`remove_netwatch`/
+  `enable_firewall_rule`/`disable_firewall_rule`)
+  look it up first - by name, by the v0.9 route tools' stable `dst-address`
+  (+`gateway`/`comment`) identifier described in "Failover control" above,
+  or, for the v0.11 firewall rule tools, by `comment` (+`chain`) described
+  in "Firewall rule toggle (by comment)" above. If nothing matches, the tool
+  raises a clear error instead of creating one - a typo can never silently
+  provision something new. `set_poe_out` additionally requires the matched
+  interface to actually have a `poe-out` field (i.e. be PoE-capable
+  hardware) - a name that exists but isn't a PoE port raises the same clear
+  error rather than doing nothing silently. The v0.9 route tools and the
+  v0.11 firewall rule tools additionally never resolve by a RouterOS `.id`
+  or a list index (both can shift as rows are added/removed elsewhere on
+  the device); if an identifier still matches more than one row after
+  narrowing, `AmbiguousResourceError` is raised instead of guessing which
+  one to touch.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
   existing lease on the given `mac_address` first, `add_to_address_list`
   checks for an existing entry with the same `list_name`+`address` pair
@@ -703,17 +797,30 @@ Python 3.11 and 3.12.
   the two simplest static DNS record types (`"A"`/`"CNAME"`) are exposed;
   other RouterOS record types (`AAAA`/`MX`/`TXT`/`NS`/...) are a future
   round's decision, not silently widened here.
-- Two write operations are deliberately **not** exposed yet, each because
-  the standard guard/confirm/preview mechanism isn't sufficient protection
-  on its own - see the comment above `ALLOWLIST` in `guard.py`:
+- **Firewall rule toggle + connection tracking** (`enable_firewall_rule`/
+  `disable_firewall_rule`, `connection_tracking`) shipped in v0.11 - see
+  "Firewall rule toggle (by comment)" and "Connection tracking (filtered)"
+  above. The firewall rule tools deliberately expose only a `disabled`
+  TOGGLE on an existing, admin-authored rule (resolved by `comment`) - not
+  rule creation or any other field. `connection_tracking` deliberately
+  requires a filter and hard-caps its result at 100 rows - see its own
+  section above for why.
+- One write operation is deliberately **not** exposed yet, because the
+  standard guard/confirm/preview mechanism isn't sufficient protection on
+  its own - see the comment above `ALLOWLIST` in `guard.py`:
   - **Reboot** (`system/reboot`): there's no meaningful before/after preview
     for a reboot, and a bad batch reboot across a fleet has no dry-run or
     rollback. Needs its own confirmation/cooldown policy first.
-  - **Firewall filter writes** (`ip/firewall/filter`): a single wrong rule
-    (e.g. one that blocks the API port itself) can lock out all remote
-    management access to the device, with no way to recover it over the
-    same connection. Needs staged/rollback support (e.g. RouterOS safe
-    mode) before it belongs in the allowlist.
+- **Firewall filter rule CREATION or general modification** (any
+  `ip/firewall/filter` write other than the v0.11 `disabled` toggle) remains
+  out of scope for the same reason it always has been: a single wrong rule
+  (e.g. one that blocks the API port itself) can lock out all remote
+  management access to the device, with no way to recover it over the same
+  connection. Needs staged/rollback support (e.g. RouterOS safe mode) before
+  it belongs in the allowlist - v0.11's `enable_firewall_rule`/
+  `disable_firewall_rule` sidestep that risk entirely by only ever touching
+  a rule an admin already wrote and reviewed themselves, never authoring
+  one.
 - Further write tools should be added by extending `guard.ALLOWLIST` with
   one new named operation and function each - see the comment block at the
   top of `guard.py`. Do not add a generic write tool.

@@ -6,9 +6,11 @@ add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
 remove_from_address_list, set_poe_out, start_container/stop_container,
 set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
-wake_on_lan - see guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
-operator's own machine, launched by an MCP client (e.g. Claude Code) over
-stdio, with no network exposure at all.
+wake_on_lan, enable_firewall_rule/disable_firewall_rule - see guard.py's
+ALLOWLIST for the full write-tool inventory), plus the read-only
+connection_tracking tool (v0.11). Transport is stdio only - this process is
+meant to run on the operator's own machine, launched by an MCP client (e.g.
+Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -30,9 +32,16 @@ from mcp.server.fastmcp import FastMCP
 from . import correlation, guard
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
-from .exceptions import DeviceCommandError, MikrotikMCPError
-from .formatting import filter_disabled, rows_to_list, strip_sensitive_fields
-from .validation import validate_interface_name, validate_ping_address, validate_positive_limit
+from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
+from .formatting import filter_disabled, rows_to_list, split_address_port, strip_sensitive_fields
+from .validation import (
+    validate_conntrack_dst_port,
+    validate_conntrack_protocol,
+    validate_interface_name,
+    validate_ip_address,
+    validate_ping_address,
+    validate_positive_limit,
+)
 
 logger = logging.getLogger("mcp_mikrotik")
 
@@ -49,6 +58,12 @@ DEFAULT_TRACEROUTE_COUNT = 1
 MAX_TRACEROUTE_COUNT = 2
 DEFAULT_TRACEROUTE_MAX_HOPS = 10
 MAX_TRACEROUTE_MAX_HOPS = 10
+# v0.11: connection_tracking's hard result cap - regardless of how many rows
+# actually match the caller's filter, at most this many are ever returned;
+# `truncated` in the result signals when more matched than were returned.
+# See connection_tracking's own docstring for why a filter is mandatory in
+# the first place.
+MAX_CONNTRACK_LIMIT = 100
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
@@ -402,6 +417,98 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules."""
         client = _client(device_name)
         return rows_to_list(client.path("ip", "firewall", "filter"))
+
+    @mcp.tool()
+    @_safe
+    def connection_tracking(
+        device_name: str,
+        src_address: str | None = None,
+        dst_address: str | None = None,
+        dst_port: int | None = None,
+        protocol: str | None = None,
+    ) -> dict[str, Any]:
+        """List active connections from RouterOS's connection tracking table
+        (/ip/firewall/connection) - FILTERED. At least ONE of `src_address`,
+        `dst_address`, `dst_port`, `protocol` is REQUIRED.
+
+        WHY a filter is mandatory (unlike every other read tool in this
+        package): on a production router, the full connection-tracking table
+        can be large enough to blow past an LLM caller's context/token
+        budget on its own. Calling this with no filter at all raises a
+        ValidationError instead of returning the whole table.
+
+        Filtering happens in Python after reading the table - the same
+        reasoning `logs`' `topics` filter already documents (RouterOS's
+        structured API doesn't expose a query-by-field read here either).
+        `src_address`/`dst_address` match a row's IP, ignoring the port
+        RouterOS packs into the same field (e.g. "192.0.2.1:80" ->
+        address "192.0.2.1"); `dst_port` matches the destination's port
+        component. `protocol` is a RouterOS protocol name (e.g.
+        "tcp"/"udp"/"icmp", case-insensitive) or a numeric IP protocol
+        number (0-255).
+
+        Regardless of how many rows match, the result is capped at
+        MAX_CONNTRACK_LIMIT (100) entries - `truncated` is `true` whenever
+        more rows matched than were returned, and `total_matched` always
+        reports the real (pre-truncation) match count, so a caller always
+        knows whether it's seeing everything that matched.
+
+        Each returned entry: `protocol`, `src-address`/`src-port`,
+        `dst-address`/`dst-port` (address and port split apart - see
+        formatting.split_address_port), `tcp-state` (populated for TCP
+        connections), `timeout`, and the `assured`/`confirmed`/`seen-reply`
+        flags - RouterOS's own closest equivalent to a generic "connection
+        state" for this table.
+        """
+        if not any([src_address, dst_address, dst_port is not None, protocol]):
+            raise ValidationError(
+                "connection_tracking requires at least one of 'src_address', 'dst_address', "
+                "'dst_port', 'protocol' - the full connection-tracking table on a production "
+                "router is too large to return unfiltered."
+            )
+
+        validated_src = validate_ip_address(src_address) if src_address else None
+        validated_dst = validate_ip_address(dst_address) if dst_address else None
+        validated_port = validate_conntrack_dst_port(dst_port) if dst_port is not None else None
+        validated_protocol = validate_conntrack_protocol(protocol) if protocol else None
+
+        client = _client(device_name)
+        rows = rows_to_list(client.path("ip", "firewall", "connection"))
+
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            src_ip, src_port = split_address_port(row.get("src-address", ""))
+            dst_ip, matched_dst_port = split_address_port(row.get("dst-address", ""))
+            if validated_src is not None and src_ip != validated_src:
+                continue
+            if validated_dst is not None and dst_ip != validated_dst:
+                continue
+            if validated_port is not None and matched_dst_port != str(validated_port):
+                continue
+            if validated_protocol is not None and (row.get("protocol") or "").lower() != validated_protocol:
+                continue
+            matches.append(
+                {
+                    "protocol": row.get("protocol"),
+                    "src-address": src_ip,
+                    "src-port": src_port,
+                    "dst-address": dst_ip,
+                    "dst-port": matched_dst_port,
+                    "tcp-state": row.get("tcp-state"),
+                    "timeout": row.get("timeout"),
+                    "assured": row.get("assured"),
+                    "confirmed": row.get("confirmed"),
+                    "seen-reply": row.get("seen-reply"),
+                }
+            )
+
+        total_matched = len(matches)
+        truncated = total_matched > MAX_CONNTRACK_LIMIT
+        return {
+            "connections": matches[:MAX_CONNTRACK_LIMIT],
+            "total_matched": total_matched,
+            "truncated": truncated,
+        }
 
     @mcp.tool()
     @_safe
@@ -1253,6 +1360,63 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.wake_on_lan(
             client, settings, mac_address=mac_address, interface=interface, confirm=confirm
         )
+        return asdict(preview)
+
+    # --- v0.11: firewall rule toggle (by comment, never create) ---------
+
+    @mcp.tool()
+    @_safe
+    def enable_firewall_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Enable an EXISTING firewall filter rule (`/ip/firewall/filter set
+        disabled=no`), resolved by its `comment` - optionally narrowed by
+        `chain` if more than one rule shares that comment.
+
+        SAFE BY DESIGN: this NEVER creates a rule. Intended workflow: an
+        admin creates a rule ahead of time on the device with a descriptive
+        `comment` (e.g. `comment="Bloqueio_Ataque_X"`), reviews it once, and
+        leaves it disabled; an LLM caller later enables it via this tool
+        when it detects the condition the rule exists to guard against. If
+        it goes wrong, the admin knows exactly which rule was toggled - the
+        same one they already wrote and reviewed. See README's "Firewall
+        rule toggle (by comment)" section.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview - the FULL matched rule, not
+        just its `disabled` field, so you can confirm WHICH rule this is -
+        without changing anything; call again with confirm=True to actually
+        apply it. Errors clearly if no rule matches `comment` (narrowed by
+        `chain`), or if more than one still does (`AmbiguousResourceError`)
+        - never guesses which one to toggle.
+        """
+        client = _client(device_name)
+        preview = guard.enable_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_firewall_rule(
+        device_name: str, comment: str, chain: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Disable an EXISTING firewall filter rule (`/ip/firewall/filter set
+        disabled=yes`), resolved by its `comment` - optionally narrowed by
+        `chain` if more than one rule shares that comment.
+
+        Same "never creates a rule" guarantee and comment-based resolution
+        as `enable_firewall_rule` - see its docstring and README's "Firewall
+        rule toggle (by comment)" section.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        no rule matches `comment` (narrowed by `chain`), or if more than one
+        still does (`AmbiguousResourceError`).
+        """
+        client = _client(device_name)
+        preview = guard.disable_firewall_rule(client, settings, comment=comment, chain=chain, confirm=confirm)
         return asdict(preview)
 
     return mcp

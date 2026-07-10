@@ -217,11 +217,13 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     guard.clear_dns_cache(client, settings_write_enabled, confirm=True)
     guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
     guard.wake_on_lan(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+    guard.disable_firewall_rule(client, settings_write_enabled, comment="allow established", confirm=True)
+    guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 22
+    assert len(events) == 24
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -736,3 +738,91 @@ def test_wake_on_lan_blocked_when_write_disabled_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "wake_on_lan"
+
+
+# --- enable_firewall_rule / disable_firewall_rule (v0.11) -----------------
+
+
+def test_enable_firewall_rule_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "enable_firewall_rule"
+    assert event["operation"] == "enable_firewall_rule"
+    assert event["action"] == "update"
+    assert event["summary"]["after"]["disabled"] == "no"
+    # The full matched rule (chain/action/comment) is journaled, not just
+    # the changed field - so an audit reader can tell WHICH rule this was.
+    assert event["summary"]["before"]["comment"] == "Bloqueio_Ataque_X"
+    assert event["summary"]["before"]["chain"] == "forward"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_enable_firewall_rule_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.enable_firewall_rule(client, settings, comment="Bloqueio_Ataque_X", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "enable_firewall_rule"
+
+
+def test_enable_firewall_rule_unknown_comment_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.enable_firewall_rule(client, settings_write_enabled, comment="no-such-rule", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "enable_firewall_rule"
+
+
+def test_enable_firewall_rule_ambiguous_comment_journals_outcome_error(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "drop", "comment": "dup", "disabled": "true"},
+                {".id": "*2", "chain": "forward", "action": "drop", "comment": "dup", "disabled": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError):
+        guard.enable_firewall_rule(client, settings_write_enabled, comment="dup", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "enable_firewall_rule"
+
+
+def test_disable_firewall_rule_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.disable_firewall_rule(client, settings_write_enabled, comment="allow established", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "disable_firewall_rule"
+    assert event["operation"] == "disable_firewall_rule"
+    assert event["action"] == "update"
+    assert event["summary"]["after"]["disabled"] == "yes"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw

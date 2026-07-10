@@ -53,6 +53,8 @@ from .validation import (
     validate_dns_name,
     validate_dns_record_type,
     validate_dst_address,
+    validate_firewall_chain,
+    validate_firewall_rule_comment,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
@@ -273,16 +275,45 @@ ALLOWLIST: dict[str, WriteOperation] = {
         action="wol",
         description="Send a Wake-on-LAN magic packet to a MAC address via an interface (/tool/wol).",
     ),
+    # v0.11: firewall rule TOGGLE - never create, never touch any field but
+    # `disabled`. See the module comment above enable_firewall_rule/
+    # disable_firewall_rule below for the full admin-creates/LLM-enables
+    # workflow this is built for, and README's "Firewall rule toggle (by
+    # comment)". Resolved by the rule's `comment` (optionally narrowed by
+    # `chain`) - a STABLE, admin-controlled identifier, never a dynamic
+    # `.id`/list index.
+    "enable_firewall_rule": WriteOperation(
+        name="enable_firewall_rule",
+        path=("ip", "firewall", "filter"),
+        action="update",
+        description=(
+            "Enable an EXISTING firewall filter rule (disabled=no), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
+    "disable_firewall_rule": WriteOperation(
+        name="disable_firewall_rule",
+        path=("ip", "firewall", "filter"),
+        action="update",
+        description=(
+            "Disable an EXISTING firewall filter rule (disabled=yes), resolved by its comment "
+            "(optionally narrowed by chain) - never creates a rule."
+        ),
+    ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
     #   * reboot ("system/reboot"): no before/after preview is meaningful for
     #     a reboot, and a bad batch reboot across a fleet has no dry-run or
     #     rollback. Needs its own confirmation/cooldown policy first.
-    #   * firewall filter writes ("ip/firewall/filter"): a single wrong rule
-    #     (e.g. an add/update that blocks the API port itself) can lock out
-    #     all management access to the device with no remote recovery. Needs
-    #     staged/rollback support (e.g. RouterOS safe mode) before it belongs
-    #     in this allowlist.
+    #   * firewall filter rule CREATION or general modification ("ip/firewall/
+    #     filter" add, or update of any field other than `disabled`): a
+    #     single wrong rule (e.g. one that blocks the API port itself) can
+    #     lock out all management access to the device with no remote
+    #     recovery. v0.11 deliberately only exposes toggling `disabled` on a
+    #     rule an admin already created and reviewed themselves (see
+    #     enable_firewall_rule/disable_firewall_rule above) - authoring or
+    #     otherwise editing a rule still needs staged/rollback support (e.g.
+    #     RouterOS safe mode) before it belongs in this allowlist.
     # --- Next iteration adds entries here, each with its own WriteOperation
     # + dedicated function. See module docstring above for the steps.
 }
@@ -1622,3 +1653,130 @@ def wake_on_lan(
     write = getattr(client, op.action)
     write(*op.path, mac_address=validated_mac, interface=validated_interface)
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.11: firewall rule toggle (by comment, never create) ----------------
+#
+# enable_firewall_rule/disable_firewall_rule are the SAFE alternative to a
+# general firewall-filter write tool - still deliberately absent, see
+# ALLOWLIST's comment above. They only ever flip an EXISTING rule's
+# `disabled` field, resolved by the rule's `comment` - a STABLE identifier
+# the ADMIN controls, never a dynamic `.id`/list index that can silently
+# shift as rules are added/removed elsewhere on the device between a preview
+# and a confirmed apply.
+#
+# The workflow this is built for (the community-suggested design this round
+# follows, given the lockout risk a wrong firewall write carries - see
+# README's "Roadmap / non-goals"): an admin creates a rule ahead of time on
+# the device itself, e.g.
+#
+#   /ip firewall filter add chain=forward src-address-list=attacker-x \
+#     action=drop comment="Bloqueio_Ataque_X" disabled=yes
+#
+# reviews it once, and leaves it disabled. An LLM caller later enables it via
+# enable_firewall_rule(comment="Bloqueio_Ataque_X") when it detects the
+# condition the rule exists to guard against - never by asking this package
+# to author a new rule itself. If something goes wrong, the admin knows
+# EXACTLY which rule was toggled: the same one they already wrote and
+# reviewed, never one this package created on its own judgment.
+#
+# Resolution never falls back to "just pick one": a `comment` that matches
+# no row raises ResourceNotFoundError (never creates a rule as a fallback);
+# a `comment` that still matches more than one row (optionally narrowed by
+# `chain`) raises AmbiguousResourceError instead of guessing - the caller
+# must supply `chain`, or the device's rule comments simply aren't unique
+# enough and must be fixed there first.
+
+
+def _find_firewall_rule_rows(
+    rows: list[dict[str, Any]], comment: str, chain: str | None = None
+) -> list[dict[str, Any]]:
+    """All /ip/firewall/filter rows matching `comment` exactly, optionally
+    narrowed further by `chain`. Returns every match (not just the first) so
+    callers can tell a clean single match from an ambiguous one - see
+    enable_firewall_rule/disable_firewall_rule's AmbiguousResourceError."""
+    matches = [row for row in rows if row.get("comment") == comment]
+    if chain is not None:
+        matches = [row for row in matches if row.get("chain") == chain]
+    return matches
+
+
+def _set_firewall_rule_disabled(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    comment: str,
+    disabled: bool,
+    confirm: bool,
+    chain: str | None,
+) -> WritePreview:
+    """Shared implementation behind enable_firewall_rule/disable_firewall_rule
+    - see this section's module comment above for the full design rationale.
+
+    Resolves EXACTLY one /ip/firewall/filter row by `comment` (optionally
+    narrowed by `chain`). Raises ResourceNotFoundError if nothing matches -
+    NEVER creates a rule as a fallback. Raises AmbiguousResourceError if more
+    than one row still matches after narrowing.
+
+    The returned WritePreview's `before`/`after` are full copies of the
+    matched row (every field RouterOS returned for it, not just `disabled`)
+    - deliberately, so a caller reading the preview can confirm WHICH rule
+    (its `chain`/`action`/every other field) it is about to toggle before
+    ever passing `confirm=true`, not just see the one field being written.
+    That is exactly the "the operator knows which rule this is" safeguard
+    this pair of tools exists to provide.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    validated_comment = validate_firewall_rule_comment(comment)
+    validated_chain = validate_firewall_chain(chain) if chain is not None else None
+
+    rows = client.path(*op.path)
+    matches = _find_firewall_rule_rows(rows, validated_comment, validated_chain)
+
+    if not matches:
+        raise ResourceNotFoundError(client.device.name, "Firewall filter rule", validated_comment)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "Firewall filter rule",
+            validated_comment,
+            [row.get("chain", "") for row in matches],
+        )
+
+    row = matches[0]
+    before = dict(row)
+    after = dict(row)
+    after["disabled"] = "yes" if disabled else "no"
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "disabled": after["disabled"]})
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("enable_firewall_rule")
+def enable_firewall_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Enable an EXISTING firewall filter rule (`disabled=no`), resolved by
+    its `comment` - optionally narrowed by `chain` if more than one rule
+    shares that comment. NEVER creates a rule - see this section's module
+    comment above for the full admin-creates/LLM-enables workflow."""
+    return _set_firewall_rule_disabled(
+        client, settings, "enable_firewall_rule", comment, disabled=False, confirm=confirm, chain=chain
+    )
+
+
+@_audited("disable_firewall_rule")
+def disable_firewall_rule(
+    client: MikrotikClient, settings: Settings, comment: str, confirm: bool, chain: str | None = None
+) -> WritePreview:
+    """Disable an EXISTING firewall filter rule (`disabled=yes`), resolved by
+    its `comment` - optionally narrowed by `chain` if more than one rule
+    shares that comment. NEVER creates a rule."""
+    return _set_firewall_rule_disabled(
+        client, settings, "disable_firewall_rule", comment, disabled=True, confirm=confirm, chain=chain
+    )
