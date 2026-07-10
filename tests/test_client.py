@@ -15,9 +15,14 @@ from mcp_mikrotik.client import (
     get_client,
 )
 from mcp_mikrotik.config import Device, Settings
-from mcp_mikrotik.exceptions import DeviceCommandError, DeviceConnectionError, DeviceNotFoundError
+from mcp_mikrotik.exceptions import (
+    CircuitOpenError,
+    DeviceCommandError,
+    DeviceConnectionError,
+    DeviceNotFoundError,
+)
 
-from .fakes import FakeConnection, TransportErrorConnection
+from .fakes import FakeConnection, FlakyConnection, TransportErrorConnection
 
 
 def test_path_returns_plain_dicts(client: MikrotikClient):
@@ -256,3 +261,238 @@ def test_client_pool_close_all_closes_every_pooled_connection_and_clears_cache(d
     second = pool.get(device.name)
     assert second is not first
     assert calls == [device.name, device.name]
+
+
+# --- v0.5: read retry (path/ping/traceroute only, never writes) -----------
+
+
+def test_path_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(
+        OSError("link blip"), fail_times=1, data={("system", "identity"): [{"name": "MikroTik"}]}
+    )
+    client = MikrotikClient(device, connection=flaky)
+
+    rows = client.path("system", "identity")
+
+    assert rows == [{"name": "MikroTik"}]
+    assert flaky.calls_made == 2  # 1 failure + 1 successful retry
+
+
+def test_path_gives_up_after_read_retries_exhausted(device: Device, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "1")
+    flaky = FlakyConnection(OSError("link blip"), fail_times=99)
+    client = MikrotikClient(device, connection=flaky)
+
+    with pytest.raises(DeviceCommandError):
+        client.path("system", "identity")
+
+    assert flaky.calls_made == 2  # 1 initial attempt + 1 retry, then give up
+
+
+def test_path_never_retries_a_non_transient_lib_routeros_error(device: Device):
+    flaky = FlakyConnection(LibRouterosError("no such command"), fail_times=99)
+    client = MikrotikClient(device, connection=flaky)
+
+    with pytest.raises(DeviceCommandError):
+        client.path("system", "identity")
+
+    assert flaky.calls_made == 1  # RouterOS-level rejection - retrying would just fail again
+
+
+def test_ping_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=2, ping_replies=[{"seq": "0", "time": "3ms"}])
+    client = MikrotikClient(device, connection=flaky)
+
+    replies = client.ping("8.8.8.8")
+
+    assert replies == [{"seq": "0", "time": "3ms"}]
+    assert flaky.calls_made == 3  # 2 failures (default MIKROTIK_READ_RETRIES=2) + 1 success
+
+
+def test_traceroute_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(
+        OSError("link blip"), fail_times=1, traceroute_replies=[{"address": "10.0.0.254", "hop": "1"}]
+    )
+    client = MikrotikClient(device, connection=flaky)
+
+    replies = client.traceroute("10.0.0.254")
+
+    assert replies == [{"address": "10.0.0.254", "hop": "1"}]
+    assert flaky.calls_made == 2
+
+
+def test_read_retries_env_var_zero_disables_retry_entirely(device: Device, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    with pytest.raises(DeviceCommandError):
+        client.path("system", "identity")
+
+    assert flaky.calls_made == 1
+
+
+@pytest.mark.parametrize(
+    "write_call",
+    [
+        lambda client: client.update("system", "identity", name="x"),
+        lambda client: client.add("ip", "address", address="10.0.0.9/24"),
+        lambda client: client.remove("ip", "address", ids=("*1",)),
+    ],
+)
+def test_writes_never_retry_on_transient_oserror(device: Device, write_call):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=99)
+    client = MikrotikClient(device, connection=flaky)
+
+    with pytest.raises(DeviceCommandError):
+        write_call(client)
+
+    assert flaky.calls_made == 1  # writes get exactly one attempt, ever
+
+
+# --- v0.5: circuit breaker --------------------------------------------------
+
+
+def test_breaker_fails_fast_after_threshold_consecutive_connect_failures(
+    device: Device, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "3")
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")  # isolate breaker accounting from read-retry loop
+    attempts: list[Device] = []
+
+    def fake_connect(dev: Device):
+        attempts.append(dev)
+        raise DeviceConnectionError(dev.name, "connection refused")
+
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect)
+    client = MikrotikClient(device, connection=None)
+
+    for _ in range(3):
+        with pytest.raises(DeviceConnectionError):
+            client.path("system", "identity")
+    assert len(attempts) == 3
+    assert client._breaker.is_open is True
+
+    # Circuit now open: the next call fails immediately, with a clear
+    # message, and never attempts a connection at all.
+    with pytest.raises(CircuitOpenError) as exc_info:
+        client.path("system", "identity")
+    assert len(attempts) == 3  # no new connect attempt was made
+    assert f"circuit open for {device.name!r}" in str(exc_info.value)
+    assert "retry after" in str(exc_info.value)
+
+
+def test_breaker_stays_closed_below_threshold(device: Device, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "3")
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")
+
+    def fake_connect(dev: Device):
+        raise DeviceConnectionError(dev.name, "connection refused")
+
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect)
+    client = MikrotikClient(device, connection=None)
+
+    for _ in range(2):  # below the threshold of 3
+        with pytest.raises(DeviceConnectionError) as exc_info:
+            client.path("system", "identity")
+        assert not isinstance(exc_info.value, CircuitOpenError)
+
+    assert client._breaker.is_open is False
+
+
+def test_breaker_closes_on_a_success(device: Device, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "2")
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")
+    calls = {"n": 0}
+
+    def fake_connect(dev: Device):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise DeviceConnectionError(dev.name, "connection refused")
+        return FakeConnection(data={("system", "identity"): [{"name": "MikroTik"}]})
+
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect)
+    client = MikrotikClient(device, connection=None)
+
+    with pytest.raises(DeviceConnectionError):
+        client.path("system", "identity")  # 1 failure, below threshold of 2
+    assert client._breaker.is_open is False
+
+    rows = client.path("system", "identity")  # succeeds - resets the failure count
+    assert rows == [{"name": "MikroTik"}]
+    assert client._breaker.is_open is False
+
+    # A fresh run of (threshold - 1) failures after a success must NOT open
+    # the circuit - record_success() really reset the consecutive count.
+    def fake_connect_fail_once_more(dev: Device):
+        raise DeviceConnectionError(dev.name, "connection refused")
+
+    client._connection = None
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect_fail_once_more)
+    with pytest.raises(DeviceConnectionError) as exc_info:
+        client.path("system", "identity")
+    assert not isinstance(exc_info.value, CircuitOpenError)
+
+
+def test_breaker_allows_a_trial_connection_after_cooldown_elapses(device: Device, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "1")
+    monkeypatch.setenv("MIKROTIK_BREAKER_COOLDOWN", "0")  # elapses immediately
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")
+    attempts = {"n": 0}
+
+    def fake_connect(dev: Device):
+        attempts["n"] += 1
+        raise DeviceConnectionError(dev.name, "connection refused")
+
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect)
+    client = MikrotikClient(device, connection=None)
+
+    with pytest.raises(DeviceConnectionError):
+        client.path("system", "identity")
+    assert attempts["n"] == 1
+    assert client._breaker.is_open is True
+
+    # Cooldown is 0s, so the very next call is allowed a fresh trial connect
+    # (half-open) instead of failing fast with CircuitOpenError.
+    with pytest.raises(DeviceConnectionError) as exc_info:
+        client.path("system", "identity")
+    assert attempts["n"] == 2
+    assert not isinstance(exc_info.value, CircuitOpenError)
+
+
+def test_breaker_applies_to_writes_too_but_never_skips_a_gate_check(
+    device: Device, monkeypatch: pytest.MonkeyPatch
+):
+    """The breaker fails a write fast once open - but this is purely about
+    the CONNECTION step. guard.py's read-only gate + allowlist check
+    (guard._require_allowed) always runs first, entirely before
+    MikrotikClient is touched, so the breaker can never be used to skip it -
+    see guard.py's module docstring and ALLOWLIST comment."""
+    monkeypatch.setenv("MIKROTIK_BREAKER_THRESHOLD", "1")
+    monkeypatch.setenv("MIKROTIK_READ_RETRIES", "0")
+    attempts = {"n": 0}
+
+    def fake_connect(dev: Device):
+        attempts["n"] += 1
+        raise DeviceConnectionError(dev.name, "connection refused")
+
+    monkeypatch.setattr("mcp_mikrotik.client._connect", fake_connect)
+    client = MikrotikClient(device, connection=None)
+
+    with pytest.raises(DeviceConnectionError):
+        client.update("system", "identity", name="x")
+    assert attempts["n"] == 1
+
+    with pytest.raises(CircuitOpenError):
+        client.update("system", "identity", name="x")
+    assert attempts["n"] == 1  # fast fail - no second connect attempt
+
+
+def test_breaker_is_scoped_per_client_instance(device: Device):
+    """Sanity check on the "per device_name" framing: since ClientPool
+    caches exactly one MikrotikClient per device_name for the server's
+    lifetime, a fresh MikrotikClient naturally gets a fresh breaker - two
+    independent instances never share breaker state."""
+    client_a = MikrotikClient(device, connection=FakeConnection())
+    client_b = MikrotikClient(device, connection=FakeConnection())
+    assert client_a._breaker is not client_b._breaker

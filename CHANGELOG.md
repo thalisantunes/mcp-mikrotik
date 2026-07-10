@@ -3,6 +3,76 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.5.0] - Unreleased
+
+Production-hardening round: layers added *around* the existing write-guard
+mechanism (read-only default, central allowlist, confirm/preview, ROS6/ROS7
+compat) - none of it weakens or bypasses that mechanism. See README's new
+"Production features: audit log, correlation IDs, retries, circuit breaker"
+section for the full writeup.
+
+### Added
+
+- **Audit journal** (`src/mcp_mikrotik/audit.py`, new module): every guarded
+  write call in `guard.py` now emits exactly one structured JSON-lines
+  event via a new `_audited` decorator applied to all nine write functions -
+  `timestamp`, `correlation_id`, `device_name`, `tool`, `operation`
+  (the `ALLOWLIST` key), `action`, `confirm`, `outcome`
+  (`preview`/`applied`/`error`), and a `summary` of the before/after change
+  (or the error). Emitted for a preview (`confirm=false`), an apply
+  (`confirm=true`), and any error - including a write blocked by the
+  read-only gate before the device is ever touched. Recursively strips any
+  dict key that looks sensitive (`password`/`secret`/`token`/`credential`,
+  case-insensitive) from the summary before it is ever serialized - the
+  device password never appears in the journal. Destination is
+  `MIKROTIK_AUDIT_LOG` (append-only file) if set, otherwise a plain
+  `INFO`-level line via `logging` (stderr). Always best-effort: a failure
+  writing the journal is logged as a warning and never blocks or fails the
+  write operation it describes.
+- **Correlation IDs** (`src/mcp_mikrotik/correlation.py`, new module): every
+  MCP tool call (read or write) is bound a short, unique id
+  (`uuid4().hex[:12]`) for its duration, via a `contextvars.ContextVar` set
+  once per call in `server.py`'s `_safe` wrapper. Appears in every audit
+  journal entry a write produces, and is prefixed onto the server-side log
+  line if a tool call fails (`[<id>] tool <name> failed: ...` /
+  `[<id>] Unhandled error in tool <name>`) - never appended to the
+  exception's own message, so no caller-facing error text changes shape.
+- **Read retry** (`src/mcp_mikrotik/client.py`): `MikrotikClient.path`/
+  `ping`/`traceroute` now retry automatically on a transient network error -
+  a fresh connect attempt failing, or an in-flight command failing because
+  of an underlying `OSError` - with a short backoff (0.5s, then 1s; further
+  retries reuse 1s). Up to `MIKROTIK_READ_RETRIES` extra attempts (default
+  2). A `LibRouterosError` (RouterOS itself rejected the command) is never
+  retried. `update`/`add`/`remove` (the write primitives) are deliberately
+  untouched - no retry, ever, since a retried write isn't guaranteed
+  idempotent.
+- **Circuit breaker** (`src/mcp_mikrotik/client.py`, `CircuitBreaker` class):
+  each pooled `MikrotikClient` now owns a thread-safe, in-memory breaker for
+  its device's connection attempts. After `MIKROTIK_BREAKER_THRESHOLD`
+  consecutive connection failures (default 3), the circuit opens for
+  `MIKROTIK_BREAKER_COOLDOWN` seconds (default 30): further calls to that
+  device - read or write - raise `CircuitOpenError` immediately (`circuit
+  open for '<device>', retry after <t>s`), without attempting a connection.
+  A successful connection resets the failure count and closes the circuit.
+  Scoped strictly to the connection step - `guard.py`'s read-only
+  gate/allowlist check always runs first, entirely before `MikrotikClient`
+  is touched, so the breaker can never be used to skip it.
+- `CircuitOpenError` (`src/mcp_mikrotik/exceptions.py`): a
+  `DeviceConnectionError` subclass raised by the circuit breaker, so
+  existing `except DeviceConnectionError` handling keeps working unchanged.
+- Env vars: `MIKROTIK_AUDIT_LOG` (unset = log to stderr), `MIKROTIK_READ_RETRIES`
+  (default `2`), `MIKROTIK_BREAKER_THRESHOLD` (default `3`),
+  `MIKROTIK_BREAKER_COOLDOWN` (default `30`) - see `.env.example` and
+  README's configuration table.
+
+### Notes
+
+- Purely additive: the write-guard mechanism itself (read-only default,
+  central allowlist, confirm/preview, "never creates the target"/"never
+  silently duplicates") is unchanged - see "Security model" in README.
+  `guard.py`'s `_audited` decorator wraps every existing write function
+  without altering its own logic.
+
 ## [0.4.0] - Unreleased
 
 ### Added

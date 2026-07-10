@@ -20,16 +20,150 @@ from __future__ import annotations
 
 import os
 import ssl
+import threading
+import time
 from functools import partial
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol, TypeVar
 
 import librouteros
 from librouteros.exceptions import LibRouterosError
 
 from .config import Device, Settings
-from .exceptions import DeviceCommandError, DeviceConnectionError
+from .exceptions import CircuitOpenError, DeviceCommandError, DeviceConnectionError
 
 DEFAULT_TIMEOUT = 10.0
+
+T = TypeVar("T")
+
+# --- Read retry (robustness on slow/flaky links) ---------------------------
+#
+# Applies only to read primitives (path/ping/traceroute - see
+# MikrotikClient._run_read). Writes (update/add/remove) never retry:
+# idempotency isn't guaranteed for an add/update/remove, so a retried write
+# could duplicate or reapply a change - see MikrotikClient._execute_once,
+# used by writes with no retry loop around it at all.
+
+DEFAULT_READ_RETRIES = 2
+# Backoff before the 1st and 2nd retry; a MIKROTIK_READ_RETRIES value beyond
+# len(_READ_RETRY_DELAYS) reuses the last delay rather than growing further.
+_READ_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+
+def _read_retries() -> int:
+    raw = os.environ.get("MIKROTIK_READ_RETRIES")
+    if raw is None:
+        return DEFAULT_READ_RETRIES
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_READ_RETRIES
+    return max(0, value)
+
+
+def _read_retry_delay(attempt: int) -> float:
+    if attempt < len(_READ_RETRY_DELAYS):
+        return _READ_RETRY_DELAYS[attempt]
+    return _READ_RETRY_DELAYS[-1]
+
+
+# --- Circuit breaker (fail fast against a known-dead device) ---------------
+
+DEFAULT_BREAKER_THRESHOLD = 3
+DEFAULT_BREAKER_COOLDOWN = 30.0
+
+
+def _breaker_threshold() -> int:
+    raw = os.environ.get("MIKROTIK_BREAKER_THRESHOLD")
+    if raw is None:
+        return DEFAULT_BREAKER_THRESHOLD
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_BREAKER_THRESHOLD
+    return value if value > 0 else DEFAULT_BREAKER_THRESHOLD
+
+
+def _breaker_cooldown() -> float:
+    raw = os.environ.get("MIKROTIK_BREAKER_COOLDOWN")
+    if raw is None:
+        return DEFAULT_BREAKER_COOLDOWN
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_BREAKER_COOLDOWN
+    # 0 is a legitimate (if unusual) value - "always half-open, retry on the
+    # very next call" - only a negative or unparseable value is rejected.
+    return value if value >= 0 else DEFAULT_BREAKER_COOLDOWN
+
+
+class CircuitBreaker:
+    """Circuit breaker guarding one device's connection attempts.
+
+    One instance lives on each MikrotikClient (`self._breaker`), scoped to
+    that single device - ClientPool caches one MikrotikClient per
+    device_name for the life of the server, so this instance's lifetime
+    naturally gives one breaker per device_name, with no separate keyed
+    registry needed.
+
+    After MIKROTIK_BREAKER_THRESHOLD consecutive connection failures
+    (record_failure()), the circuit opens: before_connect() raises
+    CircuitOpenError immediately - no socket is attempted - until
+    MIKROTIK_BREAKER_COOLDOWN seconds have passed. A single success
+    (record_success()) at any point resets the failure count and closes the
+    circuit.
+
+    Thread-safe via an internal lock: ClientPool/the MCP server may have
+    more than one tool call for the same device in flight concurrently.
+    """
+
+    def __init__(self, device_name: str, threshold: int | None = None, cooldown: float | None = None):
+        self._device_name = device_name
+        self._threshold_override = threshold
+        self._cooldown_override = cooldown
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+
+    def _threshold(self) -> int:
+        return self._threshold_override if self._threshold_override is not None else _breaker_threshold()
+
+    def _cooldown(self) -> float:
+        return self._cooldown_override if self._cooldown_override is not None else _breaker_cooldown()
+
+    def before_connect(self) -> None:
+        """Raise CircuitOpenError if the circuit is open and still within
+        its cooldown window. Called only from MikrotikClient._connect_guarded,
+        which itself is only ever reached AFTER guard.py's read-only
+        gate/allowlist check for any write - see that module's docstring -
+        so this can never be used to skip the guard, only to fail fast once
+        the guard has already allowed the call through."""
+        with self._lock:
+            if self._opened_at is None:
+                return
+            elapsed = time.time() - self._opened_at
+            cooldown = self._cooldown()
+            if elapsed < cooldown:
+                raise CircuitOpenError(self._device_name, cooldown - elapsed)
+            # Cooldown elapsed: let exactly one trial connection through
+            # (half-open). record_success()/record_failure() below decides
+            # whether the circuit stays closed or re-opens.
+            self._opened_at = None
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._opened_at = None
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._threshold():
+                self._opened_at = time.time()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._opened_at is not None
 
 
 class RouterosConnection(Protocol):
@@ -114,28 +248,97 @@ class MikrotikClient:
     def __init__(self, device: Device, connection: RouterosConnection | None = None):
         self.device = device
         self._connection = connection
+        self._breaker = CircuitBreaker(device.name)
 
-    def _conn(self) -> RouterosConnection:
-        if self._connection is None:
+    def _connect_guarded(self) -> RouterosConnection:
+        """Return the cached connection, or establish one - honoring the
+        circuit breaker (CircuitOpenError if it's currently open; no socket
+        attempted). Every read/write primitive below goes through this
+        (directly, or via _execute_once/_run_read) instead of ever calling
+        _connect() itself, so breaker accounting stays centralized here."""
+        if self._connection is not None:
+            return self._connection
+        self._breaker.before_connect()
+        try:
             self._connection = _connect(self.device)
+        except DeviceConnectionError:
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
         return self._connection
 
-    def path(self, *segments: str) -> list[dict[str, Any]]:
-        """Read all rows at an API path (e.g. path("ip", "address"))."""
+    def _execute_once(self, description: str, fn: Callable[[RouterosConnection], T]) -> T:
+        """Run one command against the device exactly once: connect
+        (breaker-checked - see _connect_guarded), invoke `fn`, and translate
+        any transport failure into DeviceCommandError. No retry happens here
+        - used directly by the write primitives (update/add/remove) for a
+        single guaranteed-once attempt, and as the per-attempt body of
+        _run_read's retry loop for reads.
+
+        The circuit breaker only ever accounts for the CONNECT step
+        (_connect_guarded), not for a failure of `fn` itself once connected
+        - a rejected/failed command on an otherwise-live connection is a
+        RouterOS/command-level problem, not "can't reach this device",
+        which is what the breaker exists to fail fast on."""
+        connection = self._connect_guarded()
         try:
-            return [dict(row) for row in self._conn().path(*segments)]
+            result = fn(connection)
         except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "/".join(segments), str(exc)) from exc
+            raise DeviceCommandError(self.device.name, description, str(exc)) from exc
+        return result
+
+    def _run_read(self, description: str, fn: Callable[[RouterosConnection], T]) -> T:
+        """Run a read primitive (path/ping/traceroute) with automatic retry
+        on transient network errors: up to MIKROTIK_READ_RETRIES extra
+        attempts (default 2), with a short backoff (0.5s, then 1s; further
+        retries reuse 1s), retrying `fn` against the SAME connection object
+        (no reconnect attempt is forced - see _execute_once). Only retried
+        when the failure looks transient - a fresh CircuitOpenError (breaker
+        already deliberately failing fast) is never retried, a
+        DeviceConnectionError from an actual failed connect attempt is
+        always retried (each retry re-attempts the connect too, through the
+        breaker), and a DeviceCommandError is retried only when its cause
+        was an OSError (a dropped socket, a timeout) rather than a
+        LibRouterosError (RouterOS itself rejected the command - retrying
+        would just get rejected again).
+        """
+        retries = _read_retries()
+        attempt = 0
+        while True:
+            try:
+                return self._execute_once(description, fn)
+            except CircuitOpenError:
+                raise
+            except DeviceConnectionError:
+                if attempt >= retries:
+                    raise
+            except DeviceCommandError as exc:
+                transient = isinstance(exc.__cause__, OSError)
+                if not transient or attempt >= retries:
+                    raise
+            time.sleep(_read_retry_delay(attempt))
+            attempt += 1
+
+    def path(self, *segments: str) -> list[dict[str, Any]]:
+        """Read all rows at an API path (e.g. path("ip", "address")). Retried
+        automatically on a transient network error - see _run_read."""
+
+        def _do(connection: RouterosConnection) -> list[dict[str, Any]]:
+            return [dict(row) for row in connection.path(*segments)]
+
+        return self._run_read("/".join(segments), _do)
 
     def ping(self, address: str, count: int = 4) -> list[dict[str, Any]]:
         """Run /ping from the device. `address` is expected to already be validated
         (see validation.validate_ping_address) - this method just forwards it as a
-        structured parameter, never as part of a command string."""
-        try:
-            replies = self._conn()("/ping", address=address, count=str(count))
+        structured parameter, never as part of a command string. Retried
+        automatically on a transient network error - see _run_read."""
+
+        def _do(connection: RouterosConnection) -> list[dict[str, Any]]:
+            replies = connection("/ping", address=address, count=str(count))
             return [dict(reply) for reply in replies]
-        except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "ping", str(exc)) from exc
+
+        return self._run_read("ping", _do)
 
     def traceroute(self, address: str, count: int = 1, max_hops: int = 10) -> list[dict[str, Any]]:
         """Run /tool/traceroute from the device. `address` is expected to already
@@ -147,18 +350,20 @@ class MikrotikClient:
         A fixed short per-hop `timeout` ("00:00:01") is always sent too, so the
         worst case (max_hops * count unanswered probes) stays comfortably under
         RouterOS's own ~60s API command timeout regardless of what the caller
-        passed for count/max_hops.
+        passed for count/max_hops. Retried automatically on a transient network
+        error - see _run_read.
         """
-        try:
-            replies = self._conn()(
+
+        def _do(connection: RouterosConnection) -> list[dict[str, Any]]:
+            replies = connection(
                 "/tool/traceroute",
                 address=address,
                 count=str(count),
                 **{"max-hops": str(max_hops), "timeout": "00:00:01"},
             )
             return [dict(reply) for reply in replies]
-        except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "traceroute", str(exc)) from exc
+
+        return self._run_read("traceroute", _do)
 
     # --- Write primitives -------------------------------------------------
     # These are intentionally NOT exposed as MCP tools directly. The only
@@ -166,24 +371,32 @@ class MikrotikClient:
     # operation to one fixed path via its ALLOWLIST. Do not call these from
     # server.py directly - go through guard.py so every write stays subject
     # to the read-only gate, the allowlist, and the confirm/preview flow.
+    #
+    # No retry: idempotency isn't guaranteed for add/update/remove, so a
+    # retried write could duplicate or reapply a change. Each still goes
+    # through the circuit breaker (via _execute_once/_connect_guarded), so a
+    # write to a known-dead device still fails fast instead of hanging on a
+    # connect attempt - the breaker only ever affects the connection step,
+    # never whether the write itself is allowed (that's the read-only
+    # gate/allowlist in guard.py, checked before this is ever reached).
 
     def update(self, *segments: str, **fields: Any) -> None:
-        try:
-            self._conn().path(*segments).update(**fields)
-        except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "/".join(segments), str(exc)) from exc
+        def _do(connection: RouterosConnection) -> None:
+            connection.path(*segments).update(**fields)
+
+        self._execute_once("/".join(segments), _do)
 
     def add(self, *segments: str, **fields: Any) -> Any:
-        try:
-            return self._conn().path(*segments).add(**fields)
-        except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "/".join(segments), str(exc)) from exc
+        def _do(connection: RouterosConnection) -> Any:
+            return connection.path(*segments).add(**fields)
+
+        return self._execute_once("/".join(segments), _do)
 
     def remove(self, *segments: str, ids: tuple[str, ...]) -> None:
-        try:
-            self._conn().path(*segments).remove(*ids)
-        except (LibRouterosError, OSError) as exc:
-            raise DeviceCommandError(self.device.name, "/".join(segments), str(exc)) from exc
+        def _do(connection: RouterosConnection) -> None:
+            connection.path(*segments).remove(*ids)
+
+        self._execute_once("/".join(segments), _do)
 
     def close(self) -> None:
         if self._connection is not None:

@@ -129,3 +129,13 @@ def settings(device: Device) -> Settings:
 @pytest.fixture
 def settings_write_enabled(device: Device) -> Settings:
     return Settings(allow_write=True, devices={device.name: device})
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never actually sleep during the read-retry backoff (client.py's
+    MikrotikClient._run_read) - keeps the suite fast and deterministic.
+    Tests that specifically exercise retry behaviour assert on call counts
+    /exceptions, not on timing, so removing the real delay changes nothing
+    they check."""
+    monkeypatch.setattr("mcp_mikrotik.client.time.sleep", lambda seconds: None)

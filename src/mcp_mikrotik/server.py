@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
 
-from . import guard
+from . import correlation, guard
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError
@@ -79,7 +79,10 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         return pool.get(device_name)
 
     def _safe(fn):
-        """Make sure nothing unexpected leaks a raw traceback or a secret.
+        """Make sure nothing unexpected leaks a raw traceback or a secret,
+        and give every call (read or write) a short correlation id (v0.5)
+        that ties its logs - and, for write tools, its audit journal entry
+        (see guard.py's `_audited`) - back to one specific call end to end.
 
         Deliberately re-raises rather than returning an error dict: each
         tool's return type is annotated (e.g. `list[dict[str, Any]]`) and
@@ -89,7 +92,9 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         FastMCP/MCP's own error path turn it into a proper isError tool
         result carrying just the exception's message - see
         MikrotikMCPError subclasses in exceptions.py, whose messages are
-        already safe to show a caller.
+        already safe to show a caller. The correlation id is prefixed onto
+        the server-side log line only - never appended to the exception's
+        own message - so no caller-facing error text changes shape.
 
         Uses functools.wraps (not just __name__/__doc__) so FastMCP's schema
         introspection - which follows __wrapped__ - still sees the original
@@ -98,13 +103,15 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
         @functools.wraps(fn)
         def inner(*args: Any, **kwargs: Any) -> Any:
-            try:
-                return fn(*args, **kwargs)
-            except MikrotikMCPError:
-                raise
-            except Exception:
-                logger.exception("Unhandled error in tool %s", fn.__name__)
-                raise RuntimeError("Internal error handling this tool call; see server logs.") from None
+            with correlation.bind() as correlation_id:
+                try:
+                    return fn(*args, **kwargs)
+                except MikrotikMCPError as exc:
+                    logger.info("[%s] tool %s failed: %s", correlation_id, fn.__name__, exc)
+                    raise
+                except Exception:
+                    logger.exception("[%s] Unhandled error in tool %s", correlation_id, fn.__name__)
+                    raise RuntimeError("Internal error handling this tool call; see server logs.") from None
 
         return inner
 

@@ -28,12 +28,15 @@ each write operation must stay individually named and reviewable.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
+from . import audit
 from .client import MikrotikClient
 from .config import Settings
+from .correlation import current as current_correlation_id
 from .exceptions import (
     DeviceCommandError,
     GuardViolationError,
@@ -176,6 +179,72 @@ def _require_allowed(settings: Settings, operation_name: str) -> WriteOperation:
     return op
 
 
+def _audited(anchor_operation: str) -> Callable[[Callable[..., WritePreview]], Callable[..., WritePreview]]:
+    """Decorator applied to every public write function below (audit
+    journal / v0.5).
+
+    Ensures exactly one audit.record() call per invocation, regardless of
+    how it ends:
+      - Returns a WritePreview with applied=False -> outcome "preview".
+      - Returns a WritePreview with applied=True  -> outcome "applied".
+      - Raises anything -> outcome "error" (WriteDisabledError from the
+        read-only gate, ValidationError, ResourceNotFoundError/
+        ResourceAlreadyExistsError, a device-side DeviceCommandError - all
+        of it, however early it happens).
+
+    `anchor_operation` is the ALLOWLIST key to report as `operation`/`action`
+    when nothing more specific is known yet - which matters for functions
+    with dynamic dispatch (set_wifi_ssid, set_client_bandwidth: see their
+    docstrings) that may fail before resolving which of their two candidate
+    operations actually applies. Once the wrapped function returns a
+    WritePreview, that WritePreview's own `.operation` is used instead - the
+    more precise choice actually made.
+
+    This is the ONLY place in the package that calls audit.record() -
+    keeping every write's audit trail centralized here means a future write
+    function only has to follow the existing `@_audited(...)` + `_require_allowed`
+    shape to be covered automatically; it never has to remember to journal
+    anything itself. Writing the journal never affects the call's own
+    outcome: audit.record() is itself best-effort (see audit.py) and never
+    raises.
+    """
+
+    def decorator(fn: Callable[..., WritePreview]) -> Callable[..., WritePreview]:
+        @functools.wraps(fn)
+        def inner(client: MikrotikClient, settings: Settings, *args: Any, confirm: bool, **kwargs: Any) -> WritePreview:
+            correlation_id = current_correlation_id()
+            try:
+                result = fn(client, settings, *args, confirm=confirm, **kwargs)
+            except Exception as exc:
+                audit.record(
+                    correlation_id=correlation_id,
+                    device_name=client.device.name,
+                    tool=fn.__name__,
+                    operation=anchor_operation,
+                    action=ALLOWLIST[anchor_operation].action,
+                    confirm=confirm,
+                    outcome="error",
+                    summary={"error": str(exc)},
+                )
+                raise
+            audit.record(
+                correlation_id=correlation_id,
+                device_name=result.device,
+                tool=fn.__name__,
+                operation=result.operation,
+                action=ALLOWLIST[result.operation].action,
+                confirm=confirm,
+                outcome="applied" if result.applied else "preview",
+                summary={"before": result.before, "after": result.after},
+            )
+            return result
+
+        return inner
+
+    return decorator
+
+
+@_audited("set_identity")
 def set_identity(client: MikrotikClient, settings: Settings, new_name: str, confirm: bool) -> WritePreview:
     """The v0 exemplary write tool.
 
@@ -251,6 +320,7 @@ def _set_interface_disabled(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+@_audited("enable_interface")
 def enable_interface(client: MikrotikClient, settings: Settings, interface_name: str, confirm: bool) -> WritePreview:
     """Enable a network interface by name (sets disabled=no). Errors if the
     interface name doesn't exist on the device; never creates one."""
@@ -259,6 +329,7 @@ def enable_interface(client: MikrotikClient, settings: Settings, interface_name:
     )
 
 
+@_audited("disable_interface")
 def disable_interface(client: MikrotikClient, settings: Settings, interface_name: str, confirm: bool) -> WritePreview:
     """Disable a network interface by name (sets disabled=yes). Errors if the
     interface name doesn't exist on the device; never creates one."""
@@ -267,6 +338,7 @@ def disable_interface(client: MikrotikClient, settings: Settings, interface_name
     )
 
 
+@_audited("set_wifi_ssid_ros7")
 def set_wifi_ssid(
     client: MikrotikClient, settings: Settings, interface_name: str, new_ssid: str, confirm: bool
 ) -> WritePreview:
@@ -337,6 +409,7 @@ def _queue_name_for_target(target: str) -> str:
     return f"limit-{slug}"
 
 
+@_audited("set_client_bandwidth_update")
 def set_client_bandwidth(
     client: MikrotikClient,
     settings: Settings,
@@ -418,6 +491,7 @@ def set_client_bandwidth(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+@_audited("add_static_dhcp_lease")
 def add_static_dhcp_lease(
     client: MikrotikClient,
     settings: Settings,
@@ -465,6 +539,7 @@ def add_static_dhcp_lease(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+@_audited("remove_simple_queue")
 def remove_simple_queue(
     client: MikrotikClient,
     settings: Settings,
@@ -521,6 +596,7 @@ def _find_address_list_row(rows: list[dict[str, Any]], list_name: str, address: 
     return None
 
 
+@_audited("add_to_address_list")
 def add_to_address_list(
     client: MikrotikClient,
     settings: Settings,
@@ -575,6 +651,7 @@ def add_to_address_list(
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
 
 
+@_audited("remove_from_address_list")
 def remove_from_address_list(
     client: MikrotikClient,
     settings: Settings,

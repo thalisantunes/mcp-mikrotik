@@ -108,6 +108,43 @@ class RaisingConnection:
         pass
 
 
+class FlakyConnection:
+    """Fake connection whose `.path()`/`__call__` raise a given exception for
+    the first `fail_times` invocations, then behave like a normal
+    FakeConnection - used to exercise MikrotikClient's read-retry (see
+    client.py's MikrotikClient._run_read)."""
+
+    def __init__(
+        self,
+        exc: Exception,
+        fail_times: int,
+        data: dict[tuple[str, ...], list[dict[str, Any]]] | None = None,
+        ping_replies: list[dict[str, Any]] | None = None,
+        traceroute_replies: list[dict[str, Any]] | None = None,
+    ):
+        self._exc = exc
+        self._fail_times = fail_times
+        self.calls_made = 0
+        self._inner = FakeConnection(data=data, ping_replies=ping_replies, traceroute_replies=traceroute_replies)
+        self.closed = False
+
+    def path(self, *segments: str) -> FakePath:
+        self.calls_made += 1
+        if self.calls_made <= self._fail_times:
+            raise self._exc
+        return self._inner.path(*segments)
+
+    def __call__(self, cmd: str, **kwargs: Any):
+        self.calls_made += 1
+        if self.calls_made <= self._fail_times:
+            raise self._exc
+        return self._inner(cmd, **kwargs)
+
+    def close(self) -> None:
+        self.closed = True
+        self._inner.close()
+
+
 class TransportErrorConnection:
     """Fake connection whose every operation raises a given exception.
 

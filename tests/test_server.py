@@ -834,3 +834,88 @@ def test_resolve_log_level_falls_back_to_info_on_invalid_value(caplog: pytest.Lo
         result = _resolve_log_level("NOT_A_LEVEL")
     assert result == "INFO"
     assert any("Invalid MIKROTIK_LOG_LEVEL" in record.message for record in caplog.records)
+
+
+# --- v0.5: audit journal + correlation id, exercised end to end through ---
+# --- FastMCP's call_tool boundary (not by calling guard.py directly) ------
+
+
+@pytest.mark.asyncio
+async def test_write_tool_call_produces_one_audit_journal_entry(
+    device: Device, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    await mcp.call_tool("set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True})
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "set_identity"
+    assert "s3cret" not in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_read_tool_call_never_writes_to_the_audit_journal(
+    settings: Settings, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Only guarded writes are audit-journaled - a plain read tool call must
+    not produce a journal entry."""
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    await mcp.call_tool("system_info", {"device_name": "core-switch"})
+
+    assert not log_path.exists() or log_path.read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.asyncio
+async def test_blocked_write_tool_call_still_journals_an_error(
+    settings: Settings, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError):
+        await mcp.call_tool(
+            "set_identity", {"device_name": "core-switch", "new_name": "renamed", "confirm": True}
+        )
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["outcome"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_unhandled_error_log_line_is_prefixed_with_a_correlation_id(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+):
+    """server.py's `_safe` wrapper binds a correlation id for every tool
+    call and prefixes it onto the server-side log line for that call - see
+    server.py's `_safe`/`correlation.bind`."""
+
+    def _broken_factory(_settings: Settings, _device_name: str):
+        raise RuntimeError("boom - not a MikrotikMCPError, so _safe's generic path handles it")
+
+    mcp = build_server(settings=settings, client_factory=_broken_factory)
+
+    with caplog.at_level("ERROR", logger="mcp_mikrotik"):
+        with pytest.raises(ToolError):
+            await mcp.call_tool("system_info", {"device_name": "core-switch"})
+
+    matches = [r for r in caplog.records if "Unhandled error in tool system_info" in r.message]
+    assert len(matches) == 1
+    # "[<12 hex chars>] Unhandled error in tool system_info"
+    prefix = matches[0].message.split("]")[0].lstrip("[")
+    assert len(prefix) == 12

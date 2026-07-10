@@ -33,6 +33,23 @@ class DeviceConnectionError(MikrotikMCPError):
         self.device_name = device_name
 
 
+class CircuitOpenError(DeviceConnectionError):
+    """Raised instead of attempting a connection at all, while a device's
+    circuit breaker (see client.CircuitBreaker) is open: N consecutive
+    connection failures within the cooldown window
+    (MIKROTIK_BREAKER_THRESHOLD/MIKROTIK_BREAKER_COOLDOWN). A subclass of
+    DeviceConnectionError so any existing `except DeviceConnectionError`
+    handling keeps working unchanged; it exists as its own class only so the
+    read-retry loop (client.py's MikrotikClient._run_read) can recognize it
+    and skip retrying - retrying while the breaker is deliberately failing
+    fast would defeat the point of failing fast.
+    """
+
+    def __init__(self, device_name: str, retry_after: float):
+        super().__init__(device_name, f"circuit open for {device_name!r}, retry after {retry_after:.1f}s")
+        self.retry_after = retry_after
+
+
 class DeviceCommandError(MikrotikMCPError):
     """A RouterOS API command failed on the device side."""
 

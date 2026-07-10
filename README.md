@@ -13,16 +13,20 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.4: read tools covering the core device inventory plus DHCP leases, DNS
-cache, firewall filter/NAT rules, address-lists, scheduler, IP pools,
-wireless client registrations, system health and Simple Queue entries; a
-`traceroute` diagnostic tool; and a set of guarded write tools
-(`set_identity`, `enable_interface`/`disable_interface`, `set_wifi_ssid`,
-`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`, plus
-v0.4's `add_to_address_list`/`remove_from_address_list` for limiting or
-blocking who uses the network) that all go through the same write-guard
-mechanism. See `CHANGELOG.md` for what changed since v0.1.0, and
-`src/mcp_mikrotik/guard.py` for how to add the next write tool.
+v0.5: everything from v0.4 (read tools covering the core device inventory
+plus DHCP leases, DNS cache, firewall filter/NAT rules, address-lists,
+scheduler, IP pools, wireless client registrations, system health and
+Simple Queue entries; a `traceroute` diagnostic tool; and a set of guarded
+write tools - `set_identity`, `enable_interface`/`disable_interface`,
+`set_wifi_ssid`, `set_client_bandwidth`, `add_static_dhcp_lease`,
+`remove_simple_queue`, `add_to_address_list`/`remove_from_address_list` -
+that all go through the same write-guard mechanism), plus a set of
+production-hardening layers around it: a structured audit journal for every
+guarded write, per-call correlation ids, automatic retry for read
+operations on a transient network error, and a per-device circuit breaker.
+None of this changes the security model - see "Production features" and
+"Security model" below. See `CHANGELOG.md` for what changed since v0.1.0,
+and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
 ## Installation
 
@@ -55,6 +59,10 @@ Configuration comes from environment variables plus an optional
    | `MIKROTIK_ALLOW_WRITE`   | `false`        | Enable write tools (see Security model)               |
    | `MIKROTIK_LOG_LEVEL`     | `INFO`         | Log level for the server process (stderr); invalid values fall back to `INFO` with a warning |
    | `MIKROTIK_TIMEOUT`       | `10`           | Fallback connect timeout (seconds) for devices without their own `timeout` |
+   | `MIKROTIK_AUDIT_LOG`     | *(unset)*      | File path for the JSON-lines write-audit journal; unset logs each event via `logging` (stderr) instead. See "Production features" below. |
+   | `MIKROTIK_READ_RETRIES`  | `2`            | Extra retry attempts for read operations on a transient network error |
+   | `MIKROTIK_BREAKER_THRESHOLD` | `3`       | Consecutive connection failures before a device's circuit breaker opens |
+   | `MIKROTIK_BREAKER_COOLDOWN`  | `30`      | Seconds a device's circuit stays open before a trial reconnect is allowed |
 
 Each device entry supports its own `port` and `use_ssl`, since a fleet is
 commonly a mix of plain API (8728) and api-ssl (8729) devices, and possibly a
@@ -251,6 +259,63 @@ On top of the write guard:
   dict-shaped error instead). Unexpected exceptions are logged server-side
   and re-raised as a generic internal-error message, never as a raw
   traceback.
+
+## Production features: audit log, correlation IDs, retries, circuit breaker
+
+v0.5 adds a set of layers *around* the write-guard mechanism above, aimed at
+running `mcp-mikrotik` unattended against a real fleet. None of them can
+weaken or bypass the read-only gate, the central allowlist, or the
+confirm/preview flow - every write still goes through `guard.py` exactly as
+described in "Security model", and the circuit breaker in particular never
+skips `guard.py`'s read-only gate/allowlist check: that check runs first,
+entirely before `MikrotikClient` ever attempts a connection.
+
+- **Audit journal.** Every guarded write call (`guard.py`, one of the
+  `ALLOWLIST` operations) emits exactly one structured JSON-lines event -
+  whether it previewed (`confirm=false`), applied (`confirm=true`), or
+  failed at any point, however early (even a write blocked by the read-only
+  gate before the device is ever touched). Each event has a `timestamp`,
+  `correlation_id`, `device_name`, `tool`, `operation` (the `ALLOWLIST` key),
+  `action` (`add`/`update`/`remove`), `confirm`, `outcome`
+  (`preview`/`applied`/`error`), and a `summary` of the before/after change
+  (or the error). **Never includes a device password or any field that
+  looks like a secret** - see `src/mcp_mikrotik/audit.py`'s `_sanitize()`.
+  Destination is `MIKROTIK_AUDIT_LOG` (a file path, appended to) if set,
+  otherwise a plain `INFO`-level line via the standard logger (stderr).
+  Writing the journal is always best-effort: a bad path or a permissions
+  error is logged as a warning and never blocks or fails the write it is
+  describing. Read tools are never journaled - only guarded writes are.
+- **Correlation IDs.** Every MCP tool call (read or write) gets a short,
+  unique id (`uuid4().hex[:12]`) for its duration - see
+  `src/mcp_mikrotik/correlation.py`. It is bound once per call in
+  `server.py`'s `_safe` wrapper, appears in every audit journal entry a
+  write call produces, and is prefixed onto the server-side log line if the
+  call fails - so one id lets you grep everything one tool call did, end to
+  end, without changing the shape of any error message returned to the
+  caller.
+- **Read retry.** `path`/`ping`/`traceroute` (every read primitive in
+  `src/mcp_mikrotik/client.py`) automatically retry on a *transient* network
+  error - a fresh connection attempt failing, or an in-flight command
+  failing because of an underlying `OSError` (a dropped socket, a timeout) -
+  with a short backoff (0.5s, then 1s). Up to `MIKROTIK_READ_RETRIES` extra
+  attempts (default 2). A command rejected by RouterOS itself (a
+  `LibRouterosError`, not an `OSError`) is never retried - it would just be
+  rejected again. **Writes never retry**, regardless of this setting:
+  `update`/`add`/`remove` aren't guaranteed idempotent, so retrying one
+  could duplicate or reapply a change.
+- **Circuit breaker.** Each device gets its own in-memory, thread-safe
+  breaker (`client.CircuitBreaker`, one instance per pooled `MikrotikClient`
+  - see `ClientPool`). After `MIKROTIK_BREAKER_THRESHOLD` consecutive
+  connection failures (default 3), the circuit opens: for the next
+  `MIKROTIK_BREAKER_COOLDOWN` seconds (default 30), any call to that device -
+  read or write - fails immediately with a clear `circuit open for
+  '<device>', retry after <t>s` error, without attempting a connection at
+  all. A single successful connection resets the failure count and closes
+  the circuit. This is scoped purely to the *connection* step - it never
+  decides whether a write is allowed (that's the read-only gate/allowlist in
+  `guard.py`, always checked first) - it exists to stop a dead device (e.g.
+  an antenna that fell over) from costing a full connect timeout on every
+  single tool call.
 
 ### TLS verification for api-ssl
 
