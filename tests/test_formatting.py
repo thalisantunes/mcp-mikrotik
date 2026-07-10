@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from mcp_mikrotik.formatting import (
+    coerce_ros_bool,
     filter_disabled,
     ros_bool,
     rows_to_list,
@@ -36,6 +37,57 @@ def test_ros_bool_falls_back_to_python_bool_for_other_values():
     assert ros_bool(None) is False
     assert ros_bool(1) is True
     assert ros_bool(0) is False
+
+
+# --- coerce_ros_bool ----------------------------------------------------------
+#
+# Unlike ros_bool above (read-tool presentation, where "absent" should read
+# as False), this is for write-guard LOGIC that needs to tell "definitely
+# false" apart from "unknown/absent" - see guard.remove_route/
+# remove_dhcp_lease. Confirmed against real ROS6/ROS7 hardware: librouteros
+# hands back a RouterOS boolean field as Python bool (True/False) or omits
+# it entirely - never the strings "true"/"false".
+
+
+def test_coerce_ros_bool_passes_through_real_bool():
+    assert coerce_ros_bool(True) is True
+    assert coerce_ros_bool(False) is False
+
+
+def test_coerce_ros_bool_parses_routeros_true_strings_case_insensitively():
+    assert coerce_ros_bool("true") is True
+    assert coerce_ros_bool("yes") is True
+    assert coerce_ros_bool("  TRUE  ") is True
+    assert coerce_ros_bool("YES") is True
+
+
+def test_coerce_ros_bool_parses_routeros_false_strings_case_insensitively():
+    assert coerce_ros_bool("false") is False
+    assert coerce_ros_bool("no") is False
+    assert coerce_ros_bool("  FALSE  ") is False
+    assert coerce_ros_bool("NO") is False
+
+
+def test_coerce_ros_bool_none_for_missing_or_unrecognized():
+    # None / an absent field (row.get(...) already yields None) / empty
+    # string / anything not a recognized bool-ish value - None, never a
+    # guessed True/False.
+    assert coerce_ros_bool(None) is None
+    assert coerce_ros_bool("") is None
+    assert coerce_ros_bool("   ") is None
+    assert coerce_ros_bool("something-else") is None
+    assert coerce_ros_bool(1) is None
+    assert coerce_ros_bool(0) is None
+
+
+def test_coerce_ros_bool_is_never_fooled_by_python_bool_string_equality_trap():
+    # The exact bug this helper exists to prevent: True == "true" is False
+    # in plain Python, so `value == "true"` never matches a real device's
+    # bool True. coerce_ros_bool must still report True here.
+    assert coerce_ros_bool(True) != "true"  # sanity: the trap is real
+    assert coerce_ros_bool(True) is True
+    assert coerce_ros_bool(False) is not None
+    assert coerce_ros_bool(False) is False
 
 
 # --- rows_to_list / filter_disabled ------------------------------------------

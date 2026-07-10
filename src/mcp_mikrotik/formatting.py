@@ -27,6 +27,53 @@ def ros_bool(value: Any) -> bool:
     return bool(value)
 
 
+def coerce_ros_bool(value: Any) -> bool | None:
+    """Normalize a RouterOS boolean *field value* to `bool | None`, for code
+    that branches on it (as opposed to `ros_bool` above, which is for
+    read-tool *presentation* - see the difference below).
+
+    CONFIRMED AGAINST REAL HARDWARE (ROS6 .254, ROS7 .237): librouteros (the
+    real device transport this package uses) returns a RouterOS boolean
+    field as a Python `bool` - `True`/`False` - or omits the field entirely
+    when absent, NEVER as the strings "true"/"false". A prior version of
+    this package's write-guard compared such a field directly against the
+    string `"true"`/`"false"` (e.g. `remove_route`'s dynamic-route refusal);
+    since `True == "true"` is `False` in Python, that comparison silently
+    never matched on real hardware - see the module note above
+    `guard.remove_route` for the security impact.
+
+    ROS6 and ROS7 additionally differ in when a *false* boolean field is
+    present at all: ROS6 commonly OMITS the field entirely when it is false
+    (e.g. `/ip/route`'s `dynamic` is simply absent on an ordinary static
+    route), while ROS7 sends it explicitly as `False`. Both cases must be
+    treated as "false" by a caller that only needs to know true-vs-not-true.
+
+    Returns:
+      - `True` for `True` (bool) or a case-insensitive "true"/"yes" string.
+      - `False` for `False` (bool) or a case-insensitive "false"/"no" string.
+      - `None` for `None`, an absent field (`.get(...)` already yields
+        `None`), an empty string, or any other unrecognized value - callers
+        that need to distinguish "definitely false" from "unknown/absent"
+        (e.g. a caller that wants to warn rather than silently skip when it
+        can't tell) can branch on `None` separately; a caller that only
+        cares about true-vs-not-true can simply check `is True`.
+
+    A string is still accepted (case-insensitively) for robustness against
+    any code path or RouterOS version that does send one - but the primary
+    shape this exists to handle correctly is the literal `bool`/absent case
+    above, which the old string-only comparison got wrong.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    return None
+
+
 def rows_to_list(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize an iterable of API rows into a plain list.
 

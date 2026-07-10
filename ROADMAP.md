@@ -23,15 +23,21 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** NAT rule toggle + firewall mangle (read + toggle) —
-`enable_nat_rule` / `disable_nat_rule`, `firewall_mangle` (read),
-`enable_mangle_rule` / `disable_mangle_rule` — landed in **v1.4**, mirroring
-`enable_firewall_rule` / `disable_firewall_rule` (v0.11) exactly: toggle an
-EXISTING, admin-authored rule by `comment`, never create one. PPP/PPPoE
-secrets — `ppp_secrets` (read), `add_ppp_secret` / `remove_ppp_secret`
-(guarded) — landed in **v1.3** (read+add+remove verified against real ROS7
-hardware; password redacted in the audit journal and never returned by the
-read).
+**Recently shipped:** Static route add/remove — `add_route` / `remove_route`
+— landed in **v1.5**, closing out Tier 1: `add_route` creates a static route
+(never refusing a duplicate `dst-address` — that's the normal failover
+shape) and `remove_route` deletes one resolved by `dst-address`/`gateway`,
+**refusing outright to remove a dynamic/connected route** (`dynamic=true`) —
+the single most important safety property in that round. Both carry the same
+default-route `warning` `disable_route` (v0.9) already established. NAT rule
+toggle + firewall mangle (read + toggle) — `enable_nat_rule` /
+`disable_nat_rule`, `firewall_mangle` (read), `enable_mangle_rule` /
+`disable_mangle_rule` — landed in **v1.4**, mirroring `enable_firewall_rule` /
+`disable_firewall_rule` (v0.11) exactly: toggle an EXISTING, admin-authored
+rule by `comment`, never create one. PPP/PPPoE secrets — `ppp_secrets`
+(read), `add_ppp_secret` / `remove_ppp_secret` (guarded) — landed in **v1.3**
+(read+add+remove verified against real ROS7 hardware; password redacted in
+the audit journal and never returned by the read).
 
 ## Feasibility note
 
@@ -75,18 +81,9 @@ separately-argued case. The default stance is: stay API-only.
 
 ## Tier 1 — next up
 
-The cheapest, lowest-risk wins: each just extends a pattern already shipped and
-proven (toggle-by-comment, add/remove a leaf object). All paths verified present
-on ROS7 (see caveats above). (PPP/PPPoE secrets shipped in v1.3; NAT rule
-toggle and firewall mangle, previously the two other items here, shipped in
-v1.4 — see "Recently shipped" above.)
-
-- **Static route add / remove** (`/ip/route`) — guarded `add_route` /
-  `remove_route`. Today only *existing* routes can be manipulated
-  (`set_route_distance`, `enable_route`, `disable_route`); adding a new static
-  route is a basic admin operation with no filter-class lockout risk, fully
-  previewable. The `disable_route` default-route guard already establishes the
-  care pattern for the dangerous edge.
+Tier 1 items have all shipped (v1.3 – v1.5: PPP/PPPoE secrets, NAT rule
+toggle + firewall mangle, and static route add/remove — see "Recently
+shipped" above). Tier 2 is now next.
 
 ## Tier 2 — valued, mostly reads
 

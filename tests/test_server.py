@@ -73,6 +73,8 @@ EXPECTED_TOOLS = {
     "set_route_distance",
     "enable_route",
     "disable_route",
+    "add_route",
+    "remove_route",
     "add_netwatch",
     "remove_netwatch",
     "add_static_dns",
@@ -707,8 +709,8 @@ async def test_arp_table_happy_path(settings: Settings, fake_connection: FakeCon
             "address": "10.0.0.70",
             "mac-address": "AA:BB:CC:DD:EE:70",
             "interface": "ether1",
-            "dynamic": "false",
-            "complete": "true",
+            "dynamic": False,
+            "complete": True,
         }
     ]
 
@@ -723,8 +725,8 @@ async def test_bridge_hosts_happy_path(settings: Settings, fake_connection: Fake
             "mac-address": "AA:BB:CC:DD:EE:70",
             "on-interface": "ether1",
             "bridge": "bridge1",
-            "dynamic": "false",
-            "local": "false",
+            "dynamic": False,
+            "local": False,
         }
     ]
 
@@ -912,7 +914,7 @@ async def test_lte_interfaces_happy_path(settings: Settings, fake_connection: Fa
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("lte_interfaces", {"device_name": "core-switch"})
     assert result["result"] == [
-        {".id": "*1", "name": "lte1", "running": "true", "disabled": "false", "apn-profiles": "default"}
+        {".id": "*1", "name": "lte1", "running": True, "disabled": False, "apn-profiles": "default"}
     ]
 
 
@@ -996,7 +998,7 @@ async def test_enable_interface_blocked_read_only_by_default(settings: Settings,
     assert "read-only" in str(exc_info.value)
     # Device was never touched.
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows == {"ether1": "false", "ether2": "true"}
+    assert rows == {"ether1": False, "ether2": True}
 
 
 @pytest.mark.asyncio
@@ -1018,18 +1020,18 @@ async def test_enable_interface_preview_then_confirm(device: Device, fake_connec
         "enable_interface", {"device_name": "core-switch", "interface_name": "ether2", "confirm": False}
     )
     assert preview["applied"] is False
-    assert preview["before"]["disabled"] == "true"
+    assert preview["before"]["disabled"] is True
     assert preview["after"]["disabled"] == "no"
     # Preview must not have touched the device.
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows["ether2"] == "true"
+    assert rows["ether2"] is True
 
     _content, applied = await mcp.call_tool(
         "enable_interface", {"device_name": "core-switch", "interface_name": "ether2", "confirm": True}
     )
     assert applied["applied"] is True
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows == {"ether1": "false", "ether2": "no"}
+    assert rows == {"ether1": False, "ether2": "no"}
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1044,7 @@ async def test_disable_interface_preview_then_confirm(device: Device, fake_conne
     )
     assert applied["applied"] is True
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows == {"ether1": "yes", "ether2": "true"}
+    assert rows == {"ether1": "yes", "ether2": True}
 
 
 @pytest.mark.asyncio
@@ -1695,10 +1697,10 @@ async def test_disable_route_preview_then_confirm(device: Device, fake_connectio
 
 @pytest.mark.asyncio
 async def test_disable_route_default_route_preview_carries_warning(device: Device, fake_connection: FakeConnection):
-    """CRITICAL for this round: disabling the default route (dst 0.0.0.0/0
-    - the fixture device's only route) is the dangerous case this write
-    exists to flag - the preview's `warning` field must be non-null and
-    mention the default route, so a caller can't miss it before confirming."""
+    """CRITICAL for this round: disabling the default route (dst 0.0.0.0/0,
+    route *1 in the fixture) is the dangerous case this write exists to
+    flag - the preview's `warning` field must be non-null and mention the
+    default route, so a caller can't miss it before confirming."""
     write_settings = Settings(allow_write=True, devices={device.name: device})
     mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
 
@@ -1772,6 +1774,178 @@ async def test_disable_route_ambiguous_without_disambiguator_raises_clear_error(
             "disable_route", {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "confirm": True}
         )
     assert "ambiguous" in str(exc_info.value).lower()
+
+
+# --- add_route / remove_route (v1.5) -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_route_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_route",
+            {"device_name": "core-switch", "dst_address": "10.40.0.0/24", "gateway": "10.0.0.254", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "route")._rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_add_route_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_route",
+        {
+            "device_name": "core-switch",
+            "dst_address": "10.40.0.0/24",
+            "gateway": "10.0.0.254",
+            "distance": 2,
+            "comment": "backup link",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("ip", "route")._rows) == 3
+
+    _content, applied = await mcp.call_tool(
+        "add_route",
+        {
+            "device_name": "core-switch",
+            "dst_address": "10.40.0.0/24",
+            "gateway": "10.0.0.254",
+            "distance": 2,
+            "comment": "backup link",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    rows = fake_connection.path("ip", "route")._rows
+    created = next(row for row in rows if row["dst-address"] == "10.40.0.0/24")
+    assert created["gateway"] == "10.0.0.254"
+    assert created["distance"] == "2"
+    assert created["comment"] == "backup link"
+
+
+@pytest.mark.asyncio
+async def test_add_route_default_route_preview_carries_warning(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.253", "confirm": False},
+    )
+    assert preview["warning"] is not None
+    assert "0.0.0.0/0" in preview["warning"]
+    assert "default" in preview["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_add_route_never_refuses_duplicate_dst_address(device: Device, fake_connection: FakeConnection):
+    """Adding a second route to an already-used dst-address (the normal
+    failover shape) must never raise ResourceAlreadyExistsError."""
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_route",
+        {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.253", "confirm": True},
+    )
+    assert applied["applied"] is True
+    matches = [row for row in fake_connection.path("ip", "route")._rows if row["dst-address"] == "0.0.0.0/0"]
+    assert len(matches) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_route_rejects_invalid_gateway_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_route",
+            {"device_name": "core-switch", "dst_address": "10.40.0.0/24", "gateway": "not-a-gateway!", "confirm": True},
+        )
+    assert "gateway" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_remove_route_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_route", {"device_name": "core-switch", "dst_address": "10.20.0.0/24", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "route")._rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_remove_route_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_route", {"device_name": "core-switch", "dst_address": "10.20.0.0/24", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert len(fake_connection.path("ip", "route")._rows) == 3
+
+    _content, applied = await mcp.call_tool(
+        "remove_route", {"device_name": "core-switch", "dst_address": "10.20.0.0/24", "confirm": True}
+    )
+    assert applied["applied"] is True
+    remaining = {row["dst-address"] for row in fake_connection.path("ip", "route")._rows}
+    assert "10.20.0.0/24" not in remaining
+    assert len(fake_connection.path("ip", "route")._rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_remove_route_refuses_dynamic_route(device: Device, fake_connection: FakeConnection):
+    """CRITICAL for this round: route *3 in the fixture is dynamic
+    (dynamic=true, a connected-route look-alike) - removing it must raise
+    a ToolError through the MCP boundary and must NOT remove the row."""
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_route", {"device_name": "core-switch", "dst_address": "10.30.0.0/24", "confirm": True}
+        )
+    assert "dynamic" in str(exc_info.value).lower()
+    remaining = {row["dst-address"] for row in fake_connection.path("ip", "route")._rows}
+    assert "10.30.0.0/24" in remaining
+    assert len(fake_connection.path("ip", "route")._rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_remove_route_default_route_preview_carries_warning(device: Device):
+    fake = FakeConnection(data={("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_route", {"device_name": "core-switch", "dst_address": "0.0.0.0/0", "confirm": False}
+    )
+    assert preview["warning"] is not None
+    assert "0.0.0.0/0" in preview["warning"]
+    assert "default" in preview["warning"].lower()
+
+
+@pytest.mark.asyncio
+async def test_remove_route_unknown_dst_address_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_route", {"device_name": "core-switch", "dst_address": "10.50.0.0/24", "confirm": True}
+        )
+    assert "10.50.0.0/24" in str(exc_info.value)
 
 
 # --- add_netwatch / remove_netwatch (v0.9) -----------------------------------
@@ -2393,14 +2567,14 @@ async def test_enable_firewall_rule_preview_then_confirm(device: Device, fake_co
         "enable_firewall_rule", {"device_name": "core-switch", "comment": "Bloqueio_Ataque_X", "confirm": False}
     )
     assert preview["applied"] is False
-    assert preview["before"]["disabled"] == "true"
+    assert preview["before"]["disabled"] is True
     assert preview["after"]["disabled"] == "no"
     # The full matched rule - not just `disabled` - so the operator can
     # confirm WHICH rule this is before applying.
     assert preview["before"]["chain"] == "forward"
     assert preview["before"]["action"] == "drop"
     rows = fake_connection.path("ip", "firewall", "filter")._rows
-    assert next(r for r in rows if r["comment"] == "Bloqueio_Ataque_X")["disabled"] == "true"
+    assert next(r for r in rows if r["comment"] == "Bloqueio_Ataque_X")["disabled"] is True
 
     _content, applied = await mcp.call_tool(
         "enable_firewall_rule", {"device_name": "core-switch", "comment": "Bloqueio_Ataque_X", "confirm": True}
@@ -2506,11 +2680,11 @@ async def test_enable_nat_rule_preview_then_confirm(device: Device, fake_connect
         "enable_nat_rule", {"device_name": "core-switch", "comment": "rdp-forward-maintenance", "confirm": False}
     )
     assert preview["applied"] is False
-    assert preview["before"]["disabled"] == "true"
+    assert preview["before"]["disabled"] is True
     assert preview["after"]["disabled"] == "no"
     assert preview["before"]["chain"] == "dstnat"
     rows = fake_connection.path("ip", "firewall", "nat")._rows
-    assert next(r for r in rows if r["comment"] == "rdp-forward-maintenance")["disabled"] == "true"
+    assert next(r for r in rows if r["comment"] == "rdp-forward-maintenance")["disabled"] is True
 
     _content, applied = await mcp.call_tool(
         "enable_nat_rule", {"device_name": "core-switch", "comment": "rdp-forward-maintenance", "confirm": True}
@@ -2615,11 +2789,11 @@ async def test_enable_mangle_rule_preview_then_confirm(device: Device, fake_conn
         "enable_mangle_rule", {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "confirm": False}
     )
     assert preview["applied"] is False
-    assert preview["before"]["disabled"] == "true"
+    assert preview["before"]["disabled"] is True
     assert preview["after"]["disabled"] == "no"
     assert preview["before"]["chain"] == "prerouting"
     rows = fake_connection.path("ip", "firewall", "mangle")._rows
-    assert next(r for r in rows if r["comment"] == "Mark_Backup_Traffic")["disabled"] == "true"
+    assert next(r for r in rows if r["comment"] == "Mark_Backup_Traffic")["disabled"] is True
 
     _content, applied = await mcp.call_tool(
         "enable_mangle_rule", {"device_name": "core-switch", "comment": "Mark_Backup_Traffic", "confirm": True}
@@ -3280,7 +3454,7 @@ async def test_ip_routes_rejects_non_positive_limit(settings: Settings, fake_con
 async def test_ip_routes_without_limit_returns_all_rows(settings: Settings, fake_connection: FakeConnection):
     mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
     _content, result = await mcp.call_tool("ip_routes", {"device_name": "core-switch"})
-    assert len(result["result"]) == 1
+    assert len(result["result"]) == 3
 
 
 @pytest.mark.asyncio

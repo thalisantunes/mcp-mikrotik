@@ -29,11 +29,20 @@ def fake_connection() -> FakeConnection:
             ("system", "identity"): [{"name": "MikroTik"}],
             ("system", "resource"): [{"board-name": "hAP ac2", "version": "7.21", "uptime": "3d5h"}],
             ("interface",): [
-                {".id": "*1", "name": "ether1", "disabled": "false"},
-                {".id": "*2", "name": "ether2", "disabled": "true"},
+                {".id": "*1", "name": "ether1", "disabled": False},
+                {".id": "*2", "name": "ether2", "disabled": True},
             ],
             ("ip", "address"): [{".id": "*1", "address": "10.0.0.1/24", "interface": "ether1"}],
-            ("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}],
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"},
+                # v1.5: a static route (no `dynamic` field, same as RouterOS's
+                # own admin-created rows) and a dynamic/connected route
+                # look-alike, added to exercise add_route/remove_route
+                # without disturbing *1 above (several existing tests assert
+                # exact equality against *1's dict shape).
+                {".id": "*2", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254", "distance": "1"},
+                {".id": "*3", "dst-address": "10.30.0.0/24", "gateway": "ether1", "dynamic": True},
+            ],
             ("ip", "neighbor"): [{".id": "*1", "address": "10.0.0.2", "identity": "ap-1"}],
             ("log",): [
                 {".id": "*1", "time": "10:00:00", "topics": "system,info", "message": "boot"},
@@ -63,7 +72,7 @@ def fake_connection() -> FakeConnection:
                     "chain": "forward",
                     "action": "drop",
                     "comment": "Bloqueio_Ataque_X",
-                    "disabled": "true",
+                    "disabled": True,
                 },
             ],
             # v0.11: connection tracking - one TCP and one UDP entry so
@@ -79,9 +88,9 @@ def fake_connection() -> FakeConnection:
                     "reply-dst-address": "10.0.0.50:51413",
                     "tcp-state": "established",
                     "timeout": "1d",
-                    "assured": "true",
-                    "confirmed": "true",
-                    "seen-reply": "true",
+                    "assured": True,
+                    "confirmed": True,
+                    "seen-reply": True,
                 },
                 {
                     ".id": "*2",
@@ -91,9 +100,9 @@ def fake_connection() -> FakeConnection:
                     "reply-src-address": "8.8.8.8:53",
                     "reply-dst-address": "10.0.0.60:33221",
                     "timeout": "10s",
-                    "assured": "false",
-                    "confirmed": "true",
-                    "seen-reply": "true",
+                    "assured": False,
+                    "confirmed": True,
+                    "seen-reply": True,
                 },
             ],
             ("system", "health"): [
@@ -108,7 +117,7 @@ def fake_connection() -> FakeConnection:
                     "max-limit": "10M/5M",
                     "limit-at": "0/0",
                     "bytes": "1234567/7654321",
-                    "disabled": "false",
+                    "disabled": False,
                 }
             ],
             ("ip", "firewall", "address-list"): [
@@ -117,8 +126,8 @@ def fake_connection() -> FakeConnection:
                     "list": "blocked-clients",
                     "address": "10.0.0.60",
                     "timeout": "0s",
-                    "dynamic": "false",
-                    "disabled": "false",
+                    "dynamic": False,
+                    "disabled": False,
                 }
             ],
             ("ip", "firewall", "nat"): [
@@ -128,7 +137,7 @@ def fake_connection() -> FakeConnection:
                     "action": "masquerade",
                     "out-interface": "ether1",
                     "comment": "wan-masquerade",
-                    "disabled": "false",
+                    "disabled": False,
                 },
                 # v1.4: a pre-created, disabled rule an admin left ready for
                 # enable_nat_rule to flip on by `comment` - the same
@@ -142,7 +151,7 @@ def fake_connection() -> FakeConnection:
                     "to-addresses": "10.0.0.80",
                     "to-ports": "3389",
                     "comment": "rdp-forward-maintenance",
-                    "disabled": "true",
+                    "disabled": True,
                 },
             ],
             # v1.4: firewall mangle - same two-row shape as
@@ -157,14 +166,14 @@ def fake_connection() -> FakeConnection:
                     "action": "mark-packet",
                     "new-packet-mark": "voip",
                     "comment": "mark-voip",
-                    "disabled": "false",
+                    "disabled": False,
                 },
                 {
                     ".id": "*2",
                     "chain": "prerouting",
                     "action": "mark-connection",
                     "comment": "Mark_Backup_Traffic",
-                    "disabled": "true",
+                    "disabled": True,
                 },
             ],
             ("system", "scheduler"): [
@@ -174,7 +183,7 @@ def fake_connection() -> FakeConnection:
                     "on-event": "backup",
                     "interval": "1d",
                     "next-run": "jan/01/2030 00:00:00",
-                    "disabled": "false",
+                    "disabled": False,
                 }
             ],
             ("ip", "pool"): [{".id": "*1", "name": "dhcp-pool", "ranges": "10.0.0.100-10.0.0.200"}],
@@ -193,8 +202,8 @@ def fake_connection() -> FakeConnection:
                     "address": "10.0.0.70",
                     "mac-address": "AA:BB:CC:DD:EE:70",
                     "interface": "ether1",
-                    "dynamic": "false",
-                    "complete": "true",
+                    "dynamic": False,
+                    "complete": True,
                 }
             ],
             ("interface", "bridge", "host"): [
@@ -203,13 +212,13 @@ def fake_connection() -> FakeConnection:
                     "mac-address": "AA:BB:CC:DD:EE:70",
                     "on-interface": "ether1",
                     "bridge": "bridge1",
-                    "dynamic": "false",
-                    "local": "false",
+                    "dynamic": False,
+                    "local": False,
                 }
             ],
             # v0.7: LTE/5G, containers, USB.
             ("interface", "lte"): [
-                {".id": "*1", "name": "lte1", "running": "true", "disabled": "false", "apn-profiles": "default"}
+                {".id": "*1", "name": "lte1", "running": True, "disabled": False, "apn-profiles": "default"}
             ],
             ("container",): [
                 {
@@ -252,8 +261,8 @@ def fake_connection() -> FakeConnection:
                     "name": "wg1",
                     "listen-port": "13231",
                     "public-key": "SERVERPUBKEYAAAA==",
-                    "running": "true",
-                    "disabled": "false",
+                    "running": True,
+                    "disabled": False,
                     "mtu": "1420",
                 }
             ],
@@ -271,7 +280,7 @@ def fake_connection() -> FakeConnection:
                     "rx": "1024",
                     "tx": "2048",
                     "allowed-address": "10.10.0.2/32",
-                    "disabled": "false",
+                    "disabled": False,
                 }
             ],
             ("ppp", "active"): [
@@ -296,7 +305,7 @@ def fake_connection() -> FakeConnection:
                     "service": "pppoe",
                     "profile": "default-encryption",
                     "remote-address": "10.40.0.10",
-                    "disabled": "false",
+                    "disabled": False,
                     "comment": "fiber customer #1",
                 }
             ],
@@ -340,7 +349,7 @@ def fake_connection() -> FakeConnection:
                     "up-script": "",
                     "down-script": ':log warning "gw down"',
                     "comment": "primary gateway",
-                    "disabled": "false",
+                    "disabled": False,
                 }
             ],
             # v0.14: hotspot vouchers + backup.

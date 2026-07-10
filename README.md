@@ -257,6 +257,8 @@ model" below for the full guard mechanism.
 | `set_route_distance` | Adjust an existing route's `distance` (failover priority - lower wins). Resolved by the stable `dst_address`+`gateway` pair - never a dynamic `.id`/index. Errors if no route matches, or if more than one still does after that pair (`AmbiguousResourceError`). See "Failover control" below. |
 | `enable_route` | Enable a route (`disabled=no`). Resolved by `dst_address`, narrowed by optional `gateway`/`comment` when more than one route shares it. |
 | `disable_route` | Disable a route (`disabled=yes`). Same resolution as `enable_route`. **The returned preview's `warning` field is non-null whenever the route is the default route (`0.0.0.0/0`/`::/0`)** - disabling it cuts outbound traffic through that gateway. See "Failover control" below. |
+| `add_route` | Add a static route (`dst_address`+`gateway` required, optional `distance`/`comment`). **Never refuses a duplicate `dst_address`** - multiple routes sharing one is the normal failover shape. `warning` is non-null when `dst_address` is the default route. See "Failover control" below. |
+| `remove_route` | Remove a static route, resolved by `dst_address` (narrowed by optional `gateway`). **Refuses outright (raises an error, removes nothing) if the resolved route is dynamic** (`dynamic=true` - connected/DHCP/OSPF/BGP-installed). `warning` is non-null (not blocking) when removing a static default route. See "Failover control" below. |
 | `add_netwatch` | Create a Netwatch host monitor (`host`, optional `interval`/`comment`). **Never accepts an up-script/down-script** - see "Failover control" below. Refuses a duplicate `host`. |
 | `remove_netwatch` | Remove a Netwatch host monitor by `host` (tried first) or `comment`. Raises `AmbiguousResourceError` instead of guessing if more than one monitor still matches. |
 | `add_static_dns` | Create a static DNS entry (`/ip/dns/static`) resolving `name` to `address`. `record_type` is `"A"` (default, `address` a literal IP) or `"CNAME"` (`address` is itself the alias target hostname). Refuses a duplicate `name`+`record_type` pair. See "DNS management" below. |
@@ -477,7 +479,10 @@ Five guarded write tools - `set_route_distance`, `enable_route`/
 building blocks** for adjusting a RouterOS failover setup. Deliberately
 small, composable steps, **not** one black-box "do a failover" command: an
 LLM caller (or a human operator) combines them, previewing each one before
-applying it.
+applying it. `add_route`/`remove_route` (v1.5, below) extend the same
+`/ip/route` family with the two writes that were still missing: creating
+and removing a route outright, rather than only adjusting one already on
+the device.
 
 **Recommended flow:**
 
@@ -546,6 +551,39 @@ package's write guard exists to rule out (see "Security model" below and
 device (WinBox/CLI) once the monitor exists. The read-only `netwatch` tool
 already only ever surfaces `has-up-script`/`has-down-script` as presence
 booleans, never a script body, for the same reason.
+
+### Static route add/remove (v1.5)
+
+`add_route`/`remove_route` close out the route family started in v0.9,
+reusing the same `_resolve_route` machinery `set_route_distance`/
+`enable_route`/`disable_route` already use - a route is always identified
+by its stable `dst-address` (+ optional `gateway`, and for `add_route`'s
+disambiguating siblings `comment`), never a RouterOS `.id`/list index.
+
+**The default-route `warning` fires in both directions.** Exactly like
+`disable_route`, both `add_route` and `remove_route` set a non-null
+`warning` field - on both the `confirm=false` preview and the
+`confirm=true` applied result - whenever `dst_address` is the default route
+(`0.0.0.0/0`/`::/0`): adding/overriding it redirects all outbound traffic
+through the new gateway; removing it cuts outbound traffic that relies on
+the old one. Always read `warning` before calling again with `confirm=true`.
+
+**`add_route` never refuses a duplicate `dst_address`.** Unlike
+`add_vlan`/`add_static_dns`, two (or more) routes sharing a `dst-address`
+is the normal failover shape - a second `0.0.0.0/0` pointing at a backup
+gateway is exactly what this tool is for, so it never raises
+`ResourceAlreadyExistsError`.
+
+**SAFETY GUARANTEE - `remove_route` refuses to remove a dynamic route,
+outright.** If the resolved row's `dynamic` field is `"true"` (a
+connected/DHCP/OSPF/BGP-installed route - RouterOS creates these itself,
+an operator did not), `remove_route` raises an error **before building any
+preview and without ever calling the write primitive** - this is a hard
+refusal, not merely a warning (contrast `remove_dhcp_lease`, which *warns*
+but still allows removing a static lease). Removing a device's connected/
+dynamic route can sever the network entirely, so this tool only ever
+manages static, admin-created routes; if removing a dynamic route is
+genuinely intended, do it manually on the device (WinBox/CLI).
 
 ### DNS management (v0.10)
 
@@ -1183,7 +1221,7 @@ On top of the write guard:
 - **Never creates the target.** Write tools that operate on a named resource
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
   `remove_from_address_list`/`set_poe_out`/`start_container`/`stop_container`/
-  `set_route_distance`/`enable_route`/`disable_route`/`remove_netwatch`/
+  `set_route_distance`/`enable_route`/`disable_route`/`remove_route`/`remove_netwatch`/
   `enable_firewall_rule`/`disable_firewall_rule`/`add_wireguard_peer`/
   `remove_wireguard_peer`)
   look it up first - by name, by the v0.9 route tools' stable `dst-address`

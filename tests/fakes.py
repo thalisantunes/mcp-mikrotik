@@ -66,8 +66,12 @@ class FakePath:
             # redaction to have to strip.
             row.setdefault("private-key", FAKE_WIREGUARD_PRIVATE_KEY_MARKER)
             row.setdefault("public-key", FAKE_WIREGUARD_PUBLIC_KEY_MARKER)
-            row.setdefault("running", "true")
-            row.setdefault("disabled", "false")
+            # librouteros hands back RouterOS booleans as Python bool (or
+            # omits the field entirely) - never the strings "true"/"false".
+            # See formatting.coerce_ros_bool's docstring for the full
+            # ROS6/ROS7 split this mirrors.
+            row.setdefault("running", True)
+            row.setdefault("disabled", False)
         self._rows.append(row)
         return str(len(self._rows))
 

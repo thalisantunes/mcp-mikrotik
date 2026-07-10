@@ -113,11 +113,14 @@ def test_enable_interface_preview_does_not_apply(
     preview = guard.enable_interface(client, settings_write_enabled, interface_name="ether2", confirm=False)
 
     assert preview.applied is False
-    assert preview.before["disabled"] == "true"
+    # `before` is the raw fixture row (a real device's bool - see conftest.py
+    # and coerce_ros_bool's docstring); `after` is the literal "yes"/"no"
+    # RouterOS itself expects as a `set` command value, unaffected.
+    assert preview.before["disabled"] is True
     assert preview.after["disabled"] == "no"
     # Nothing was written to the fake device.
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows == {"ether1": "false", "ether2": "true"}
+    assert rows == {"ether1": False, "ether2": True}
 
 
 def test_disable_interface_confirm_true_applies(
@@ -126,10 +129,10 @@ def test_disable_interface_confirm_true_applies(
     preview = guard.disable_interface(client, settings_write_enabled, interface_name="ether1", confirm=True)
 
     assert preview.applied is True
-    assert preview.before["disabled"] == "false"
+    assert preview.before["disabled"] is False
     assert preview.after["disabled"] == "yes"
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
-    assert rows == {"ether1": "yes", "ether2": "true"}
+    assert rows == {"ether1": "yes", "ether2": True}
 
 
 def test_enable_interface_unknown_name_raises_resource_not_found(
@@ -150,7 +153,7 @@ def test_enable_interface_dispatches_via_allowlist_id(
     guard.enable_interface(client, settings_write_enabled, interface_name="ether2", confirm=True)
     rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
     # ether1 (row 0) must be untouched; only ether2 (the requested name) changes.
-    assert rows == {"ether1": "false", "ether2": "no"}
+    assert rows == {"ether1": False, "ether2": "no"}
 
 
 # --- set_wifi_ssid ----------------------------------------------------------
@@ -1083,8 +1086,10 @@ def test_start_container_dispatch_follows_allowlist_action(
 # --- set_route_distance / enable_route / disable_route (v0.9) ---------------
 #
 # The fixture device's ("ip", "route") table (see conftest.fake_connection)
-# has exactly one row: dst-address "0.0.0.0/0" via gateway "10.0.0.254", no
-# `distance` field set yet. Ambiguity tests below build their own two-route
+# has row *1: dst-address "0.0.0.0/0" via gateway "10.0.0.254", no
+# `distance` field set yet (plus, since v1.5, a couple of unrelated
+# static/dynamic rows used by add_route/remove_route tests - see
+# conftest.py). Ambiguity tests below build their own two-route
 # FakeConnection instead, mirroring set_wifi_ssid's pattern for scenarios
 # the shared fixture doesn't cover.
 
@@ -1325,10 +1330,10 @@ def test_disable_route_disambiguated_by_comment(settings_write_enabled: Settings
 
 
 def test_disable_route_default_route_preview_carries_warning(client: MikrotikClient, settings_write_enabled: Settings):
-    """dst-address "0.0.0.0/0" (the fixture device's only route) IS the
-    default route - the preview must carry a non-null, explicit warning
-    about cutting outbound traffic, both on preview and on the applied
-    result (not just one or the other)."""
+    """dst-address "0.0.0.0/0" (route *1 in the fixture) IS the default
+    route - the preview must carry a non-null, explicit warning about
+    cutting outbound traffic, both on preview and on the applied result
+    (not just one or the other)."""
     preview = guard.disable_route(
         client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=False
     )
@@ -1370,6 +1375,440 @@ def test_enable_route_rejects_invalid_dst_address_before_touching_device(
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.enable_route(guarded_client, settings_write_enabled, dst_address="not-an-ip", confirm=True)
+
+
+# --- add_route / remove_route (v1.5) -----------------------------------------
+#
+# Closes ROADMAP.md's Tier 1. Reuses _resolve_route/_DEFAULT_ROUTE_DST_ADDRESSES
+# (see set_route_distance/enable_route/disable_route block above). Dedicated
+# small FakeConnection route tables are built per-test below (mirroring
+# test_set_route_distance_resolves_by_dst_and_gateway_never_by_index's
+# pattern) rather than relying only on the shared fixture, so each test's
+# route table is exactly what it needs.
+
+
+def test_add_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.add_route(client, settings, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=True)
+
+
+def test_add_route_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_route(guarded_client, settings, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=True)
+
+
+def test_add_route_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_route(
+        client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"dst-address": "10.40.0.0/24", "gateway": "10.0.0.254"}
+    # Nothing was written to the fake device.
+    assert len(fake.path("ip", "route")._rows) == 1
+
+
+def test_add_route_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_route(
+        client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=True
+    )
+    assert preview.applied is True
+    rows = fake.path("ip", "route")._rows
+    assert len(rows) == 2
+    created = next(row for row in rows if row["dst-address"] == "10.40.0.0/24")
+    assert created["gateway"] == "10.0.0.254"
+    assert "distance" not in created
+    assert "comment" not in created
+
+
+def test_add_route_includes_optional_distance_and_comment_when_given(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ip", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    guard.add_route(
+        client,
+        settings_write_enabled,
+        dst_address="10.40.0.0/24",
+        gateway="10.0.0.254",
+        distance=3,
+        comment="failover",
+        confirm=True,
+    )
+    created = fake.path("ip", "route")._rows[0]
+    assert created["distance"] == "3"
+    assert created["comment"] == "failover"
+
+
+def test_add_route_never_refuses_duplicate_dst_address(settings_write_enabled: Settings, device: Device):
+    """Multiple routes sharing a dst-address is the normal failover shape -
+    add_route must never raise ResourceAlreadyExistsError, unlike
+    add_vlan/add_static_dns."""
+    fake = FakeConnection(data={("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.253", confirm=True
+    )
+    assert preview.applied is True
+    matches = [row for row in fake.path("ip", "route")._rows if row["dst-address"] == "0.0.0.0/0"]
+    assert len(matches) == 2
+
+
+def test_add_route_default_dst_address_carries_warning_on_preview_and_applied(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ip", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.warning is not None
+    assert "0.0.0.0/0" in preview.warning
+    assert "default" in preview.warning.lower()
+
+    applied = guard.add_route(
+        client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.254", confirm=True
+    )
+    assert applied.warning is not None
+
+
+def test_add_route_non_default_dst_address_carries_no_warning(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("ip", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_route(
+        client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=False
+    )
+    assert preview.warning is None
+
+
+def test_add_route_rejects_invalid_dst_address_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_route(
+            guarded_client, settings_write_enabled, dst_address="not-an-ip", gateway="10.0.0.254", confirm=True
+        )
+
+
+def test_add_route_rejects_invalid_gateway_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_route(
+            guarded_client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="not-a-gateway!", confirm=True
+        )
+
+
+def test_add_route_rejects_invalid_distance_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_route(
+            guarded_client,
+            settings_write_enabled,
+            dst_address="10.40.0.0/24",
+            gateway="10.0.0.254",
+            distance=999,
+            confirm=True,
+        )
+
+
+def test_add_route_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(data={("ip", "route"): []})
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_route"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_route", patched_op)
+
+    guard.add_route(client, settings_write_enabled, dst_address="10.40.0.0/24", gateway="10.0.0.254", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"dst-address": "10.40.0.0/24", "gateway": "10.0.0.254"}}
+
+
+def test_remove_route_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.remove_route(client, settings, dst_address="10.20.0.0/24", confirm=True)
+
+
+def test_remove_route_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_route(guarded_client, settings, dst_address="10.20.0.0/24", confirm=True)
+
+
+def _route_fake_with_static_and_dynamic() -> FakeConnection:
+    # `dynamic` is a Python `bool` here, not the string "true" - this is
+    # what librouteros actually hands back from a real device (confirmed
+    # against ROS6/ROS7 hardware; see coerce_ros_bool's docstring in
+    # formatting.py). The old string-typed fake masked the 1.5.0 security
+    # bug where remove_route's refusal compared this field against the
+    # literal string "true" and so never matched a real `True`.
+    return FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254"},
+                {".id": "*2", "dst-address": "10.30.0.0/24", "gateway": "ether1", "dynamic": True},
+            ]
+        }
+    )
+
+
+def test_remove_route_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=False)
+    assert preview.applied is False
+    assert preview.before == {".id": "*1", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254"}
+    assert preview.after == {}
+    # Nothing was removed from the fake device.
+    assert len(fake.path("ip", "route")._rows) == 2
+
+
+def test_remove_route_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=True)
+    assert preview.applied is True
+    remaining = {row["dst-address"] for row in fake.path("ip", "route")._rows}
+    assert remaining == {"10.30.0.0/24"}
+
+
+def test_remove_route_resolves_by_dst_address_and_gateway(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "primary"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253", "comment": "backup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    guard.remove_route(client, settings_write_enabled, dst_address="0.0.0.0/0", gateway="10.0.0.253", confirm=True)
+    remaining = {row["gateway"] for row in fake.path("ip", "route")._rows}
+    assert remaining == {"10.0.0.254"}
+
+
+def test_remove_route_ambiguous_without_gateway_raises_ambiguous_resource_error_and_removes_nothing(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254", "comment": "primary"},
+                {".id": "*2", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.253", "comment": "backup"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.remove_route(client, settings_write_enabled, dst_address="0.0.0.0/0", confirm=True)
+    assert "0.0.0.0/0" in str(exc_info.value)
+    assert len(fake.path("ip", "route")._rows) == 2
+
+
+def test_remove_route_unknown_dst_address_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_route(client, settings_write_enabled, dst_address="10.99.0.0/24", confirm=True)
+    assert "10.99.0.0/24" in str(exc_info.value)
+
+
+def test_remove_route_refuses_dynamic_route_and_does_not_remove_it(settings_write_enabled: Settings, device: Device):
+    """CRITICAL for this round: a route whose resolved row has
+    dynamic=True - a Python bool, the real shape librouteros hands back
+    from hardware, NOT the string "true" (see coerce_ros_bool) - must raise
+    ValidationError and must NOT be removed from the device - removing a
+    device's connected/dynamic route can sever the network."""
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError) as exc_info:
+        guard.remove_route(client, settings_write_enabled, dst_address="10.30.0.0/24", confirm=True)
+    assert "dynamic" in str(exc_info.value).lower()
+
+    # The row must still be present in the fake's own row storage - proof
+    # the write primitive was never called.
+    remaining = {row["dst-address"] for row in fake.path("ip", "route")._rows}
+    assert "10.30.0.0/24" in remaining
+    assert len(fake.path("ip", "route")._rows) == 2
+
+
+def test_remove_route_refuses_dynamic_route_even_on_preview(settings_write_enabled: Settings, device: Device):
+    """The dynamic-route refusal must fire identically for confirm=False -
+    a caller must never be able to even preview past this refusal in a way
+    that suggests removing a dynamic/connected route is fine."""
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError) as exc_info:
+        guard.remove_route(client, settings_write_enabled, dst_address="10.30.0.0/24", confirm=False)
+    assert "dynamic" in str(exc_info.value).lower()
+
+    # The row must still be present in the fake's own row storage - proof
+    # the refusal happens before any preview/write path is reached.
+    remaining = {row["dst-address"] for row in fake.path("ip", "route")._rows}
+    assert "10.30.0.0/24" in remaining
+    assert len(fake.path("ip", "route")._rows) == 2
+
+
+def test_remove_route_regression_dynamic_bool_true_is_refused_not_silently_removed(
+    settings_write_enabled: Settings, device: Device
+):
+    """SECURITY REGRESSION (1.5.0): before the fix, remove_route's refusal
+    was `row.get("dynamic") == "true"`. librouteros never actually sends
+    the string "true" for a RouterOS boolean field - a real device sends
+    the Python bool `True` (ROS7) or, for a false/absent one, `False` or
+    omits the field entirely (ROS6) - so `True == "true"` was always
+    `False` and this refusal never fired on real hardware: a dynamic/
+    connected/default route could be removed outright, potentially
+    severing the network. This test proves the CURRENT behaviour is
+    correct for the real (bool) shape; before the `coerce_ros_bool` fix,
+    it would have failed - the write would have gone through instead of
+    raising."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "10.30.0.0/24", "gateway": "ether1", "dynamic": True},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError):
+        guard.remove_route(client, settings_write_enabled, dst_address="10.30.0.0/24", confirm=True)
+
+    # Nothing was removed - the write primitive was never reached.
+    assert len(fake.path("ip", "route")._rows) == 1
+
+
+def test_remove_route_allows_removal_when_dynamic_is_bool_false(settings_write_enabled: Settings, device: Device):
+    """ROS7 shape for a static route: `dynamic` present and explicitly
+    `False` (bool). Must be removable - only dynamic=True is refused."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254", "dynamic": False},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=True)
+    assert preview.applied is True
+    assert fake.path("ip", "route")._rows == []
+
+
+def test_remove_route_allows_removal_when_dynamic_field_is_absent(settings_write_enabled: Settings, device: Device):
+    """ROS6 shape for a static route: `dynamic` OMITTED entirely (not sent
+    as False) - `row.get("dynamic")` is `None`. Must still be removable;
+    only a resolved dynamic=True refuses."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=True)
+    assert preview.applied is True
+    assert fake.path("ip", "route")._rows == []
+
+
+def test_remove_route_still_refuses_dynamic_string_true_for_defensive_compatibility(
+    settings_write_enabled: Settings, device: Device
+):
+    """coerce_ros_bool also accepts the string "true" (case-insensitively) -
+    belt-and-suspenders in case any code path/RouterOS version ever does
+    send a string instead of the real bool."""
+    fake = FakeConnection(
+        data={
+            ("ip", "route"): [
+                {".id": "*1", "dst-address": "10.30.0.0/24", "gateway": "ether1", "dynamic": "true"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError):
+        guard.remove_route(client, settings_write_enabled, dst_address="10.30.0.0/24", confirm=True)
+
+
+def test_remove_route_default_dst_address_carries_warning_not_refusal(settings_write_enabled: Settings, device: Device):
+    """Removing a STATIC default route is a legitimate operation - it gets
+    a warning, not the hard refusal reserved for dynamic routes."""
+    fake = FakeConnection(data={("ip", "route"): [{".id": "*1", "dst-address": "0.0.0.0/0", "gateway": "10.0.0.254"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="0.0.0.0/0", confirm=False)
+    assert preview.warning is not None
+    assert "0.0.0.0/0" in preview.warning
+    assert "default" in preview.warning.lower()
+
+    applied = guard.remove_route(client, settings_write_enabled, dst_address="0.0.0.0/0", confirm=True)
+    assert applied.warning is not None
+    assert applied.applied is True
+
+
+def test_remove_route_non_default_dst_address_carries_no_warning(settings_write_enabled: Settings, device: Device):
+    fake = _route_fake_with_static_and_dynamic()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=False)
+    assert preview.warning is None
+
+
+def test_remove_route_rejects_invalid_dst_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_route(guarded_client, settings_write_enabled, dst_address="not-an-ip", confirm=True)
+
+
+def test_remove_route_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={("ip", "route"): [{".id": "*1", "dst-address": "10.20.0.0/24", "gateway": "10.0.0.254"}]}
+    )
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_route"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_route", patched_op)
+
+    guard.remove_route(client, settings_write_enabled, dst_address="10.20.0.0/24", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
 
 
 # --- add_netwatch / remove_netwatch (v0.9) -----------------------------------
@@ -1910,6 +2349,9 @@ def test_clear_dns_cache_dispatches_via_allowlist_action(
 
 
 def _dhcp_leases_fixture() -> FakeConnection:
+    # `dynamic` is a Python bool here (librouteros' real shape - see
+    # coerce_ros_bool in formatting.py), not the string "true"/"false" a
+    # prior version of this fixture used.
     return FakeConnection(
         data={
             ("ip", "dhcp-server", "lease"): [
@@ -1917,14 +2359,14 @@ def _dhcp_leases_fixture() -> FakeConnection:
                     ".id": "*1",
                     "address": "10.0.0.50",
                     "mac-address": "AA:BB:CC:DD:EE:01",
-                    "dynamic": "true",
+                    "dynamic": True,
                     "status": "bound",
                 },
                 {
                     ".id": "*2",
                     "address": "10.0.0.60",
                     "mac-address": "AA:BB:CC:DD:EE:02",
-                    "dynamic": "false",
+                    "dynamic": False,
                     "status": "bound",
                 },
             ]
@@ -1994,6 +2436,28 @@ def test_remove_dhcp_lease_static_lease_carries_warning_on_preview_and_apply(
     assert "STATIC" in applied.warning
     macs = {row["mac-address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
     assert "AA:BB:CC:DD:EE:02" not in macs
+
+
+def test_remove_dhcp_lease_static_warning_fires_when_dynamic_field_is_absent(
+    settings_write_enabled: Settings, device: Device
+):
+    """ROS6 shape: `dynamic` OMITTED entirely on a static lease (not sent
+    as False) - `row.get("dynamic")` is `None`. Same class of fix as
+    remove_route: coerce_ros_bool(None) is not True, so this must still be
+    treated as "not confirmably dynamic" and carry the static-lease
+    warning, same as an explicit dynamic=False."""
+    fake = FakeConnection(
+        data={
+            ("ip", "dhcp-server", "lease"): [
+                {".id": "*1", "address": "10.0.0.70", "mac-address": "AA:BB:CC:DD:EE:03", "status": "bound"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:03", confirm=False)
+    assert preview.warning is not None
+    assert "STATIC" in preview.warning
 
 
 def test_remove_dhcp_lease_mac_tried_before_address_when_both_given(settings_write_enabled: Settings, device: Device):
@@ -2164,14 +2628,14 @@ def test_enable_firewall_rule_preview_does_not_apply(
 ):
     preview = guard.enable_firewall_rule(client, settings_write_enabled, comment="Bloqueio_Ataque_X", confirm=False)
     assert preview.applied is False
-    assert preview.before["disabled"] == "true"
+    assert preview.before["disabled"] is True
     assert preview.after["disabled"] == "no"
     # The full matched row - chain/action included - not just `disabled`,
     # so the caller can confirm WHICH rule this is before applying.
     assert preview.before["chain"] == "forward"
     assert preview.before["action"] == "drop"
     row = next(r for r in fake_connection.path("ip", "firewall", "filter")._rows if r["comment"] == "Bloqueio_Ataque_X")
-    assert row["disabled"] == "true"
+    assert row["disabled"] is True
 
 
 def test_enable_firewall_rule_confirm_true_applies(
@@ -2330,13 +2794,13 @@ def test_enable_nat_rule_preview_does_not_apply(
 ):
     preview = guard.enable_nat_rule(client, settings_write_enabled, comment="rdp-forward-maintenance", confirm=False)
     assert preview.applied is False
-    assert preview.before["disabled"] == "true"
+    assert preview.before["disabled"] is True
     assert preview.after["disabled"] == "no"
     assert preview.before["chain"] == "dstnat"
     row = next(
         r for r in fake_connection.path("ip", "firewall", "nat")._rows if r["comment"] == "rdp-forward-maintenance"
     )
-    assert row["disabled"] == "true"
+    assert row["disabled"] is True
 
 
 def test_enable_nat_rule_confirm_true_applies(
@@ -2475,13 +2939,13 @@ def test_enable_mangle_rule_preview_does_not_apply(
 ):
     preview = guard.enable_mangle_rule(client, settings_write_enabled, comment="Mark_Backup_Traffic", confirm=False)
     assert preview.applied is False
-    assert preview.before["disabled"] == "true"
+    assert preview.before["disabled"] is True
     assert preview.after["disabled"] == "no"
     assert preview.before["chain"] == "prerouting"
     row = next(
         r for r in fake_connection.path("ip", "firewall", "mangle")._rows if r["comment"] == "Mark_Backup_Traffic"
     )
-    assert row["disabled"] == "true"
+    assert row["disabled"] is True
 
 
 def test_enable_mangle_rule_confirm_true_applies(

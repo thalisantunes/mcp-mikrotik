@@ -47,7 +47,7 @@ from .exceptions import (
     ValidationError,
     WriteDisabledError,
 )
-from .formatting import WIREGUARD_SENSITIVE_FIELDS, strip_sensitive_fields
+from .formatting import WIREGUARD_SENSITIVE_FIELDS, coerce_ros_bool, strip_sensitive_fields
 from .validation import (
     validate_address_list_name,
     validate_allowed_address_list,
@@ -237,6 +237,29 @@ ALLOWLIST: dict[str, WriteOperation] = {
         description=(
             "Disable a route (disabled=yes); resolved by dst-address, narrowed by gateway/comment if ambiguous. "
             "Disabling the default route (0.0.0.0/0 or ::/0) cuts outbound traffic through that gateway."
+        ),
+    ),
+    # v1.5: closes Tier 1 of the route family - add/remove a static route,
+    # alongside the v0.9 set_route_distance/enable_route/disable_route
+    # trio. Both reuse _resolve_route/_DEFAULT_ROUTE_DST_ADDRESSES below.
+    "add_route": WriteOperation(
+        name="add_route",
+        path=("ip", "route"),
+        action="add",
+        description=(
+            "Add a static route (dst-address+gateway, optional distance/comment). Never refuses a duplicate "
+            "dst-address - multiple routes sharing one is the normal failover shape. Adding/overriding the "
+            "default route (0.0.0.0/0 or ::/0) redirects all traffic through the new gateway."
+        ),
+    ),
+    "remove_route": WriteOperation(
+        name="remove_route",
+        path=("ip", "route"),
+        action="remove",
+        description=(
+            "Remove a static route; resolved by dst-address, narrowed by gateway if ambiguous. Refuses to "
+            "remove a dynamic/connected route (dynamic=true) outright. Removing the default route "
+            "(0.0.0.0/0 or ::/0) cuts outbound traffic through that gateway."
         ),
     ),
     "add_netwatch": WriteOperation(
@@ -1465,6 +1488,155 @@ def disable_route(
     )
 
 
+# v1.5: static route add/remove - closes ROADMAP.md's Tier 1. Extends the
+# same /ip/route family as set_route_distance/enable_route/disable_route
+# above; add_route/remove_route reuse _resolve_route/_DEFAULT_ROUTE_DST_ADDRESSES
+# defined earlier in this file rather than re-deriving route resolution.
+
+
+@_audited("add_route")
+def add_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    gateway: str,
+    confirm: bool,
+    distance: int | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Add a static route (`/ip/route add`): `dst_address` and `gateway`
+    are required, `distance` (failover priority - lower wins) and `comment`
+    are optional.
+
+    Never refuses a duplicate `dst_address`+`gateway` pair (unlike
+    add_vlan/add_static_dns) - multiple routes sharing a `dst-address` is
+    the normal failover shape (see _resolve_route's own docstring), so this
+    tool never raises ResourceAlreadyExistsError.
+
+    If `dst_address` is the default route (`0.0.0.0/0`/`::/0` - see
+    _DEFAULT_ROUTE_DST_ADDRESSES), the returned WritePreview's `warning`
+    field is set to a clear, non-null message: adding/overriding the
+    default route redirects all traffic through the new gateway. This is
+    set on BOTH the preview (`confirm=False`) and the applied result
+    (`confirm=True`), same pattern as disable_route's default-route
+    warning.
+    """
+    op = _require_allowed(settings, "add_route")
+
+    validated_dst = validate_dst_address(dst_address)
+    validated_gateway = validate_route_gateway(gateway)
+    validated_distance = validate_route_distance(distance) if distance is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    payload: dict[str, Any] = {"dst-address": validated_dst, "gateway": validated_gateway}
+    if validated_distance is not None:
+        payload["distance"] = str(validated_distance)
+    if validated_comment:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    warning: str | None = None
+    if validated_dst in _DEFAULT_ROUTE_DST_ADDRESSES:
+        warning = (
+            f"{validated_dst} is the DEFAULT ROUTE - adding/overriding it redirects all traffic through "
+            f"gateway {validated_gateway!r}. Confirm this is the intended gateway before applying this "
+            "with confirm=true."
+        )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+@_audited("remove_route")
+def remove_route(
+    client: MikrotikClient,
+    settings: Settings,
+    dst_address: str,
+    confirm: bool,
+    gateway: str | None = None,
+) -> WritePreview:
+    """Remove a static route (`/ip/route remove`), resolved by `dst_address`
+    - narrowed by `gateway` when more than one route shares that
+    `dst_address` (see _resolve_route). Raises ResourceNotFoundError if
+    nothing matches, or AmbiguousResourceError if the match is still
+    ambiguous after narrowing.
+
+    REFUSES to remove a DYNAMIC route: if the resolved row's `dynamic`
+    field coerces to `True` (see `coerce_ros_bool`) - a connected/DHCP/
+    OSPF/BGP-installed route, not one an operator created by hand - this
+    raises ValidationError instead of removing anything - a hard refusal,
+    not just a warning. Removing a device's connected/dynamic route can
+    sever the network, and this tool only ever manages static,
+    admin-created routes. Remove a dynamic route manually on the device if
+    that is genuinely intended.
+
+    SECURITY NOTE (fixed in 1.5.0, confirmed against real ROS6/ROS7
+    hardware): librouteros returns RouterOS boolean fields as Python `bool`
+    (or omits them entirely, `None`) - NEVER the strings "true"/"false". An
+    earlier version of this refusal compared `row.get("dynamic")` directly
+    against the string `"true"`; since `True == "true"` is `False` in
+    Python, that comparison never matched on a real device, so this
+    refusal silently never fired outside the test suite's own
+    string-typed fakes - a dynamic/connected/default route could be
+    removed outright. See `coerce_ros_bool`'s docstring (formatting.py) for
+    the full ROS6/ROS7 split (ROS6 omits `dynamic` entirely when false;
+    ROS7 sends `False` explicitly) this fix accounts for.
+
+    If the resolved (static) route's `dst_address` is the default route
+    (`0.0.0.0/0`/`::/0` - see _DEFAULT_ROUTE_DST_ADDRESSES), the returned
+    WritePreview's `warning` field is set to a clear, non-null message
+    (this direction is a warning, not a refusal - removing a static
+    default route is a legitimate operation). Set on BOTH the preview
+    (`confirm=False`) and the applied result (`confirm=True`).
+    """
+    op = _require_allowed(settings, "remove_route")
+
+    validated_dst = validate_dst_address(dst_address)
+    validated_gateway = validate_route_gateway(gateway) if gateway is not None else None
+
+    row = _resolve_route(client, op, validated_dst, gateway=validated_gateway)
+
+    if coerce_ros_bool(row.get("dynamic")) is True:
+        raise ValidationError(
+            f"refuses to remove {validated_dst} via {row.get('gateway', '?')!r}: this route is dynamic "
+            "(dynamic=true) - a connected/DHCP/OSPF/BGP-installed route, not one this tool creates. Only "
+            "static, admin-created routes can be removed by this tool; remove a connected/DHCP/OSPF/"
+            "BGP-installed route manually on the device if that is genuinely intended."
+        )
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    warning: str | None = None
+    if validated_dst in _DEFAULT_ROUTE_DST_ADDRESSES:
+        warning = (
+            f"{validated_dst} is the DEFAULT ROUTE - removing it will cut outbound traffic that relies on "
+            f"gateway {row.get('gateway', '?')!r}. Confirm a working alternate route/gateway is already "
+            "active before applying this with confirm=true."
+        )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
 @_audited("add_netwatch")
 def add_netwatch(
     client: MikrotikClient,
@@ -1798,19 +1970,29 @@ def remove_dhcp_lease(
     more than the one matching row.
 
     STATIC vs DYNAMIC: this removes EITHER kind of lease - RouterOS's
-    `dynamic` field on the matched row (`"true"` for a normal DHCP-assigned
-    lease, `"false"` for one pinned by add_static_dhcp_lease) tells you
-    which. Removing a DYNAMIC lease is this tool's primary use case (forces
-    a renewal - a new dynamic lease is typically re-created on the client's
-    next DHCP request). Removing a STATIC lease is also allowed - it is not
-    blocked outright - but it deletes the pinned IP<->MAC mapping itself,
-    not just a transient cache entry, so the returned WritePreview's
-    `warning` field is set to a clear, non-null message whenever the
-    resolved lease is static (`dynamic == "false"`), on BOTH the preview
-    (`confirm=False`) and the applied result (`confirm=True`) - exactly the
-    same pattern `disable_route`'s default-route warning uses (see v0.9).
-    `warning` is `None` for a dynamic lease - removing one is unremarkable,
+    `dynamic` field on the matched row (`True` for a normal DHCP-assigned
+    lease, `False` - or absent, on ROS6 - for one pinned by
+    add_static_dhcp_lease; see `coerce_ros_bool`) tells you which. Removing
+    a DYNAMIC lease is this tool's primary use case (forces a renewal - a
+    new dynamic lease is typically re-created on the client's next DHCP
+    request). Removing a STATIC lease is also allowed - it is not blocked
+    outright - but it deletes the pinned IP<->MAC mapping itself, not just
+    a transient cache entry, so the returned WritePreview's `warning` field
+    is set to a clear, non-null message whenever the resolved lease is NOT
+    definitely dynamic (`coerce_ros_bool(row.get("dynamic")) is not True`
+    - i.e. `False` or unknown/absent, deliberately erring toward showing
+    the warning when it can't be told apart from a genuine static lease),
+    on BOTH the preview (`confirm=False`) and the applied result
+    (`confirm=True`) - exactly the same pattern `disable_route`'s
+    default-route warning uses (see v0.9). `warning` is `None` only when
+    the lease is confirmably dynamic - removing one is unremarkable,
     exactly what this tool is for.
+
+    1.5.0 fix: this used to compare `row.get("dynamic")` against the
+    literal string `"false"`, which - like `remove_route`'s dynamic-route
+    refusal (see that function's docstring) - never matches librouteros'
+    real `bool`/absent values, so a static lease's warning could silently
+    fail to fire on real hardware. Now goes through `coerce_ros_bool`.
     """
     op = _require_allowed(settings, "remove_dhcp_lease")
 
@@ -1834,7 +2016,7 @@ def remove_dhcp_lease(
     after: dict[str, Any] = {}
 
     warning: str | None = None
-    if row.get("dynamic") == "false":
+    if coerce_ros_bool(row.get("dynamic")) is not True:
         warning = (
             f"{before.get('address', '?')} <-> {before.get('mac-address', '?')} is a STATIC DHCP lease "
             "(dynamic=false) - removing it deletes the pinned mapping itself, not just a renewable "

@@ -3,6 +3,91 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.5.0] - 2026-07-10
+
+**Static route add / remove** (`/ip/route`), closing `ROADMAP.md`'s Tier 1
+and extending the v0.9 route family (`set_route_distance`,
+`enable_route`/`disable_route`) with the two writes that were still missing:
+creating and deleting a route outright, rather than only adjusting one
+already on the device.
+
+- `add_route` (guarded write): creates a static route from `dst_address` +
+  `gateway` (both required), with optional `distance` and `comment`.
+  **Never refuses a duplicate `dst_address`** - unlike `add_vlan`/
+  `add_static_dns`, multiple routes sharing a `dst-address` is the normal
+  failover shape (see `_resolve_route`'s own docstring), so a second
+  `0.0.0.0/0` pointing at a different gateway is not an error here. If
+  `dst_address` is the default route (`0.0.0.0/0`/`::/0`), the returned
+  preview's `warning` field is set to a clear, non-null message - adding or
+  overriding the default route redirects all outbound traffic through the
+  new gateway - present on both the `confirm=False` preview and the
+  `confirm=True` applied result.
+- `remove_route` (guarded write): removes a route resolved by `dst_address`,
+  narrowed by `gateway` when more than one route shares that `dst_address`
+  (reusing `_resolve_route` exactly as `set_route_distance`/`enable_route`/
+  `disable_route` already do - `ResourceNotFoundError`/`AmbiguousResourceError`
+  apply identically, never guessing which row to remove). Same default-route
+  `warning` pattern as `add_route`, for the removal direction.
+- **Key safety property**: `remove_route` REFUSES OUTRIGHT to remove a
+  dynamic route. If the resolved row's `dynamic` field coerces to `True`
+  (see `coerce_ros_bool` below - a connected/DHCP/OSPF/BGP-installed route,
+  not one an operator created by hand), it raises `ValidationError` before
+  building any preview and never calls the write primitive - a hard
+  refusal, not merely a warning, unlike `remove_dhcp_lease`'s softer "warn
+  but allow" handling of a static lease. Removing a device's
+  connected/dynamic route can sever the network entirely, so this tool only
+  ever manages static, admin-created routes; removing a dynamic route (if
+  genuinely intended) must be done manually on the device.
+
+**SECURITY FIX - RouterOS boolean fields compared against the wrong type**
+(caught in real-hardware testing against ROS6 `.254` and ROS7 `.237`,
+*before* this release ever shipped). `librouteros` - the real device
+transport this package uses - returns a RouterOS boolean field (`dynamic`,
+`disabled`, etc.) as a Python `bool` (`True`/`False`), or omits the field
+entirely (`None`) when RouterOS itself omits it; it **never** returns the
+strings `"true"`/`"false"`, unlike this package's own test fakes prior to
+this fix. Because `True == "true"` is `False` in Python, `remove_route`'s
+dynamic-route refusal above - written as `row.get("dynamic") == "true"` -
+**never actually matched on real hardware**: a connected/DHCP/OSPF/
+BGP-installed route (including the default route) could be removed
+outright, with no refusal, potentially severing the network. The test
+fakes (`tests/fakes.py`, `tests/conftest.py`) returned the string
+`"true"`/`"false"` for these fields, so the existing test suite passed
+despite the bug - it only surfaced against real hardware.
+  - Added `coerce_ros_bool(value) -> bool | None` (`formatting.py`): the
+    correct normalizer for this class of write-guard *logic* (as opposed to
+    `ros_bool`, already used for read-tool *presentation*, which was never
+    affected - it already checked `isinstance(value, bool)` first). Accepts
+    a real `bool`, a case-insensitive `"true"/"yes"/"false"/"no"` string
+    (defensively), or `None`/absent/unrecognized (returned as `None`, not
+    guessed as `False`, so a caller can tell "definitely false" apart from
+    "unknown").
+  - `remove_route` now refuses when `coerce_ros_bool(row.get("dynamic")) is
+    True` - correctly matching a real device's `True`, `"true"`, `False`,
+    or absent `dynamic` field, instead of only the string `"true"`.
+  - **Bonus fix found by the same audit**: `remove_dhcp_lease`'s
+    static-lease warning had the identical bug (`row.get("dynamic") ==
+    "false"`) - lower severity (it only skips a warning, never blocks a
+    removal) but the same wrong-type comparison. Now uses
+    `coerce_ros_bool(row.get("dynamic")) is not True`, so the warning fires
+    for both an explicit `dynamic=False` (ROS7) and an omitted `dynamic`
+    field (ROS6's shape for a static lease).
+  - The full codebase was audited for every `== "true"`/`== "false"`/
+    `== "yes"`/`== "no"` comparison against a RouterOS field; these two
+    (`remove_route`, `remove_dhcp_lease`) were the only ones affecting
+    control flow. `security.py`/`formatting.py` already routed every other
+    boolean-field check through `ros_bool`, which was never affected.
+  - Test fakes updated to match: `tests/conftest.py`'s shared fixture and
+    `tests/fakes.py`'s WireGuard `add()` defaults now return Python `bool`
+    (mirroring `librouteros`'s real shape) instead of the strings
+    `"true"`/`"false"` for every field this package interprets as boolean
+    (`dynamic`, `disabled`, `running`, `complete`, `local`, `assured`,
+    `confirmed`, `seen-reply`) - this is what makes the test suite able to
+    catch this class of bug going forward. Added explicit regression tests
+    proving `remove_route`/`remove_dhcp_lease` behave correctly for the
+    real `bool`/`None` shape (and still refuse a legacy string `"true"`,
+    defensively).
+
 ## [1.4.0] - 2026-07-10
 
 **NAT rule toggle + firewall mangle (read + toggle)**, extending v0.11's

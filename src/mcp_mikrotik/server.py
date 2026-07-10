@@ -4,7 +4,8 @@ Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
 add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
 remove_from_address_list, set_poe_out, start_container/stop_container,
-set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
+set_route_distance, enable_route/disable_route, add_route/remove_route,
+add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule,
 add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
@@ -1467,6 +1468,79 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.disable_route(
             client, settings, dst_address=dst_address, gateway=gateway, comment=comment, confirm=confirm
         )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def add_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str,
+        distance: int | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Add a static route (`/ip/route add`): `dst_address` and
+        `gateway` are required, `distance` (failover priority - lower wins)
+        and `comment` are optional. Never refuses a duplicate `dst_address`
+        - multiple routes sharing one is the normal failover shape.
+
+        RISK: adding/overriding the default route (`dst_address="0.0.0.0/0"`
+        or `"::/0"`) redirects all outbound traffic through the new
+        gateway. The returned preview's `warning` field is non-null
+        whenever this is the case - always check it before calling again
+        with `confirm=true`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the `warning`
+        field) without changing anything; call again with confirm=True to
+        actually apply it.
+        """
+        client = _client(device_name)
+        preview = guard.add_route(
+            client,
+            settings,
+            dst_address=dst_address,
+            gateway=gateway,
+            distance=distance,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_route(
+        device_name: str,
+        dst_address: str,
+        gateway: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Remove a static route (`/ip/route remove`), resolved by
+        `dst_address` - narrowed by `gateway` when more than one route
+        shares that `dst_address`. Errors clearly if nothing matches, or if
+        the match is still ambiguous after narrowing.
+
+        SAFETY: refuses outright (raises an error, does not remove
+        anything) if the resolved route is dynamic (`dynamic=true` - a
+        connected/DHCP/OSPF/BGP-installed route). Only static,
+        admin-created routes can be removed by this tool - removing a
+        device's connected/dynamic route can sever the network.
+
+        The returned preview's `warning` field is non-null (but not
+        blocking) whenever the resolved route's `dst_address` is the
+        default route (`0.0.0.0/0`/`::/0`) - check it before calling again
+        with `confirm=true`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the `warning`
+        field) without changing anything; call again with confirm=True to
+        actually apply it.
+        """
+        client = _client(device_name)
+        preview = guard.remove_route(client, settings, dst_address=dst_address, gateway=gateway, confirm=confirm)
         return asdict(preview)
 
     @mcp.tool()
