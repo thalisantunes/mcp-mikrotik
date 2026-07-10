@@ -123,6 +123,68 @@ def test_lte_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
     assert flaky.calls_made == 2
 
 
+# --- Regression: librouteros' callable connection form returns a GENERATOR,
+# not a list, for monitor-once commands. `replies[0] if replies else {}` on
+# the raw generator raised `TypeError: 'generator' object is not
+# subscriptable` on every call against real hardware (confirmed against ROS7
+# mANTBox and ROS6 OmniTik) - a generator is always truthy (so `if replies`
+# never caught the empty case) and never subscriptable (so `replies[0]`
+# always raised). client.py now materializes with list(...) first, exactly
+# like ping/traceroute already did; these tests pin both (a) that the fakes
+# actually hand back a generator - so a regression to `list` in the fakes
+# can't hide a regression to `replies[0]` in client.py - and (b) that
+# monitor_traffic/poe_monitor/lte_monitor handle both an empty and a
+# non-empty generator without raising.
+
+
+def test_fake_connection_returns_a_generator_not_a_list_for_monitor_once_commands(
+    fake_connection: FakeConnection,
+):
+    """Pin the fakes' contract: a `once=` monitor command must hand back a
+    generator (truthy-but-empty, not subscriptable) - a real `list` here
+    would let client.py regress to `replies[0]` without any test catching
+    it."""
+    import types
+
+    for cmd, interface in (
+        ("/interface/monitor-traffic", "ether1"),
+        ("/interface/ethernet/poe/monitor", "ether1"),
+        ("/interface/lte/monitor", "lte1"),
+    ):
+        result = fake_connection(cmd, interface=interface, once="")
+        assert isinstance(result, types.GeneratorType)
+        assert bool(result) is True  # a generator object is always truthy
+        with pytest.raises(TypeError):
+            result[0]  # not subscriptable, unlike a list
+
+
+@pytest.mark.parametrize(
+    "method_name,interface",
+    [("monitor_traffic", "ether1"), ("poe_monitor", "ether1"), ("lte_monitor", "lte1")],
+)
+def test_monitor_once_methods_handle_a_non_empty_generator_reply(
+    client: MikrotikClient, method_name: str, interface: str
+):
+    """Non-empty generator case: must not raise, and must return the one
+    reply as a plain dict."""
+    reply = getattr(client, method_name)(interface)
+    assert isinstance(reply, dict)
+    assert reply != {}
+
+
+@pytest.mark.parametrize(
+    "method_name,interface",
+    [("monitor_traffic", "sfp1"), ("poe_monitor", "sfp1"), ("lte_monitor", "lte99")],
+)
+def test_monitor_once_methods_handle_an_empty_generator_reply(
+    client: MikrotikClient, method_name: str, interface: str
+):
+    """Empty generator case (device has nothing to report for this
+    interface): must not raise TypeError, must return {}."""
+    reply = getattr(client, method_name)(interface)
+    assert reply == {}
+
+
 # --- v0.7: start/stop (RouterOS ACTION commands, not update/add/remove) ----
 
 

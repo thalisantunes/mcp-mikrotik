@@ -41,7 +41,19 @@ logger = logging.getLogger("mcp_mikrotik.audit")
 # see client.py). Keeps the journal safe even if a future allowlist entry
 # touches an endpoint (e.g. /ppp/secret, /user) whose rows do carry
 # sensitive fields.
-_SENSITIVE_KEY = re.compile(r"password|secret|token|credential", re.IGNORECASE)
+#
+# `passphrase`/`psk`/`pre-shared-key` (and its `pre_shared_key`/`preshared`
+# spellings, and the `wpa-pre-shared`/`wpa2-pre-shared` RouterOS field names
+# used by /interface/wifi/security and /interface/wireless/security-profiles)
+# were added after a real set_wifi_ssid preview against ROS7 hardware wrote
+# the WPA2 passphrase to the journal in plaintext: the original regex only
+# covered password/secret/token/credential, and RouterOS's own field name for
+# a WPA2 key is `passphrase` (or `wpa2-pre-shared-key`/`wpa-pre-shared-key`),
+# none of which that pattern matched.
+_SENSITIVE_KEY = re.compile(
+    r"password|secret|token|credential|passphrase|psk|pre.?shared",
+    re.IGNORECASE,
+)
 
 _VALID_OUTCOMES = {"preview", "applied", "error"}
 

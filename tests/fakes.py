@@ -72,6 +72,20 @@ class FakePath:
         raise LibRouterosError(f"no such item (id={row_id!r})")
 
 
+def _once_reply_stream(reply: dict[str, Any] | None):
+    """Mirror librouteros' actual return type for a `once=` monitor-style
+    command (/interface/monitor-traffic, /interface/ethernet/poe/monitor,
+    /interface/lte/monitor): a GENERATOR, not a list - always truthy (even
+    when it yields nothing) and never subscriptable. Real hardware exposed a
+    bug where client.py did `replies[0] if replies else {}` directly on this
+    - `list` here would have made the fakes lie about that. Callers
+    (client.py's monitor_traffic/poe_monitor/lte_monitor) must call
+    list(...) on the result before subscripting it, exactly like ping/
+    traceroute already do."""
+    if reply is not None:
+        yield dict(reply)
+
+
 class FakeConnection:
     """Stand-in for a connected librouteros.Api, entirely in memory."""
 
@@ -123,14 +137,11 @@ class FakeConnection:
         if cmd == "/tool/traceroute":
             return list(self._traceroute_replies)
         if cmd == "/interface/monitor-traffic":
-            reply = self._monitor_traffic_replies.get(kwargs.get("interface"))
-            return [dict(reply)] if reply is not None else []
+            return _once_reply_stream(self._monitor_traffic_replies.get(kwargs.get("interface")))
         if cmd == "/interface/ethernet/poe/monitor":
-            reply = self._poe_monitor_replies.get(kwargs.get("interface"))
-            return [dict(reply)] if reply is not None else []
+            return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
         if cmd == "/interface/lte/monitor":
-            reply = self._lte_monitor_replies.get(kwargs.get("interface"))
-            return [dict(reply)] if reply is not None else []
+            return _once_reply_stream(self._lte_monitor_replies.get(kwargs.get("interface")))
         return []
 
     def close(self) -> None:

@@ -87,11 +87,12 @@ ALLOWLIST: dict[str, WriteOperation] = {
         description="Disable a network interface by name (sets disabled=yes).",
     ),
     # set_wifi_ssid is exposed as ONE server.py tool, but a device may speak
-    # either of these two RouterOS generations - see set_wifi_ssid() below,
-    # which detects which one the target interface actually lives under and
-    # dispatches through that (and only that) allowlisted operation. Both
-    # entries stay individually named/reviewable; nothing here accepts an
-    # arbitrary path.
+    # either RouterOS generation, and ROS7 itself may store the ssid in
+    # either of two places - see set_wifi_ssid()/_resolve_wifi_ssid_target()
+    # below, which detect which of the three entries below the target
+    # interface actually lives under and dispatch through that (and only
+    # that) allowlisted operation. Every entry stays individually
+    # named/reviewable; nothing here accepts an arbitrary path.
     "set_wifi_ssid_ros7": WriteOperation(
         name="set_wifi_ssid_ros7",
         path=("interface", "wifi"),
@@ -103,6 +104,18 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("interface", "wireless"),
         action="update",
         description="Set the SSID of a ROS6 wireless-package interface (/interface/wireless).",
+    ),
+    # A ROS7 /interface/wifi interface that references a named `configuration`
+    # (the standard production layout - confirmed against real ROS7 hardware,
+    # a mANTBox) has NO writable `ssid` field of its own; the SSID lives on
+    # the referenced /interface/wifi/configuration row instead. set_wifi_ssid()
+    # below resolves the interface's own `configuration` field server-side and
+    # dispatches here - never on a path the caller supplies.
+    "set_wifi_ssid_ros7_configuration": WriteOperation(
+        name="set_wifi_ssid_ros7_configuration",
+        path=("interface", "wifi", "configuration"),
+        action="update",
+        description="Set the SSID on a named ROS7 wifi configuration profile (/interface/wifi/configuration).",
     ),
     # set_client_bandwidth is exposed as ONE server.py tool, backed by two
     # fixed allowlist entries exactly like set_wifi_ssid above: whichever one
@@ -366,18 +379,71 @@ def disable_interface(client: MikrotikClient, settings: Settings, interface_name
     )
 
 
+def _resolve_wifi_ssid_target(
+    client: MikrotikClient, interface_row: dict[str, Any]
+) -> tuple[WriteOperation, dict[str, Any]]:
+    """Resolve where a matched ROS7 /interface/wifi interface's SSID
+    actually lives, and return the (WriteOperation, row) to read/write it.
+
+    Confirmed against real ROS7 hardware (mANTBox) running a named
+    `configuration` - the standard production layout: the wifi interface row
+    itself has NO writable `ssid` field at all; writing one there is
+    rejected by RouterOS ("unknown parameter ssid"). The SSID lives on the
+    /interface/wifi/configuration row the interface references (its own
+    `configuration` field, e.g. `configuration=cfg1`) instead - that row,
+    resolved here by name, is the real write target and the honest
+    before/after source.
+
+    Only a wifi interface with NO named `configuration` at all (rare/legacy)
+    still carries a genuinely inline `ssid` field - that case is unchanged
+    from before this fix: written directly on /interface/wifi.
+
+    Raises DeviceCommandError with a clear explanation - never a device
+    command RouterOS would itself reject - if neither shape is recognized:
+    a `configuration` name that doesn't resolve to any
+    /interface/wifi/configuration row, or an interface row with neither a
+    `configuration` reference nor an inline `ssid` field.
+    """
+    configuration_name = interface_row.get("configuration")
+    if configuration_name:
+        config_op = ALLOWLIST["set_wifi_ssid_ros7_configuration"]
+        try:
+            config_rows = client.path(*config_op.path)
+        except DeviceCommandError as exc:
+            raise DeviceCommandError(
+                client.device.name,
+                "/".join(config_op.path),
+                f"interface references configuration {configuration_name!r} but "
+                f"/interface/wifi/configuration could not be read: {exc}",
+            ) from exc
+        config_row = _find_row_by_field(config_rows, "name", configuration_name)
+        if config_row is None:
+            raise ResourceNotFoundError(client.device.name, "Wifi configuration", configuration_name)
+        return config_op, config_row
+
+    if "ssid" in interface_row:
+        return ALLOWLIST["set_wifi_ssid_ros7"], interface_row
+
+    raise DeviceCommandError(
+        client.device.name,
+        "/".join(ALLOWLIST["set_wifi_ssid_ros7"].path),
+        "wifi interface has neither a 'configuration' reference nor an inline "
+        "'ssid' field - cannot determine where its SSID is stored.",
+    )
+
+
 @_audited("set_wifi_ssid_ros7")
 def set_wifi_ssid(
     client: MikrotikClient, settings: Settings, interface_name: str, new_ssid: str, confirm: bool
 ) -> WritePreview:
     """Set a wireless interface's SSID, on either RouterOS generation.
 
-    The read-only gate is identical for both candidate operations, so it is
-    checked once up front (anchored on the ROS7 entry purely to reuse
-    _require_allowed's ALLOWLIST/gate check) before anything is read from the
-    device, exactly like every other guarded write.
+    The read-only gate is identical for every candidate operation, so it is
+    checked once up front (anchored on the ROS7 interface entry purely to
+    reuse _require_allowed's ALLOWLIST/gate check) before anything is read
+    from the device, exactly like every other guarded write.
 
-    Which underlying path is actually touched is then decided by looking for
+    Which underlying interface is targeted is decided by looking for
     `interface_name` first under /interface/wifi (ROS7), then under
     /interface/wireless (ROS6) - mirroring server.py's wireless_registrations
     read tool's own ROS7-then-ROS6 fallback. A device that doesn't have a
@@ -385,12 +451,19 @@ def set_wifi_ssid(
     client.path(); that is treated the same as "not found here" and the next
     candidate is tried, so a non-wifi device or a ROS6-only device never
     produces a confusing transport error - only a clear "not found" once both
-    candidates are exhausted, or a WritePreview from whichever one matched.
+    candidates are exhausted.
+
+    For a ROS7 match, WHERE the ssid is actually written is then resolved
+    separately by _resolve_wifi_ssid_target: a production ROS7 interface
+    referencing a named `configuration` has no inline `ssid` field at all -
+    the real write target is that /interface/wifi/configuration row (see
+    that function's docstring, confirmed against real hardware). A ROS6
+    match always writes inline on /interface/wireless, unchanged.
     """
     _require_allowed(settings, "set_wifi_ssid_ros7")
 
-    op = None
-    row = None
+    interface_op = None
+    interface_row = None
     for operation_name in ("set_wifi_ssid_ros7", "set_wifi_ssid_ros6"):
         candidate_op = ALLOWLIST[operation_name]
         try:
@@ -399,11 +472,16 @@ def set_wifi_ssid(
             continue
         candidate_row = _find_row_by_field(candidate_rows, "name", interface_name)
         if candidate_row is not None:
-            op, row = candidate_op, candidate_row
+            interface_op, interface_row = candidate_op, candidate_row
             break
 
-    if row is None or op is None:
+    if interface_row is None or interface_op is None:
         raise ResourceNotFoundError(client.device.name, "Wireless interface", interface_name)
+
+    if interface_op.name == "set_wifi_ssid_ros7":
+        op, row = _resolve_wifi_ssid_target(client, interface_row)
+    else:
+        op, row = interface_op, interface_row
 
     before = dict(row)
     after = dict(row)
@@ -809,7 +887,19 @@ def _set_container_running(
 
     validated_container = validate_container_identifier(container)
 
-    rows = client.path(*op.path)
+    try:
+        rows = client.path(*op.path)
+    except DeviceCommandError:
+        # A device with no container package/hardware support at all (e.g. a
+        # ROS6-only box, or a board without the container feature) raises a
+        # raw DeviceCommandError from client.path() - same underlying
+        # condition the read tool `containers()` already degrades
+        # gracefully from (returns [] rather than erroring; see
+        # server.py). A write can't silently no-op the same way, but it
+        # must not leak that raw device-side error text either - treat it
+        # the same as "no such container here", exactly like an unmatched
+        # name/tag below.
+        raise ResourceNotFoundError(client.device.name, "Container", validated_container) from None
     row = _find_container_row(rows, validated_container)
     if row is None:
         raise ResourceNotFoundError(client.device.name, "Container", validated_container)

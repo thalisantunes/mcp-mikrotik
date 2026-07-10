@@ -142,7 +142,7 @@ model" below for the full guard mechanism.
 | `set_identity` | Set a device's RouterOS identity (hostname). |
 | `enable_interface` | Enable a network interface by name (`disabled=no`). Errors if the interface name doesn't exist; never creates one. |
 | `disable_interface` | Disable a network interface by name (`disabled=yes`). Errors if the interface name doesn't exist; never creates one. |
-| `set_wifi_ssid` | Set a wireless interface's SSID. Detects whether the interface lives under the ROS7 wifi package or the ROS6 wireless package and writes to whichever one matches; errors if the interface name isn't found under either. |
+| `set_wifi_ssid` | Set a wireless interface's SSID. Detects whether the interface lives under the ROS7 wifi package or the ROS6 wireless package and writes to whichever one matches; errors if the interface name isn't found under either. On ROS7, also detects whether the ssid is inline or lives on the interface's referenced `configuration` profile and writes to the right place - see "ROS7 wifi: `configuration`-based SSID" below. |
 | `set_client_bandwidth` | Limit a client's bandwidth via a Simple Queue targeting an IP/subnet (`target`). Updates the existing queue's `max-limit`/`limit-at` if one already targets it, otherwise creates one with a name derived from `target`. **FastTrack gotcha**: if the device has a FastTrack firewall rule, fasttracked traffic bypasses queues entirely - this may have no visible effect until FastTrack is adjusted. See "Limiting a client's bandwidth" below. |
 | `add_static_dhcp_lease` | Create a static DHCP lease pinning an IP `address` to a `mac_address` (useful to give a client a stable target before limiting it). Refuses to create a second lease for a MAC that already has one. |
 | `remove_simple_queue` | Remove a Simple Queue by `target` or `name` - undoes a bandwidth limit. |
@@ -287,7 +287,10 @@ again afterward to see the settled `"running"`/`"stopped"` status. See
 action-command shape was added to the write guard without weakening it.
 Like every other write tool, `start_container`/`stop_container` never
 create a container: an unmatched `container` raises
-`ResourceNotFoundError`.
+`ResourceNotFoundError`. A device with no container package/hardware
+support at all raises the same `ResourceNotFoundError` (never a raw
+device-side error) - the same underlying condition `containers()` already
+degrades gracefully from (returns `[]` rather than erroring).
 
 ### USB (v0.7)
 
@@ -321,10 +324,15 @@ Three independent controls apply to every write tool, all centralized in
    `set_wifi_ssid` and `set_client_bandwidth` are the two exceptions to "one
    tool, one allowlist entry": because RouterOS exposes wifi under different
    paths depending on generation (ROS7 `/interface/wifi` vs ROS6
-   `/interface/wireless`), `set_wifi_ssid` is backed by *two* fixed, reviewed
-   allowlist entries (`set_wifi_ssid_ros7`/`set_wifi_ssid_ros6`), and the
-   guard function picks between them by checking which path actually has a
-   matching interface name on the device. Likewise, `set_client_bandwidth`
+   `/interface/wireless`) - and, on ROS7, the ssid itself lives in one of two
+   different places depending on whether the interface references a named
+   `configuration` (see "ROS7 wifi: `configuration`-based SSID" below) -
+   `set_wifi_ssid` is backed by *three* fixed, reviewed allowlist entries
+   (`set_wifi_ssid_ros7`/`set_wifi_ssid_ros7_configuration`/
+   `set_wifi_ssid_ros6`), and the guard function picks between them by
+   reading the device: which path has a matching interface name, and then,
+   for a ROS7 match, whether that interface's ssid is inline or lives on its
+   referenced configuration profile. Likewise, `set_client_bandwidth`
    either updates an existing Simple Queue or creates a new one, so it is
    backed by `set_client_bandwidth_update`/`set_client_bandwidth_add`, and
    the guard function picks between them by checking whether a queue already
@@ -335,6 +343,28 @@ Three independent controls apply to every write tool, all centralized in
    `confirm: bool` parameter. With `confirm=False` (the default), the tool
    computes and returns what would change - a `before`/`after` structure -
    without applying anything. Only `confirm=True` applies the change.
+
+### ROS7 wifi: `configuration`-based SSID
+
+Confirmed against real ROS7 hardware (a mANTBox): in the standard production
+layout, a `/interface/wifi` interface references a named `configuration`
+(e.g. `configuration=cfg1`) and has **no writable `ssid` field of its own** -
+writing one directly there is rejected by RouterOS ("unknown parameter
+ssid"). The ssid instead lives on the referenced
+`/interface/wifi/configuration` row.
+
+`set_wifi_ssid` resolves this automatically: for a ROS7 match, it checks the
+interface's own `configuration` field, looks up the matching
+`/interface/wifi/configuration` row by name, and reads/writes the ssid
+there (backed by the `set_wifi_ssid_ros7_configuration` allowlist entry).
+The `before`/`after` preview always reflects the ssid's real location - it
+is never synthesized on a field that doesn't actually exist on the device.
+Only a wifi interface with no named `configuration` at all (rare/legacy)
+keeps a genuinely inline `ssid` field, written directly on `/interface/wifi`
+as before. If neither shape is recognized (a `configuration` name that
+doesn't resolve, or an interface with neither an inline `ssid` nor a
+`configuration` reference), the tool raises a clear error rather than
+sending a write RouterOS would itself reject.
 
 On top of the write guard:
 

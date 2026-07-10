@@ -145,6 +145,80 @@ def test_record_strips_password_like_keys_case_insensitively_and_nested(
     assert event["summary"]["after"]["list_of_rows"] == [{"ok": "fine"}]
 
 
+def test_record_never_includes_wifi_passphrase_field(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """set_wifi_ssid's before/after preview reads the WPA2 passphrase off the
+    device row it's editing - the journal must never carry it, same as a
+    device password."""
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    _record(
+        summary={
+            "before": {"ssid": "old-ssid", "passphrase": "MyWifiSecret123"},
+            "after": {"ssid": "new-ssid", "passphrase": "MyWifiSecret123"},
+        }
+    )
+
+    raw = log_path.read_text(encoding="utf-8")
+    assert "MyWifiSecret123" not in raw
+    event = json.loads(raw.strip())
+    assert "passphrase" not in event["summary"]["before"]
+    assert "passphrase" not in event["summary"]["after"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "passphrase",
+        "security.passphrase",
+        "wpa2-pre-shared-key",
+        "wpa-pre-shared-key",
+        "psk",
+        "pre-shared-key",
+        "pre_shared_key",
+        "preshared",
+    ],
+)
+def test_record_strips_every_wifi_secret_key_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+):
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    _record(summary={"before": {}, "after": {key: "top-secret-wifi-key", "ssid": "safe-value"}})
+
+    raw = log_path.read_text(encoding="utf-8")
+    assert "top-secret-wifi-key" not in raw
+    event = json.loads(raw.strip())
+    assert key not in event["summary"]["after"]
+    assert event["summary"]["after"]["ssid"] == "safe-value"
+
+
+def test_record_strips_nested_wifi_passphrase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A `security.passphrase`-shaped nested dict (e.g. ROS7's
+    /interface/wifi/configuration row, which nests wifi security fields
+    under a `security` key) must be stripped recursively, same as
+    `nested.credential` already is."""
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    _record(
+        summary={
+            "before": {},
+            "after": {
+                "ssid": "safe-value",
+                "security": {"passphrase": "nested-wifi-secret", "authentication-types": "wpa2-psk"},
+            },
+        }
+    )
+
+    raw = log_path.read_text(encoding="utf-8")
+    assert "nested-wifi-secret" not in raw
+    event = json.loads(raw.strip())
+    assert event["summary"]["after"]["security"] == {"authentication-types": "wpa2-psk"}
+    assert event["summary"]["after"]["ssid"] == "safe-value"
+
+
 def test_record_never_logs_password_to_stderr_either(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):

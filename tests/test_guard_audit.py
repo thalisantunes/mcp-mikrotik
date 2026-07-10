@@ -240,6 +240,32 @@ def test_dynamic_dispatch_journal_uses_anchor_operation_on_error(
     assert events[0]["operation"] == "set_wifi_ssid_ros7"
 
 
+def test_ros7_configuration_dispatch_journal_uses_resolved_operation_and_never_leaks_passphrase(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """set_wifi_ssid's ROS7-named-`configuration` path (Bug 2 fix) reads the
+    /interface/wifi/configuration row as before/after - if that row (as on
+    real hardware) also carries a `passphrase`/WPA2 key field, it must never
+    reach the journal, exactly like the device password never does (Bug 3
+    fix - see audit._SENSITIVE_KEY)."""
+    fake_connection._data[("interface", "wifi")] = [{".id": "*1", "name": "wifi1", "configuration": "cfg1"}]
+    fake_connection._data[("interface", "wifi", "configuration")] = [
+        {".id": "*5", "name": "cfg1", "ssid": "old-ssid", "security": {"passphrase": "MyWpa2Secret"}}
+    ]
+
+    guard.set_wifi_ssid(client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["operation"] == "set_wifi_ssid_ros7_configuration"
+    assert events[0]["tool"] == "set_wifi_ssid"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "MyWpa2Secret" not in raw
+    assert "passphrase" not in events[0]["summary"]["before"].get("security", {})
+    assert "passphrase" not in events[0]["summary"]["after"].get("security", {})
+
+
 # --- set_poe_out (v0.6) ------------------------------------------------------
 
 

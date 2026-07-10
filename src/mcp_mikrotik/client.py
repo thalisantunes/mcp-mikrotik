@@ -389,8 +389,16 @@ class MikrotikClient:
         """
 
         def _do(connection: RouterosConnection) -> dict[str, Any]:
-            replies = connection("/interface/monitor-traffic", interface=interface, once="")
-            return dict(replies[0]) if replies else {}
+            # librouteros' callable connection form returns a GENERATOR, not
+            # a list - always truthy and never subscriptable. Materializing
+            # with list(...) first (exactly like ping/traceroute above) is
+            # required before `rows[0]`/`if rows` mean what they look like
+            # they mean; the previous `replies[0] if replies else {}` on the
+            # raw generator raised `TypeError: 'generator' object is not
+            # subscriptable` on every real device (confirmed against ROS7
+            # mANTBox and ROS6 OmniTik hardware).
+            rows = list(connection("/interface/monitor-traffic", interface=interface, once=""))
+            return dict(rows[0]) if rows else {}
 
         return self._run_read("interface/monitor-traffic", _do)
 
@@ -408,8 +416,10 @@ class MikrotikClient:
         """
 
         def _do(connection: RouterosConnection) -> dict[str, Any]:
-            replies = connection("/interface/ethernet/poe/monitor", interface=interface, once="")
-            return dict(replies[0]) if replies else {}
+            # See monitor_traffic's _do above: must materialize with list(...)
+            # before subscripting - librouteros returns a generator here too.
+            rows = list(connection("/interface/ethernet/poe/monitor", interface=interface, once=""))
+            return dict(rows[0]) if rows else {}
 
         return self._run_read("interface/ethernet/poe/monitor", _do)
 
@@ -432,8 +442,10 @@ class MikrotikClient:
         """
 
         def _do(connection: RouterosConnection) -> dict[str, Any]:
-            replies = connection("/interface/lte/monitor", interface=interface, once="")
-            return dict(replies[0]) if replies else {}
+            # See monitor_traffic's _do above: must materialize with list(...)
+            # before subscripting - librouteros returns a generator here too.
+            rows = list(connection("/interface/lte/monitor", interface=interface, once=""))
+            return dict(rows[0]) if rows else {}
 
         return self._run_read("interface/lte/monitor", _do)
 

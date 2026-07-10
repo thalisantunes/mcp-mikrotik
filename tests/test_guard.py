@@ -9,6 +9,7 @@ from mcp_mikrotik import guard
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
 from mcp_mikrotik.exceptions import (
+    DeviceCommandError,
     GuardViolationError,
     ResourceAlreadyExistsError,
     ResourceNotFoundError,
@@ -211,6 +212,105 @@ def test_set_wifi_ssid_unknown_interface_raises_resource_not_found(
     with pytest.raises(ResourceNotFoundError) as exc_info:
         guard.set_wifi_ssid(client, settings_write_enabled, interface_name="ghost-radio", new_ssid="x", confirm=True)
     assert "ghost-radio" in str(exc_info.value)
+
+
+# --- set_wifi_ssid: ROS7 named `configuration` (real-hardware regression) --
+#
+# Confirmed against a real mANTBox (ROS7, production layout): the
+# /interface/wifi row has NO writable `ssid` field at all when it references
+# a named `configuration` - only `configuration=<name>`. The real target is
+# the matching /interface/wifi/configuration row's own `ssid` field.
+
+
+def test_set_wifi_ssid_ros7_with_named_configuration_writes_to_configuration_row(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("interface", "wifi"): [{".id": "*1", "name": "wifi1", "configuration": "cfg1"}],
+            ("interface", "wifi", "configuration"): [
+                {".id": "*5", "name": "cfg1", "ssid": "old-ssid", "mode": "ap"}
+            ],
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wifi_ssid(
+        client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=False
+    )
+    assert preview.operation == "set_wifi_ssid_ros7_configuration"
+    assert preview.applied is False
+    # Honest before/after: reflects the configuration row's real ssid, not a
+    # synthesized field on the interface row (which has none).
+    assert preview.before == {".id": "*5", "name": "cfg1", "ssid": "old-ssid", "mode": "ap"}
+    assert preview.after["ssid"] == "new-ssid"
+    # Preview must not touch the device.
+    assert fake.path("interface", "wifi", "configuration")._rows[0]["ssid"] == "old-ssid"
+    assert "ssid" not in fake.path("interface", "wifi")._rows[0]
+
+    applied = guard.set_wifi_ssid(
+        client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True
+    )
+    assert applied.applied is True
+    assert applied.operation == "set_wifi_ssid_ros7_configuration"
+    # The configuration row changed...
+    assert fake.path("interface", "wifi", "configuration")._rows[0]["ssid"] == "new-ssid"
+    # ...and the interface row itself was never touched (still no ssid field).
+    assert "ssid" not in fake.path("interface", "wifi")._rows[0]
+
+
+def test_set_wifi_ssid_ros7_inline_ssid_when_no_configuration_reference(
+    settings_write_enabled: Settings, device: Device
+):
+    """The rare/legacy case (no named `configuration` at all) keeps writing
+    inline on /interface/wifi, unchanged from before this fix."""
+    fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.set_wifi_ssid(
+        client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True
+    )
+    assert applied.operation == "set_wifi_ssid_ros7"
+    assert fake.path("interface", "wifi")._rows[0]["ssid"] == "new-ssid"
+
+
+def test_set_wifi_ssid_ros7_unknown_configuration_name_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("interface", "wifi"): [{".id": "*1", "name": "wifi1", "configuration": "ghost-cfg"}],
+            ("interface", "wifi", "configuration"): [{".id": "*5", "name": "cfg1", "ssid": "old-ssid"}],
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.set_wifi_ssid(client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
+    assert "ghost-cfg" in str(exc_info.value)
+    # Nothing was written anywhere.
+    assert fake.path("interface", "wifi", "configuration")._rows[0]["ssid"] == "old-ssid"
+
+
+def test_set_wifi_ssid_ros7_ambiguous_interface_raises_clear_device_command_error(
+    settings_write_enabled: Settings, device: Device
+):
+    """No `configuration` reference AND no inline `ssid` field: refuse with a
+    clear, explicit error rather than sending a write RouterOS would reject."""
+    fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1"}]})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError) as exc_info:
+        guard.set_wifi_ssid(client, settings_write_enabled, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
+    assert "configuration" in str(exc_info.value)
+
+
+def test_set_wifi_ssid_ros7_configuration_read_only_gate_applies_before_touching_device(
+    device: Device, settings: Settings
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_wifi_ssid(guarded_client, settings, interface_name="wifi1", new_ssid="new-ssid", confirm=True)
 
 
 # --- set_client_bandwidth ---------------------------------------------------
@@ -896,6 +996,39 @@ def test_start_container_rejects_invalid_identifier_before_touching_device(
     guarded_client = MikrotikClient(device, connection=RaisingConnection())
     with pytest.raises(ValidationError):
         guard.start_container(guarded_client, settings_write_enabled, container="grafana\nrm -rf /", confirm=True)
+
+
+# --- start/stop_container: no /container menu at all (secondary finding) ---
+#
+# A device with no container package/hardware support (e.g. a ROS6-only box)
+# raises a raw DeviceCommandError from client.path("container") - the read
+# tool `containers()` already degrades that gracefully to `[]` (server.py);
+# start/stop_container must not leak that raw device-side error either.
+
+
+def test_start_container_no_container_menu_raises_resource_not_found_not_raw_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(raise_for={("container",): LibRouterosError("no such command prefix")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.start_container(client, settings_write_enabled, container="grafana", confirm=True)
+    assert "grafana" in str(exc_info.value)
+    # Never the raw device-side message.
+    assert "no such command prefix" not in str(exc_info.value)
+
+
+def test_stop_container_no_container_menu_raises_resource_not_found_not_raw_error(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(raise_for={("container",): LibRouterosError("no such command prefix")})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.stop_container(client, settings_write_enabled, container="grafana", confirm=True)
+    assert "grafana" in str(exc_info.value)
+    assert "no such command prefix" not in str(exc_info.value)
 
 
 def test_start_container_dispatch_follows_allowlist_action(

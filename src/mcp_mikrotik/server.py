@@ -606,6 +606,12 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         either RouterOS generation - it looks for `interface_name` under the
         ROS7 wifi package first, then the ROS6 wireless package - and errors
         clearly if it isn't found under either; it is never created.
+
+        On ROS7, a wifi interface running the standard production layout (a
+        named `configuration`) has no ssid field of its own - the actual
+        write lands on the referenced /interface/wifi/configuration profile
+        instead, resolved automatically. The before/after preview always
+        reflects the real location the ssid is read from and written to.
         """
         client = _client(device_name)
         preview = guard.set_wifi_ssid(

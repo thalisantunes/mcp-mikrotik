@@ -3,6 +3,91 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.7.1] - Unreleased
+
+Patch round: four bugs found testing v0.7.0 against real hardware (a ROS7
+mANTBox at a lab IP and a ROS6 OmniTik), none of them caught by the
+in-memory fake device suite because the fakes didn't match real
+librouteros/RouterOS behavior closely enough. The write-guard mechanism
+itself (read-only default, central allowlist, confirm/preview, audit
+journal) is unchanged - every fix below tightens it, none weakens or
+bypasses it.
+
+### Fixed
+
+- **`interface_traffic`/`poe_status`/`lte_status` raised `TypeError` on
+  every real device (CRITICAL)** - `src/mcp_mikrotik/client.py`
+  (`MikrotikClient.monitor_traffic`/`.poe_monitor`/`.lte_monitor`):
+  librouteros' callable connection form (`connection(cmd, **kwargs)`)
+  returns a **generator**, not a list - always truthy, never subscriptable.
+  The old `replies[0] if replies else {}` on that raw generator raised
+  `TypeError: 'generator' object is not subscriptable` on every call
+  against real hardware (100% failure rate for these three read tools).
+  Fixed by materializing with `list(connection(...))` first, exactly like
+  `ping`/`traceroute` already did. `tests/fakes.py`'s
+  `FakeConnection.__call__` previously returned a `list` for these three
+  commands, which is why the fake suite never caught this - it now returns
+  a real generator (`_once_reply_stream`), so a regression back to
+  `replies[0]` would fail the suite again.
+- **`set_wifi_ssid` rejected on ROS7 with a named `configuration`
+  (CRITICAL)** - `src/mcp_mikrotik/guard.py`: on ROS7's standard production
+  wifi layout, `/interface/wifi` interfaces reference a named
+  `configuration` (e.g. `configuration=cfg1`) and have **no writable
+  `ssid` field of their own** - the write was rejected by RouterOS
+  ("unknown parameter ssid"). The ssid actually lives on the referenced
+  `/interface/wifi/configuration` row. `set_wifi_ssid` now resolves this
+  server-side: it reads the matched interface's own `configuration` field,
+  looks up the matching `/interface/wifi/configuration` row by name, and
+  reads/writes the ssid there - backed by a new allowlist entry,
+  `set_wifi_ssid_ros7_configuration` (`("interface", "wifi",
+  "configuration")`, action `update`), resolved the same way as every
+  other guarded write (`_require_allowed` + `getattr(client, op.action)`
+  dispatch, never a caller-supplied path). The `before`/`after` preview
+  always reflects the ssid's real location - never a synthesized field
+  that doesn't exist on the device. A wifi interface with no named
+  `configuration` at all (rare/legacy) keeps writing an inline `ssid`
+  field, unchanged. An unresolvable `configuration` name raises
+  `ResourceNotFoundError`; an interface with neither an inline `ssid` nor a
+  `configuration` reference raises a clear `DeviceCommandError` instead of
+  sending a write RouterOS would itself reject. See README's "ROS7 wifi:
+  `configuration`-based SSID".
+- **WPA2 passphrase leaked into the audit journal (SECURITY)** -
+  `src/mcp_mikrotik/audit.py` (`_SENSITIVE_KEY`): the sensitive-key regex
+  covered `password`/`secret`/`token`/`credential` but not `passphrase` -
+  `set_wifi_ssid`'s ROS7-`configuration` preview/apply (see above) reads
+  the configuration row as `before`/`after`, and a real device's row can
+  carry the WPA2 key under `passphrase`/`security.passphrase`. Extended
+  the regex to also strip `passphrase`, `psk`, and any `pre-shared`/
+  `pre_shared`/`preshared` spelling (covers `wpa-pre-shared-key`,
+  `wpa2-pre-shared-key`, `pre-shared-key`, `pre_shared_key`, `preshared`
+  case-insensitively) - recursively, nested included, same as
+  `password`/`secret` already were.
+- **`start_container`/`stop_container` leaked a raw device error on a
+  device with no container support** - `src/mcp_mikrotik/guard.py`
+  (`_set_container_running`): `client.path(*op.path)` was not wrapped, so
+  a device with no container package/hardware at all (e.g. a ROS6-only
+  box) raised a raw `DeviceCommandError` straight from the device's own
+  RouterOS response, instead of degrading the way the read tool
+  `containers()` already does (returns `[]`, no error). Now caught and
+  raised as `ResourceNotFoundError` - the same clear error already used
+  for "no container matches this name/tag" - never the raw device-side
+  text.
+
+### Tests
+
+25 new tests (476 → 501, full suite green): generator-vs-list regression
+tests for `monitor_traffic`/`poe_monitor`/`lte_monitor` (both against the
+fakes' contract directly and against empty/non-empty generator replies);
+`guard.set_wifi_ssid`'s new `configuration`-resolution path (preview+apply
+writes to the configuration row and never the interface row, unknown
+`configuration` name, ambiguous interface with neither shape, read-only
+gate), plus an audit-journal test proving a `passphrase` field on that
+configuration row never reaches the journal; `audit._SENSITIVE_KEY`
+coverage for every new spelling (`passphrase`, `security.passphrase`,
+`wpa2-pre-shared-key`, `wpa-pre-shared-key`, `psk`, `pre-shared-key`,
+`pre_shared_key`, `preshared`), flat and nested; `start_container`/
+`stop_container` against a device with no `/container` menu at all.
+
 ## [0.7.0] - Unreleased
 
 LTE/5G + containers + USB round: read tools for cellular WAN status,
