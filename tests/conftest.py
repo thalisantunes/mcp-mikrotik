@@ -104,6 +104,35 @@ def fake_connection() -> FakeConnection:
             ("ip", "pool"): [
                 {".id": "*1", "name": "dhcp-pool", "ranges": "10.0.0.100-10.0.0.200"}
             ],
+            # v0.6: physical layer / PoE - a CRS318-16P-2S+-like mix of
+            # PoE-capable ethernet ports (ether1: high/48V, ether2: low/24V)
+            # and a non-PoE-capable one (sfp1: no `poe-out` field at all,
+            # like an SFP+ cage or a device with no PoE hardware).
+            ("interface", "ethernet"): [
+                {".id": "*1", "name": "ether1", "poe-out": "auto-on"},
+                {".id": "*2", "name": "ether2", "poe-out": "off"},
+                {".id": "*3", "name": "sfp1"},
+            ],
+            ("ip", "arp"): [
+                {
+                    ".id": "*1",
+                    "address": "10.0.0.70",
+                    "mac-address": "AA:BB:CC:DD:EE:70",
+                    "interface": "ether1",
+                    "dynamic": "false",
+                    "complete": "true",
+                }
+            ],
+            ("interface", "bridge", "host"): [
+                {
+                    ".id": "*1",
+                    "mac-address": "AA:BB:CC:DD:EE:70",
+                    "on-interface": "ether1",
+                    "bridge": "bridge1",
+                    "dynamic": "false",
+                    "local": "false",
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
@@ -113,6 +142,28 @@ def fake_connection() -> FakeConnection:
             {"address": "10.0.0.254", "hop": "1", "status": "", "loss": "0%", "time": "1ms"},
             {"address": "8.8.8.8", "hop": "2", "status": "", "loss": "0%", "time": "5ms"},
         ],
+        monitor_traffic_replies={
+            "ether1": {
+                "rx-bits-per-second": "1000000",
+                "tx-bits-per-second": "500000",
+                "rx-packets-per-second": "120",
+                "tx-packets-per-second": "80",
+            },
+        },
+        poe_monitor_replies={
+            "ether1": {
+                "poe-out-status": "powered-on",
+                "poe-out-voltage": "48.0",
+                "poe-out-current": "150",
+                "poe-out-power": "7.2",
+            },
+            "ether2": {
+                "poe-out-status": "poe-out-off",
+                "poe-out-voltage": "0",
+                "poe-out-current": "0",
+                "poe-out-power": "0",
+            },
+        },
     )
 
 

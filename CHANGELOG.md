@@ -3,6 +3,87 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.6.0] - Unreleased
+
+Physical layer / L2 observability round, plus PoE control: read tools to
+locate a device on the physical topology and read its live traffic/PoE
+state, and one new guarded write tool to power-cycle a PoE port. Built on
+top of the same write-guard mechanism as every previous round (read-only
+default, central allowlist, confirm/preview, audit journal, ROS6/ROS7
+compat) - none of it weakened or bypassed.
+
+### Added
+
+- **`arp_table`** (read, `src/mcp_mikrotik/server.py`): lists the IPv4 ARP
+  table (`/ip/arp`) - address, mac-address, interface, dynamic, complete.
+  Cross-references an IP to a MAC (or vice versa) for a statically-addressed
+  device that never shows up in `dhcp_leases`.
+- **`bridge_hosts`** (read): lists `/interface/bridge/host` entries -
+  mac-address, on-interface, bridge, dynamic, local. Finds which physical
+  bridge port a MAC is currently learned on.
+- **`interface_traffic`** (read): current rx/tx rate of one interface, via
+  `/interface/monitor-traffic interface=<X> once=yes`. `once=""` is sent as
+  a structured flag parameter (RouterOS API convention for a boolean/flag -
+  an empty value, not the string "yes") so the device replies exactly once
+  and the call returns promptly, instead of opening the continuous/streaming
+  form of monitor-traffic that RouterOS uses when `once` is omitted
+  entirely. `interface` is validated for shape
+  (`validation.validate_interface_name`, new) before ever being sent.
+- **`poe_status`** (read): PoE configuration + live consumption for every
+  PoE-capable ethernet port on the device. Reads `/interface/ethernet` and
+  keeps only rows with a `poe-out` field, then reads
+  `/interface/ethernet/poe/monitor once=yes` per port for
+  voltage/current/power/`poe-out-status`. A port whose live monitor call
+  fails is still listed (with its configured `poe-out`, just without the
+  live fields) rather than failing the whole call. Returns an empty list
+  (never an error) for a device with no PoE hardware at all.
+- **`set_poe_out`** (WRITE, guarded - new `ALLOWLIST` entry
+  `src/mcp_mikrotik/guard.py`): sets a PoE-capable ethernet port's
+  `poe-out` mode (`/interface/ethernet set [interface] poe-out=<mode>`,
+  action `update`). `poe_out` must be one of `auto-on`/`forced-on`/`off`
+  (new `validation.validate_poe_out`). Killer use case: remotely
+  power-cycling a locked-up antenna/camera/AP powered over PoE - `off` then
+  `auto-on` again - instead of a truck roll. Same guard mechanics as every
+  other write tool: blocked by the read-only gate unless
+  `MIKROTIK_ALLOW_WRITE=true`, `confirm=false` previews a before/after
+  without touching the device, only `confirm=true` applies it, and it never
+  creates or coerces anything - raises `ResourceNotFoundError` if
+  `interface_name` doesn't exist on the device at all, or exists but has no
+  `poe-out` field (not PoE-capable hardware, e.g. an SFP+ cage). Goes
+  through the v0.5 audit-journal `_audited` decorator automatically, like
+  every other guarded write - the device password never appears in the
+  journal.
+- `MikrotikClient.monitor_traffic`/`.poe_monitor` (`src/mcp_mikrotik/client.py`):
+  new read primitives for the two "monitor once" RouterOS commands above,
+  built the same way as `ping`/`traceroute` - the callable connection form
+  (`connection(cmd, **kwargs)`), automatic read-retry on a transient network
+  error (`_run_read`), and transport failures wrapped as
+  `DeviceCommandError`. No new timeout logic was needed: `once=""` is
+  RouterOS's own "reply once and stop" contract (mirrored from its CLI
+  `once=yes` flag), and the connection's existing socket timeout
+  (`MikrotikClient`'s `timeout`/`MIKROTIK_TIMEOUT`) already bounds every
+  command sent over it, exactly as it already did for `ping`/`traceroute`.
+- `validation.validate_interface_name`/`validate_poe_out`
+  (`src/mcp_mikrotik/validation.py`): shape validation for a RouterOS
+  interface name and the `poe-out` enum, used by `interface_traffic` and
+  `set_poe_out`.
+
+### Tests
+
+61 new tests (352 → 415, full suite green): `validate_interface_name`/
+`validate_poe_out` (valid/invalid/non-string cases);
+`MikrotikClient.monitor_traffic`/`.poe_monitor` (structured params not a
+command string, empty-reply handling, transport-error wrapping, read
+retry); `guard.set_poe_out` (blocked read-only, gate-before-touch,
+preview/confirm, `.id`-targeted dispatch, unknown interface, non-PoE
+interface, invalid `poe_out`/`interface_name` before touching the device,
+audit journal outcomes including the no-password-leak sweep); and
+`arp_table`/`bridge_hosts`/`interface_traffic`/`poe_status`/`set_poe_out`
+exercised end to end through `server.py`'s `call_tool` (happy paths, the
+read-only-by-default and read-tools-never-gated cases, empty-PoE-device
+case, one-bad-port resilience for `poe_status`, and the invalid-input and
+unknown-resource error paths for `set_poe_out`).
+
 ## [0.5.0] - Unreleased
 
 Production-hardening round: layers added *around* the existing write-guard

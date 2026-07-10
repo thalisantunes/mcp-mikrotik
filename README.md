@@ -13,20 +13,21 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.5: everything from v0.4 (read tools covering the core device inventory
-plus DHCP leases, DNS cache, firewall filter/NAT rules, address-lists,
-scheduler, IP pools, wireless client registrations, system health and
-Simple Queue entries; a `traceroute` diagnostic tool; and a set of guarded
-write tools - `set_identity`, `enable_interface`/`disable_interface`,
-`set_wifi_ssid`, `set_client_bandwidth`, `add_static_dhcp_lease`,
-`remove_simple_queue`, `add_to_address_list`/`remove_from_address_list` -
-that all go through the same write-guard mechanism), plus a set of
-production-hardening layers around it: a structured audit journal for every
-guarded write, per-call correlation ids, automatic retry for read
-operations on a transient network error, and a per-device circuit breaker.
-None of this changes the security model - see "Production features" and
-"Security model" below. See `CHANGELOG.md` for what changed since v0.1.0,
-and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
+v0.6: everything from v0.5 (the core read-tool inventory, `ping`/
+`traceroute` diagnostics, a set of guarded write tools - `set_identity`,
+`enable_interface`/`disable_interface`, `set_wifi_ssid`,
+`set_client_bandwidth`, `add_static_dhcp_lease`, `remove_simple_queue`,
+`add_to_address_list`/`remove_from_address_list` - all going through the
+same write-guard mechanism, plus the production-hardening layers around it:
+audit journal, correlation ids, read retry, circuit breaker), plus a
+physical layer / L2 observability round: `interface_traffic` (live rx/tx
+rate for one interface) and `poe_status` (per-port PoE configuration and
+live consumption), and one new guarded write tool, `set_poe_out` (set a
+PoE-capable port's output mode - the killer feature being a remote power
+cycle for a locked-up antenna/camera/AP). See "Physical layer & PoE control"
+below. None of this changes the security model - see "Production features"
+and "Security model" below. See `CHANGELOG.md` for what changed since
+v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
 ## Installation
 
@@ -113,6 +114,10 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
 | `ping` | Ping an address from the device; `address` is validated as IPv4/IPv6/hostname before use. |
 | `traceroute` | Traceroute to an address from the device; returns the list of hops. `address` validated like `ping`'s; `count`/`max_hops` are capped low (and a fixed short per-hop timeout used internally) so the command can't run long enough to hit RouterOS's own API command timeout. Diagnostic only - not gated by `MIKROTIK_ALLOW_WRITE`. |
+| `arp_table` | List the IPv4 ARP table (address, mac-address, interface, dynamic, complete) - cross-reference IP↔MAC for a statically-addressed device that doesn't show up in `dhcp_leases`. |
+| `bridge_hosts` | List `/interface/bridge/host` entries (mac-address, on-interface, bridge, dynamic, local) - find which physical bridge port a MAC is currently on. |
+| `interface_traffic` | Current rx/tx rate of one `interface` (`/interface/monitor-traffic once=yes`); `interface` is validated for shape before use. A single instantaneous reading, not a stream - see "Physical layer & PoE control" below. |
+| `poe_status` | PoE configuration + live consumption for every PoE-capable ethernet port on the device (voltage/current/power/`poe-out-status`); empty list (not an error) for a device with no PoE hardware. See "Physical layer & PoE control" below. |
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 
 ### Write (guarded)
@@ -133,6 +138,7 @@ model" below for the full guard mechanism.
 | `remove_simple_queue` | Remove a Simple Queue by `target` or `name` - undoes a bandwidth limit. |
 | `add_to_address_list` | Add an IP/subnet `address` to a named firewall `list_name`. **Only manages the list** - see "Blocking/allowing a client via address lists" below for why this alone doesn't block/allow anything. Refuses to create a duplicate `list_name`+`address` pair. |
 | `remove_from_address_list` | Remove the `list_name`+`address` entry from a firewall address-list. Same "list only" caveat as `add_to_address_list`. |
+| `set_poe_out` | Set a PoE-capable ethernet port's `poe-out` mode (`auto-on`/`forced-on`/`off`). Errors if `interface_name` doesn't exist, or exists but isn't PoE-capable; never creates/coerces anything. See "Physical layer & PoE control" below. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
@@ -190,6 +196,43 @@ actually block or allow anyone. The typical flow:
 4. `address_lists` to check current membership; `remove_from_address_list`
    to lift a block/allow later.
 
+### Physical layer & PoE control (v0.6)
+
+Three tools for the physical/L2 layer, aimed at fleets where devices are
+powered over PoE from a managed switch (e.g. a MikroTik CRS318-16P-2S+
+feeding antennas at different PoE levels - 48V "high" and 24V "low"):
+
+- `arp_table`/`bridge_hosts` (`/ip/arp` and `/interface/bridge/host` - see
+  the read-tools table above) to cross-reference an IP to a MAC, and a MAC
+  to the physical bridge port it's on.
+- `interface_traffic` for a live rx/tx reading on one interface.
+- `poe_status` for per-port PoE configuration and live consumption
+  (voltage/current/power/`poe-out-status`) across every PoE-capable port -
+  empty, not an error, on hardware with no PoE at all.
+- `set_poe_out` to change a port's PoE output mode.
+
+**The killer use case: remote power-cycle a locked-up antenna/camera/AP.**
+Rather than a truck roll to physically unplug/replug a device, if it's
+powered over PoE from a MikroTik switch:
+
+1. `bridge_hosts` (or `arp_table`) to confirm which physical port the stuck
+   device is on, if not already known.
+2. `poe_status` to see its current `poe-out`/`poe-out-status` and confirm
+   it's actually drawing power (voltage/current > 0) before assuming a PoE
+   cycle will help.
+3. `set_poe_out` with `poe_out="off"`, `confirm=false` first to preview,
+   then `confirm=true` to actually cut power to the port.
+4. Wait a few seconds - `poe_status` again to confirm `poe-out-status` shows
+   the port is no longer powered.
+5. `set_poe_out` with `poe_out="auto-on"` (preview, then confirm) to restore
+   power. `forced-on` is also available for ports/devices that need power
+   regardless of RouterOS's own PoE detection/negotiation.
+
+Like every other write tool, `set_poe_out` never creates or coerces
+anything: it raises `ResourceNotFoundError` if `interface_name` doesn't
+exist on the device at all, or if it exists but has no `poe-out` field (not
+PoE-capable hardware, e.g. an SFP+ cage) - see "Security model" below.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -225,11 +268,14 @@ On top of the write guard:
 
 - **Never creates the target.** Write tools that operate on a named resource
   (`enable_interface`/`disable_interface`/`set_wifi_ssid`/`remove_simple_queue`/
-  `remove_from_address_list`) look it up by name first. If no interface/
-  wireless network/queue/address-list entry with that name (or `target`, or
-  `list_name`+`address` pair) exists on the device, the tool raises a clear
-  error instead of creating one - a typo can never silently provision
-  something new.
+  `remove_from_address_list`/`set_poe_out`) look it up by name first. If no
+  interface/wireless network/queue/address-list entry with that name (or
+  `target`, or `list_name`+`address` pair) exists on the device, the tool
+  raises a clear error instead of creating one - a typo can never silently
+  provision something new. `set_poe_out` additionally requires the matched
+  interface to actually have a `poe-out` field (i.e. be PoE-capable
+  hardware) - a name that exists but isn't a PoE port raises the same clear
+  error rather than doing nothing silently.
 - **Never silently duplicates.** `add_static_dhcp_lease` checks for an
   existing lease on the given `mac_address` first, and `add_to_address_list`
   checks for an existing entry with the same `list_name`+`address` pair

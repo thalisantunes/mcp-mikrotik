@@ -48,8 +48,10 @@ from .exceptions import (
 from .validation import (
     validate_address_list_name,
     validate_comment,
+    validate_interface_name,
     validate_ip_address,
     validate_mac_address,
+    validate_poe_out,
     validate_rate_pair,
     validate_target,
     validate_timeout,
@@ -141,6 +143,12 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("ip", "firewall", "address-list"),
         action="remove",
         description="Remove an IP/subnet entry from a named firewall address-list.",
+    ),
+    "set_poe_out": WriteOperation(
+        name="set_poe_out",
+        path=("interface", "ethernet"),
+        action="update",
+        description="Set a PoE-capable ethernet port's PoE output mode (auto-on/forced-on/off).",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -688,4 +696,47 @@ def remove_from_address_list(
 
     write = getattr(client, op.action)
     write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.6: physical layer / PoE control -------------------------------------
+
+
+@_audited("set_poe_out")
+def set_poe_out(
+    client: MikrotikClient, settings: Settings, interface_name: str, poe_out: str, confirm: bool
+) -> WritePreview:
+    """Set a PoE-capable ethernet port's `poe-out` mode
+    (/interface/ethernet set [interface] poe-out=<auto-on|forced-on|off>).
+
+    Primary use case on this fleet: resetting a locked-up antenna/camera/AP
+    powered over PoE by cycling its power - set poe_out="off" (confirm=true),
+    then once it's confirmed down, set poe_out="auto-on" again to bring it
+    back up.
+
+    Errors (never creates/coerces anything) if `interface_name` doesn't
+    exist on the device at all, OR if it exists but isn't PoE-capable (its
+    /interface/ethernet row has no `poe-out` field at all - e.g. an SFP
+    port, or any port on a device with no PoE hardware) - both cases raise
+    ResourceNotFoundError.
+    """
+    op = _require_allowed(settings, "set_poe_out")
+
+    validated_interface = validate_interface_name(interface_name)
+    validated_poe_out = validate_poe_out(poe_out)
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", validated_interface)
+    if row is None or "poe-out" not in row:
+        raise ResourceNotFoundError(client.device.name, "PoE-capable interface", validated_interface)
+
+    before = dict(row)
+    after = dict(row)
+    after["poe-out"] = validated_poe_out
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "poe-out": validated_poe_out})
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

@@ -53,6 +53,40 @@ def test_ping_forwards_structured_params_not_a_command_string(
     assert fake_connection.calls == [("/ping", {"address": "8.8.8.8", "count": "2"})]
 
 
+def test_monitor_traffic_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    reply = client.monitor_traffic("ether1")
+    assert reply["rx-bits-per-second"] == "1000000"
+    assert reply["tx-bits-per-second"] == "500000"
+    # once="" mirrors RouterOS's own `once=yes` CLI flag - a structured kwarg,
+    # never concatenated into the command string itself.
+    assert fake_connection.calls == [("/interface/monitor-traffic", {"interface": "ether1", "once": ""})]
+
+
+def test_monitor_traffic_returns_empty_dict_when_device_replies_nothing(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    assert client.monitor_traffic("sfp1") == {}
+
+
+def test_poe_monitor_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    reply = client.poe_monitor("ether1")
+    assert reply["poe-out-status"] == "powered-on"
+    assert reply["poe-out-voltage"] == "48.0"
+    assert fake_connection.calls == [
+        ("/interface/ethernet/poe/monitor", {"interface": "ether1", "once": ""})
+    ]
+
+
+def test_poe_monitor_returns_empty_dict_when_device_replies_nothing(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    assert client.poe_monitor("sfp1") == {}
+
+
 def test_close_is_idempotent(client: MikrotikClient, fake_connection: FakeConnection):
     client.close()
     assert fake_connection.closed is True
@@ -98,6 +132,22 @@ def test_ping_wraps_transport_errors_as_device_command_error(device: Device, exc
     client = MikrotikClient(device, connection=TransportErrorConnection(exc))
     with pytest.raises(DeviceCommandError) as exc_info:
         client.ping("8.8.8.8")
+    assert device.name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_monitor_traffic_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.monitor_traffic("ether1")
+    assert device.name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_poe_monitor_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.poe_monitor("ether1")
     assert device.name in str(exc_info.value)
 
 
@@ -318,6 +368,26 @@ def test_traceroute_retries_on_transient_oserror_and_succeeds(device: Device):
     replies = client.traceroute("10.0.0.254")
 
     assert replies == [{"address": "10.0.0.254", "hop": "1"}]
+    assert flaky.calls_made == 2
+
+
+def test_monitor_traffic_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    reply = client.monitor_traffic("ether1")
+
+    assert reply == {}  # FlakyConnection's inner FakeConnection has no monitor_traffic_replies wired
+    assert flaky.calls_made == 2
+
+
+def test_poe_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    reply = client.poe_monitor("ether1")
+
+    assert reply == {}
     assert flaky.calls_made == 2
 
 

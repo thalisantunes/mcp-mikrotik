@@ -6,9 +6,11 @@ from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
     validate_address_list_name,
     validate_comment,
+    validate_interface_name,
     validate_ip_address,
     validate_mac_address,
     validate_ping_address,
+    validate_poe_out,
     validate_rate_pair,
     validate_target,
     validate_timeout,
@@ -253,3 +255,49 @@ def test_validate_timeout_rejects_invalid(value: str):
 def test_validate_timeout_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_timeout(None)  # type: ignore[arg-type]
+
+
+# --- validate_interface_name (v0.6) ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name", ["ether1", "sfp-sfpplus1", "wlan1", "bridge1", "vlan100", "ether1-poe", "a", "A0"]
+)
+def test_validate_interface_name_accepts_valid(name: str):
+    assert validate_interface_name(name) == name
+
+
+def test_validate_interface_name_strips_whitespace():
+    assert validate_interface_name("  ether1  ") == "ether1"
+
+
+@pytest.mark.parametrize(
+    "name", ["", "   ", "ether1; reboot", "ether 1", "ether/1", "ether\n1", "a" * 65]
+)
+def test_validate_interface_name_rejects_invalid(name: str):
+    with pytest.raises(ValidationError):
+        validate_interface_name(name)
+
+
+def test_validate_interface_name_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_interface_name(None)  # type: ignore[arg-type]
+
+
+# --- validate_poe_out (v0.6) --------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["auto-on", "forced-on", "off"])
+def test_validate_poe_out_accepts_valid(value: str):
+    assert validate_poe_out(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", "on", "AUTO-ON", "auto_on", "true"])
+def test_validate_poe_out_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_poe_out(value)
+
+
+def test_validate_poe_out_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_poe_out(None)  # type: ignore[arg-type]

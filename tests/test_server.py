@@ -16,7 +16,7 @@ from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
 from mcp_mikrotik.server import _resolve_log_level, build_server
 
-from .fakes import FakeConnection, RaisingConnection
+from .fakes import FakeConnection, FakePath, RaisingConnection
 
 EXPECTED_TOOLS = {
     "list_devices",
@@ -38,6 +38,10 @@ EXPECTED_TOOLS = {
     "logs",
     "ping",
     "traceroute",
+    "arp_table",
+    "bridge_hosts",
+    "interface_traffic",
+    "poe_status",
     "list_write_operations",
     "set_identity",
     "enable_interface",
@@ -48,6 +52,7 @@ EXPECTED_TOOLS = {
     "remove_simple_queue",
     "add_to_address_list",
     "remove_from_address_list",
+    "set_poe_out",
 }
 
 
@@ -322,6 +327,161 @@ async def test_set_identity_preview_then_confirm(device: Device, fake_connection
     )
     assert applied["applied"] is True
     assert fake_connection.path("system", "identity")._rows == [{"name": "renamed"}]
+
+
+# --- arp_table / bridge_hosts (v0.6, read-only) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_arp_table_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("arp_table", {"device_name": "core-switch"})
+    assert result["result"] == [
+        {
+            ".id": "*1",
+            "address": "10.0.0.70",
+            "mac-address": "AA:BB:CC:DD:EE:70",
+            "interface": "ether1",
+            "dynamic": "false",
+            "complete": "true",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bridge_hosts_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("bridge_hosts", {"device_name": "core-switch"})
+    assert result["result"] == [
+        {
+            ".id": "*1",
+            "mac-address": "AA:BB:CC:DD:EE:70",
+            "on-interface": "ether1",
+            "bridge": "bridge1",
+            "dynamic": "false",
+            "local": "false",
+        }
+    ]
+
+
+# --- interface_traffic / poe_status (v0.6, read-only - not gated by --------
+# --- MIKROTIK_ALLOW_WRITE) --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interface_traffic_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "interface_traffic", {"device_name": "core-switch", "interface": "ether1"}
+    )
+    # A dict-returning tool's structured content is the dict itself - not
+    # wrapped under a "result" key (that wrapping only applies to
+    # list-returning tools; see e.g. set_identity's `preview["applied"]`).
+    assert result["rx-bits-per-second"] == "1000000"
+    assert result["tx-bits-per-second"] == "500000"
+
+
+@pytest.mark.asyncio
+async def test_interface_traffic_does_not_require_write_enabled(
+    settings: Settings, fake_connection: FakeConnection
+):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool(
+        "interface_traffic", {"device_name": "core-switch", "interface": "ether1"}
+    )
+    assert result
+
+
+@pytest.mark.asyncio
+async def test_interface_traffic_rejects_invalid_interface_name_before_touching_device(settings: Settings):
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "interface_traffic", {"device_name": "core-switch", "interface": "ether1; reboot"}
+        )
+    assert "not valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_interface_traffic_sends_once_flag_as_structured_param(settings: Settings):
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    await mcp.call_tool("interface_traffic", {"device_name": "core-switch", "interface": "ether1"})
+    cmd, kwargs = fake.calls[-1]
+    assert cmd == "/interface/monitor-traffic"
+    assert kwargs == {"interface": "ether1", "once": ""}
+
+
+@pytest.mark.asyncio
+async def test_poe_status_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("poe_status", {"device_name": "core-switch"})
+    rows = {row["interface"]: row for row in result["result"]}
+    # sfp1 (no `poe-out` field on the fixture device) must never appear.
+    assert set(rows) == {"ether1", "ether2"}
+    assert rows["ether1"]["poe-out"] == "auto-on"
+    assert rows["ether1"]["poe-out-status"] == "powered-on"
+    assert rows["ether1"]["voltage"] == "48.0"
+    assert rows["ether1"]["current"] == "150"
+    assert rows["ether1"]["power"] == "7.2"
+    assert rows["ether2"]["poe-out"] == "off"
+    assert rows["ether2"]["poe-out-status"] == "poe-out-off"
+
+
+@pytest.mark.asyncio
+async def test_poe_status_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("poe_status", {"device_name": "core-switch"})
+    assert result["result"]
+
+
+@pytest.mark.asyncio
+async def test_poe_status_returns_empty_list_for_device_with_no_poe(settings: Settings):
+    """A device with no PoE hardware at all has no `poe-out` field on any
+    /interface/ethernet row - poe_status must return an empty list, not an
+    error, exactly like wireless_registrations does for a wired-only device."""
+    fake = FakeConnection(
+        data={("interface", "ethernet"): [{".id": "*1", "name": "ether1"}, {".id": "*2", "name": "ether2"}]}
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("poe_status", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_poe_status_survives_a_failed_monitor_call_for_one_port(settings: Settings):
+    """A PoE-capable port whose live monitor call fails must still be listed
+    (with its configured `poe-out`, just without live monitor fields) -
+    one bad port must not fail the whole tool. `fake_connection`'s __call__
+    is a bound method looked up on the type for the implicit `connection(...)`
+    call form (client.py's poe_monitor), so it can't be monkeypatched per
+    instance - a small standalone fake connection is used instead."""
+
+    class _FlakyMonitorConnection:
+        def path(self, *segments: str) -> FakePath:
+            if segments == ("interface", "ethernet"):
+                return FakePath([{".id": "*1", "name": "ether1", "poe-out": "auto-on"}])
+            return FakePath([])
+
+        def __call__(self, cmd: str, **kwargs):
+            if cmd == "/interface/ethernet/poe/monitor":
+                raise LibRouterosError("no such port")
+            return []
+
+        def close(self) -> None:
+            pass
+
+    def factory(s: Settings, n: str) -> MikrotikClient:
+        return MikrotikClient(s.get_device(n), connection=_FlakyMonitorConnection())
+
+    mcp = build_server(settings=settings, client_factory=factory)
+    _content, result = await mcp.call_tool("poe_status", {"device_name": "core-switch"})
+    assert result["result"] == [{"interface": "ether1", "poe-out": "auto-on"}]
 
 
 # --- enable_interface / disable_interface --------------------------------
@@ -719,6 +879,83 @@ async def test_remove_from_address_list_unknown_raises_clear_error(device: Devic
             {"device_name": "core-switch", "list_name": "blocked-clients", "address": "10.0.0.99", "confirm": True},
         )
     assert "10.0.0.99" in str(exc_info.value)
+
+
+# --- set_poe_out (v0.6) ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_poe_out_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_poe_out",
+            {"device_name": "core-switch", "interface_name": "ether1", "poe_out": "off", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+    # Device was never touched.
+    assert fake_connection.path("interface", "ethernet")._rows[0]["poe-out"] == "auto-on"
+
+
+@pytest.mark.asyncio
+async def test_set_poe_out_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "set_poe_out",
+        {"device_name": "core-switch", "interface_name": "ether1", "poe_out": "off", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["poe-out"] == "auto-on"
+    assert preview["after"]["poe-out"] == "off"
+    assert fake_connection.path("interface", "ethernet")._rows[0]["poe-out"] == "auto-on"
+
+    _content, applied = await mcp.call_tool(
+        "set_poe_out",
+        {"device_name": "core-switch", "interface_name": "ether1", "poe_out": "off", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake_connection.path("interface", "ethernet")._rows[0]["poe-out"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_set_poe_out_unknown_interface_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_poe_out",
+            {"device_name": "core-switch", "interface_name": "ghost0", "poe_out": "off", "confirm": True},
+        )
+    assert "ghost0" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_poe_out_non_poe_interface_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_poe_out",
+            {"device_name": "core-switch", "interface_name": "sfp1", "poe_out": "off", "confirm": True},
+        )
+    assert "sfp1" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_poe_out_rejects_invalid_poe_out_value_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_poe_out",
+            {"device_name": "core-switch", "interface_name": "ether1", "poe_out": "on", "confirm": True},
+        )
+    assert "not valid" in str(exc_info.value)
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------

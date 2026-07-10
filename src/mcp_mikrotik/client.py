@@ -365,6 +365,51 @@ class MikrotikClient:
 
         return self._run_read("traceroute", _do)
 
+    def monitor_traffic(self, interface: str) -> dict[str, Any]:
+        """Run /interface/monitor-traffic once=yes for a single interface,
+        returning one reply dict (rx-bits-per-second/tx-bits-per-second, and
+        packet counters).
+
+        `interface` is expected to already be validated (see
+        validation.validate_interface_name) - forwarded as a structured
+        parameter, never as part of a command string.
+
+        `once=""` mirrors RouterOS's CLI `once=yes` flag (RouterOS API
+        booleans/flags are sent as an empty value, not the string "yes" -
+        same convention librouteros itself uses): the device answers with
+        exactly one reply sentence and the command is done, instead of the
+        continuous/streaming form monitor-traffic runs in when `once` is
+        omitted entirely (which would keep the API session open waiting for
+        further replies and never return). Combined with the connection's
+        own timeout (see _resolve_timeout/_connect), this can't hang.
+        Retried automatically on a transient network error - see _run_read.
+        """
+
+        def _do(connection: RouterosConnection) -> dict[str, Any]:
+            replies = connection("/interface/monitor-traffic", interface=interface, once="")
+            return dict(replies[0]) if replies else {}
+
+        return self._run_read("interface/monitor-traffic", _do)
+
+    def poe_monitor(self, interface: str) -> dict[str, Any]:
+        """Run /interface/ethernet/poe/monitor once=yes for a single
+        interface, returning one reply dict (poe-out-status, voltage,
+        current, power fields - see server.py's `poe_status` tool for how
+        these are mapped).
+
+        Same "once" semantics as monitor_traffic above: `once=""` gets
+        exactly one reply back instead of opening a continuous stream, so
+        this returns promptly. `interface` is expected to already be
+        validated. Retried automatically on a transient network error - see
+        _run_read.
+        """
+
+        def _do(connection: RouterosConnection) -> dict[str, Any]:
+            replies = connection("/interface/ethernet/poe/monitor", interface=interface, once="")
+            return dict(replies[0]) if replies else {}
+
+        return self._run_read("interface/ethernet/poe/monitor", _do)
+
     # --- Write primitives -------------------------------------------------
     # These are intentionally NOT exposed as MCP tools directly. The only
     # caller allowed to invoke them is guard.py, which maps each write

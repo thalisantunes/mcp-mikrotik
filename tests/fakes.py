@@ -58,12 +58,21 @@ class FakeConnection:
         data: dict[tuple[str, ...], list[dict[str, Any]]] | None = None,
         ping_replies: list[dict[str, Any]] | None = None,
         traceroute_replies: list[dict[str, Any]] | None = None,
+        monitor_traffic_replies: dict[str, dict[str, Any]] | None = None,
+        poe_monitor_replies: dict[str, dict[str, Any]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
     ):
         self._data: dict[tuple[str, ...], list[dict[str, Any]]] = dict(data or {})
         self._ping_replies = ping_replies if ping_replies is not None else []
         self._traceroute_replies = traceroute_replies if traceroute_replies is not None else []
+        # Keyed by interface name (the "interface" kwarg each command is
+        # called with) rather than a flat list, since v0.6's monitor-once
+        # commands (interface_traffic, poe_status) are always scoped to one
+        # named interface - this lets a test give different fake readings to
+        # different ports in the same fake device.
+        self._monitor_traffic_replies: dict[str, dict[str, Any]] = dict(monitor_traffic_replies or {})
+        self._poe_monitor_replies: dict[str, dict[str, Any]] = dict(poe_monitor_replies or {})
         self._on_call = on_call
         # Simulates a RouterOS menu that doesn't exist on this device/version
         # (e.g. /interface/wifi on a ROS6-only box, or /system/health on a
@@ -88,6 +97,12 @@ class FakeConnection:
             return list(self._ping_replies)
         if cmd == "/tool/traceroute":
             return list(self._traceroute_replies)
+        if cmd == "/interface/monitor-traffic":
+            reply = self._monitor_traffic_replies.get(kwargs.get("interface"))
+            return [dict(reply)] if reply is not None else []
+        if cmd == "/interface/ethernet/poe/monitor":
+            reply = self._poe_monitor_replies.get(kwargs.get("interface"))
+            return [dict(reply)] if reply is not None else []
         return []
 
     def close(self) -> None:

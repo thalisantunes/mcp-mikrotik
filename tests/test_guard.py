@@ -675,3 +675,97 @@ def test_remove_from_address_list_rejects_invalid_input_before_touching_device(
         guard.remove_from_address_list(
             guarded_client, settings_write_enabled, list_name="blocked-clients", address="not-an-ip", confirm=True
         )
+
+
+# --- set_poe_out (v0.6) ------------------------------------------------------
+
+
+def test_set_poe_out_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    assert settings.allow_write is False
+    with pytest.raises(WriteDisabledError):
+        guard.set_poe_out(client, settings, interface_name="ether1", poe_out="off", confirm=True)
+
+
+def test_set_poe_out_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    """Read-only gate must block *before* touching the device at all, regardless of confirm."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_poe_out(guarded_client, settings, interface_name="ether1", poe_out="off", confirm=True)
+
+
+def test_set_poe_out_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.set_poe_out(
+        client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.before["poe-out"] == "auto-on"
+    assert preview.after["poe-out"] == "off"
+    # Nothing was written to the fake device.
+    rows = {row["name"]: row.get("poe-out") for row in fake_connection.path("interface", "ethernet")._rows}
+    assert rows == {"ether1": "auto-on", "ether2": "off", "sfp1": None}
+
+
+def test_set_poe_out_confirm_true_applies(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.set_poe_out(
+        client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True
+    )
+
+    assert preview.applied is True
+    assert preview.before["poe-out"] == "auto-on"
+    assert preview.after["poe-out"] == "off"
+    rows = {row["name"]: row.get("poe-out") for row in fake_connection.path("interface", "ethernet")._rows}
+    assert rows == {"ether1": "off", "ether2": "off", "sfp1": None}
+
+
+def test_set_poe_out_dispatches_via_allowlist_id(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """The write must target the specific interface row by `.id`, not blindly update row 0."""
+    guard.set_poe_out(client, settings_write_enabled, interface_name="ether2", poe_out="forced-on", confirm=True)
+    rows = {row["name"]: row.get("poe-out") for row in fake_connection.path("interface", "ethernet")._rows}
+    # ether1 (row 0) must be untouched; only ether2 (the requested name) changes.
+    assert rows == {"ether1": "auto-on", "ether2": "forced-on", "sfp1": None}
+
+
+def test_set_poe_out_unknown_interface_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.set_poe_out(client, settings_write_enabled, interface_name="ghost0", poe_out="off", confirm=True)
+    assert "ghost0" in str(exc_info.value)
+    # Nothing was created.
+    names = {row["name"] for row in fake_connection.path("interface", "ethernet")._rows}
+    assert names == {"ether1", "ether2", "sfp1"}
+
+
+def test_set_poe_out_non_poe_interface_raises_resource_not_found(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """sfp1 exists on the fixture device but has no `poe-out` field at all -
+    it must never be silently coerced into a PoE-capable row."""
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.set_poe_out(client, settings_write_enabled, interface_name="sfp1", poe_out="off", confirm=True)
+    assert "sfp1" in str(exc_info.value)
+
+
+def test_set_poe_out_rejects_invalid_poe_out_value_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_poe_out(guarded_client, settings_write_enabled, interface_name="ether1", poe_out="on", confirm=True)
+
+
+def test_set_poe_out_rejects_invalid_interface_name_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_poe_out(
+            guarded_client, settings_write_enabled, interface_name="ether1; reboot", poe_out="off", confirm=True
+        )

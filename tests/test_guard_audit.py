@@ -188,11 +188,12 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     guard.remove_from_address_list(
         client, settings_write_enabled, list_name="blocked-clients", address="10.0.0.60", confirm=True
     )
+    guard.set_poe_out(client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 9
+    assert len(events) == 10
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -230,3 +231,37 @@ def test_dynamic_dispatch_journal_uses_anchor_operation_on_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "set_wifi_ssid_ros7"
+
+
+# --- set_poe_out (v0.6) ------------------------------------------------------
+
+
+def test_set_poe_out_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.set_poe_out(client, settings_write_enabled, interface_name="ether1", poe_out="off", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "set_poe_out"
+    assert event["operation"] == "set_poe_out"
+    assert event["action"] == "update"
+    assert event["summary"]["before"]["poe-out"] == "auto-on"
+    assert event["summary"]["after"]["poe-out"] == "off"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_set_poe_out_unknown_interface_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.set_poe_out(client, settings_write_enabled, interface_name="ghost0", poe_out="off", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "set_poe_out"

@@ -254,6 +254,58 @@ def validate_timeout(value: str, field_name: str = "timeout") -> str:
     )
 
 
+
+# --- v0.6: physical layer / PoE ------------------------------------------
+
+# RouterOS interface name: letters/digits plus '.', '_', '-' (covers real
+# names like "ether1", "sfp-sfpplus1", "wlan1", "bridge1", "vlan100"). Like
+# `_LIST_NAME` above, this is a conservative, unambiguous charset rather than
+# an attempt to enumerate everything RouterOS itself accepts - it exists to
+# reject obviously-wrong input (e.g. a stray "/" or shell metacharacter)
+# before ever touching a device, not as an injection defense (see module
+# docstring: every value is always sent as a structured API parameter).
+_INTERFACE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+# RouterOS `/interface/ethernet`'s `poe-out` field: exactly these three
+# values (RouterOS itself rejects anything else at the CLI too).
+_POE_OUT_VALUES = ("auto-on", "forced-on", "off")
+
+
+def validate_interface_name(name: str) -> str:
+    """Validate a RouterOS interface name (e.g. "ether1"), used by
+    `interface_traffic` and `set_poe_out`. This only rejects a name whose
+    *shape* is implausible - whether it actually exists on a given device is
+    checked separately, against the device itself (see server.py/guard.py).
+
+    Returns the (stripped) name on success, raises ValidationError otherwise.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValidationError("Interface name must be a non-empty string.")
+
+    name = name.strip()
+    if not _INTERFACE_NAME.match(name):
+        raise ValidationError(
+            f"Interface name {name!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return name
+
+
+def validate_poe_out(value: str) -> str:
+    """Validate a RouterOS `poe-out` mode, used by `set_poe_out`. Must be one
+    of "auto-on", "forced-on", "off".
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("poe_out must be a non-empty string.")
+
+    value = value.strip()
+    if value not in _POE_OUT_VALUES:
+        raise ValidationError(f"poe_out value {value!r} is not valid (expected one of {_POE_OUT_VALUES}).")
+    return value
+
+
 def validate_rate_pair(value: str, field_name: str) -> str:
     """Validate a RouterOS rate-pair string, as used by Simple Queue's
     `max-limit` and `limit-at` fields. RouterOS's own format is

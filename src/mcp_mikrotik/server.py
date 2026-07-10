@@ -3,8 +3,8 @@
 Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
 add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
-remove_from_address_list - see guard.py's ALLOWLIST for the full write-tool
-inventory). Transport is stdio only - this process is meant to run on the
+remove_from_address_list, set_poe_out - see guard.py's ALLOWLIST for the full
+write-tool inventory). Transport is stdio only - this process is meant to run on the
 operator's own machine, launched by an MCP client (e.g. Claude Code) over
 stdio, with no network exposure at all.
 
@@ -30,7 +30,7 @@ from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError
 from .formatting import filter_disabled, rows_to_list
-from .validation import validate_ping_address, validate_positive_limit
+from .validation import validate_interface_name, validate_ping_address, validate_positive_limit
 
 logger = logging.getLogger("mcp_mikrotik")
 
@@ -347,6 +347,97 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
+    def arp_table(device_name: str) -> list[dict[str, Any]]:
+        """List the IPv4 ARP table (/ip/arp): address, mac-address,
+        interface, dynamic, complete.
+
+        Use this to cross-reference an IP to a MAC (or vice versa) for a
+        statically-addressed device that never shows up in `dhcp_leases`
+        (it never requested a DHCP lease, so it has no lease entry - but it
+        does get an ARP entry once it has exchanged traffic with the
+        device).
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "arp"))
+
+    @mcp.tool()
+    @_safe
+    def bridge_hosts(device_name: str) -> list[dict[str, Any]]:
+        """List /interface/bridge/host entries: mac-address, on-interface
+        (the physical bridge port), bridge, dynamic, local.
+
+        Use this to find which physical port of a bridge a given MAC is
+        currently learned on - e.g. to identify which PoE-capable ethernet
+        port a locked-up device is plugged into, before using `poe_status`/
+        `set_poe_out` on it (see "Physical layer & PoE control" in the
+        README).
+        """
+        client = _client(device_name)
+        return rows_to_list(client.path("interface", "bridge", "host"))
+
+    @mcp.tool()
+    @_safe
+    def interface_traffic(device_name: str, interface: str) -> dict[str, Any]:
+        """Current rx/tx traffic rate of one interface
+        (/interface/monitor-traffic interface=<interface> once=yes).
+
+        `interface` is validated for shape (validate_interface_name) before
+        it is ever sent to the device - existence isn't checked separately
+        here (unlike the guarded write tools), so a typo'd/unknown interface
+        name simply produces whatever error RouterOS itself returns.
+
+        Returns a single reply dict - typically rx-bits-per-second/
+        tx-bits-per-second and rx-packets-per-second/tx-packets-per-second -
+        or an empty dict if the device returned nothing. `once=yes` makes
+        this a single instantaneous reading, not a continuous stream, so the
+        call always returns promptly.
+        """
+        validated_interface = validate_interface_name(interface)
+        client = _client(device_name)
+        return client.monitor_traffic(validated_interface)
+
+    @mcp.tool()
+    @_safe
+    def poe_status(device_name: str) -> list[dict[str, Any]]:
+        """PoE status/consumption per port, for every PoE-capable ethernet
+        port on the device.
+
+        Reads /interface/ethernet and keeps only rows that have a `poe-out`
+        field (i.e. are PoE-capable on this hardware - e.g. the CRS318-16P's
+        high/low PoE ports), then reads
+        /interface/ethernet/poe/monitor once=yes for each one to get its
+        live voltage/current/power/poe-out-status. Each entry looks like
+        {"interface", "poe-out" (configured mode), "poe-out-status",
+        "voltage", "current", "power"} - the monitor fields are omitted for
+        a port whose live monitor call fails (kept resilient rather than
+        failing the whole tool for one bad port).
+
+        Returns an empty list (never an error) for a device with no PoE
+        hardware at all - that's a completely normal state, same as
+        `wireless_registrations` for a wired-only device.
+        """
+        client = _client(device_name)
+        ethernet_rows = rows_to_list(client.path("interface", "ethernet"))
+        poe_rows = [row for row in ethernet_rows if "poe-out" in row]
+
+        result: list[dict[str, Any]] = []
+        for row in poe_rows:
+            name = row.get("name", "")
+            entry: dict[str, Any] = {"interface": name, "poe-out": row.get("poe-out")}
+            try:
+                monitor = client.poe_monitor(name)
+            except DeviceCommandError:
+                monitor = {}
+            if monitor:
+                entry["poe-out-status"] = monitor.get("poe-out-status")
+                entry["voltage"] = monitor.get("poe-out-voltage")
+                entry["current"] = monitor.get("poe-out-current")
+                entry["power"] = monitor.get("poe-out-power")
+            result.append(entry)
+        return result
+
+    @mcp.tool()
+    @_safe
     def list_write_operations() -> list[dict[str, Any]]:
         """List every guarded write operation and the RouterOS path/action it maps to.
 
@@ -581,6 +672,35 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         client = _client(device_name)
         preview = guard.remove_from_address_list(
             client, settings, list_name=list_name, address=address, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def set_poe_out(
+        device_name: str, interface_name: str, poe_out: str, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Set a PoE-capable ethernet port's PoE output mode
+        (/interface/ethernet set [interface_name] poe-out=<poe_out>).
+
+        `poe_out` must be one of "auto-on", "forced-on", "off".
+
+        Primary use case: reset a locked-up antenna/camera/AP powered over
+        PoE by cycling its power - call with poe_out="off" (confirm=true),
+        wait for it to actually power down, then call again with
+        poe_out="auto-on" to bring it back up.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without changing anything) if `interface_name` doesn't exist on the
+        device, or exists but isn't PoE-capable - it never creates or
+        coerces anything.
+        """
+        client = _client(device_name)
+        preview = guard.set_poe_out(
+            client, settings, interface_name=interface_name, poe_out=poe_out, confirm=confirm
         )
         return asdict(preview)
 
