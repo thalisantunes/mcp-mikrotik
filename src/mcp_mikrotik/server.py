@@ -4,8 +4,9 @@ Registers the read tools plus every guarded write tool (set_identity,
 enable_interface/disable_interface, set_wifi_ssid, set_client_bandwidth,
 add_static_dhcp_lease, remove_simple_queue, add_to_address_list,
 remove_from_address_list, set_poe_out, start_container/stop_container,
-set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch
-- see guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
+set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
+add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
+wake_on_lan - see guard.py's ALLOWLIST for the full write-tool inventory). Transport is stdio only - this process is meant to run on the
 operator's own machine, launched by an MCP client (e.g. Claude Code) over
 stdio, with no network exposure at all.
 
@@ -1118,6 +1119,140 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.remove_netwatch(client, settings, host=host, comment=comment, confirm=confirm)
+        return asdict(preview)
+
+    # --- v0.10: static DNS, DNS cache flush, DHCP lease removal, WoL -----
+
+    @mcp.tool()
+    @_safe
+    def add_static_dns(
+        device_name: str,
+        name: str,
+        address: str,
+        record_type: str = "A",
+        ttl: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a static DNS entry (`/ip/dns/static add`) resolving `name`
+        to `address`.
+
+        `record_type` is `"A"` (default) or `"CNAME"`: for `"A"`, `address`
+        is a literal IPv4/IPv6 address; for `"CNAME"`, `address` is itself
+        another hostname (the alias target), written to RouterOS's `cname`
+        field. Useful to block a malicious domain (point it at `0.0.0.0`) or
+        set up an internal DNS override.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly
+        (without creating anything) if a row already matches this exact
+        `name`+`record_type` pair - it never creates a duplicate.
+        """
+        client = _client(device_name)
+        preview = guard.add_static_dns(
+            client,
+            settings,
+            name=name,
+            address=address,
+            record_type=record_type,
+            ttl=ttl,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_static_dns(
+        device_name: str, name: str, record_type: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove a static DNS entry (`/ip/dns/static remove`) by `name`,
+        optionally narrowed by `record_type` (`"A"`/`"CNAME"`).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be removed; call again with
+        confirm=True to actually remove it. Errors clearly if nothing
+        matches `name` (narrowed by `record_type`), or if more than one row
+        still matches after narrowing (`AmbiguousResourceError`) - never
+        guesses which one to remove.
+        """
+        client = _client(device_name)
+        preview = guard.remove_static_dns(client, settings, name=name, record_type=record_type, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def clear_dns_cache(device_name: str, confirm: bool = False) -> dict[str, Any]:
+        """Flush the device's DNS resolver cache (`/ip/dns/cache/flush`) -
+        no arguments, clears every cached DNS answer at once.
+
+        Benign (only cached answers are cleared - repopulated on the next
+        resolution - never device configuration), but still guarded/
+        confirm-gated like every other write tool here.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview the current cached-entry count without changing
+        anything; call again with confirm=True to actually flush it.
+        """
+        client = _client(device_name)
+        preview = guard.clear_dns_cache(client, settings, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_dhcp_lease(
+        device_name: str, address: str | None = None, mac_address: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Remove a DHCP lease (`/ip/dhcp-server/lease remove`) by `address`
+        or `mac_address` - typically to force a client to renew its IP. At
+        least one of `address`/`mac_address` must be given and must match an
+        existing lease (`mac_address` is tried first if both are given).
+
+        Removes EITHER a dynamic or a static lease. **If the resolved lease
+        is STATIC** (`dynamic=false` - i.e. it was pinned with
+        `add_static_dhcp_lease`), the returned preview's `warning` field is
+        non-null: removing it deletes the pinned IP<->MAC mapping itself,
+        not just a renewable cache entry. Always check `warning` before
+        calling again with `confirm=true`. No warning for a dynamic lease -
+        that is this tool's ordinary use case.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview (including the `warning` field) without
+        changing anything; call again with confirm=True to actually remove
+        it. Errors clearly if nothing matches.
+        """
+        client = _client(device_name)
+        preview = guard.remove_dhcp_lease(
+            client, settings, address=address, mac_address=mac_address, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def wake_on_lan(device_name: str, mac_address: str, interface: str, confirm: bool = False) -> dict[str, Any]:
+        """Send a Wake-on-LAN magic packet (`/tool/wol`) for `mac_address`,
+        out `interface`.
+
+        Benign - it never changes device configuration and targets no
+        existing RouterOS row - but still guarded/confirm-gated like every
+        other write tool here, so an LLM caller can't wake a machine "by
+        accident". Does NOT verify `interface` exists on the device first;
+        RouterOS itself rejects an unknown interface name at send time.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of what would be sent without changing
+        anything; call again with confirm=True to actually send it.
+        """
+        client = _client(device_name)
+        preview = guard.wake_on_lan(
+            client, settings, mac_address=mac_address, interface=interface, confirm=confirm
+        )
         return asdict(preview)
 
     return mcp

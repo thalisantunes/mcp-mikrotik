@@ -232,6 +232,39 @@ def test_stop_wraps_transport_errors_as_device_command_error(device: Device, exc
     assert device.name in str(exc_info.value)
 
 
+# --- v0.10: flush/wol (RouterOS ACTION commands, callable form - no .id) ---
+
+
+def test_flush_sends_the_fixed_command_string(client: MikrotikClient, fake_connection: FakeConnection):
+    client.flush("ip", "dns", "cache")
+    assert fake_connection.calls == [("/ip/dns/cache/flush", {})]
+
+
+def test_wol_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    client.wol("tool", mac_address="AA:BB:CC:DD:EE:FF", interface="ether1")
+    assert fake_connection.calls == [
+        ("/tool/wol", {"mac-address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"})
+    ]
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_flush_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.flush("ip", "dns", "cache")
+    assert device.name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_wol_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.wol("tool", mac_address="AA:BB:CC:DD:EE:FF", interface="ether1")
+    assert device.name in str(exc_info.value)
+
+
 def test_close_is_idempotent(client: MikrotikClient, fake_connection: FakeConnection):
     client.close()
     assert fake_connection.closed is True
@@ -555,6 +588,8 @@ def test_read_retries_env_var_zero_disables_retry_entirely(device: Device, monke
         lambda client: client.remove("ip", "address", ids=("*1",)),
         lambda client: client.start("container", id="*1"),
         lambda client: client.stop("container", id="*1"),
+        lambda client: client.flush("ip", "dns", "cache"),
+        lambda client: client.wol("tool", mac_address="AA:BB:CC:DD:EE:FF", interface="ether1"),
     ],
 )
 def test_writes_never_retry_on_transient_oserror(device: Device, write_call):

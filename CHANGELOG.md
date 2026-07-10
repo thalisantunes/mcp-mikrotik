@@ -3,6 +3,136 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.10.0] - Unreleased
+
+DNS/DHCP/Wake-on-LAN **write** round: five new guarded write tools -
+`add_static_dns`/`remove_static_dns` (`/ip/dns/static`), `clear_dns_cache`
+(`/ip/dns/cache/flush`), `remove_dhcp_lease` (`/ip/dhcp-server/lease`), and
+`wake_on_lan` (`/tool/wol`). Same write-guard mechanism as every previous
+round (read-only default, central allowlist, confirm/preview, audit
+journal, no secrets logged, ROS6/ROS7 compat - none of these five needed
+any generation branching, since static DNS, DNS cache, DHCP leases, and
+`/tool/wol` all live at the same path on both RouterOS generations) - none
+of it weakened or bypassed. `clear_dns_cache`/`wake_on_lan` extend the
+guard's action-command mechanism (first introduced by v0.7's
+`start_container`/`stop_container`) a second time - see "How
+`clear_dns_cache`/`wake_on_lan` extend the guard" below.
+
+### Added
+
+- **`add_static_dns`** (write, guarded, `src/mcp_mikrotik/guard.py` +
+  `server.py`): creates a static DNS entry (`/ip/dns/static add`) resolving
+  `name` to `address`. `record_type` (default `"A"`) selects what `address`
+  means - a literal IPv4/IPv6 address for `"A"`, or another hostname (the
+  alias target, written to RouterOS's `cname` field) for `"CNAME"`. Typical
+  uses: sinkhole a malicious domain (`address="0.0.0.0"`), or set up an
+  internal DNS override/alias. Refuses to create a second row for the same
+  `name`+`record_type` pair (`ResourceAlreadyExistsError`) - this tool only
+  ever adds, never updates or removes an existing entry, and does not
+  attempt to create RouterOS round-robin DNS (two "A" records sharing a
+  `name`, different addresses) since that would require accepting a
+  same-name-and-type "duplicate" as intentional.
+- **`remove_static_dns`** (write, guarded): removes a static DNS entry by
+  `name`, optionally narrowed by `record_type`. `ResourceNotFoundError` if
+  nothing matches; `AmbiguousResourceError` if more than one row still
+  matches after narrowing (e.g. an existing round-robin pair) - never
+  guesses which one to remove.
+- **`clear_dns_cache`** (write, guarded): flushes the device's DNS resolver
+  cache (`/ip/dns/cache/flush`) - no arguments, targets no specific row
+  (clears every cached answer at once). Benign (only cached *answers* are
+  cleared, never configuration - they repopulate on the next resolution),
+  but still confirm-gated like every other write tool here. `before`/`after`
+  report the currently-cached entry count (`cached_entries`) as an
+  informative read, not a specific row's fields - `after.cached_entries` is
+  the *intended* post-flush count (`0`), not a verified re-read.
+- **`remove_dhcp_lease`** (write, guarded): removes an existing
+  `/ip/dhcp-server/lease` row by `address` or `mac_address` (`mac_address`
+  tried first if both given - the more stable identifier). Typical use:
+  force a client to renew its IP. Removes EITHER a dynamic or a static
+  lease - not blocked outright for a static one - but the returned
+  preview's new `warning` field is non-null whenever the resolved lease is
+  static (`dynamic=false`): removing it deletes the pinned IP↔MAC mapping
+  itself, not just a renewable entry. Set on both the `confirm=false`
+  preview and the `confirm=true` applied result, same pattern as v0.9's
+  `disable_route` default-route warning.
+- **`wake_on_lan`** (write, guarded): sends a Wake-on-LAN magic packet
+  (`/tool/wol`) for `mac_address`, out `interface`. The first guarded write
+  in this package that resolves nothing on the device first - there is no
+  existing row to check `mac_address`/`interface` against, only shape
+  validation (`validate_mac_address`/`validate_interface_name`); RouterOS
+  itself rejects an unknown `interface` at send time. Benign (never changes
+  device configuration) but still confirm-gated, so an LLM caller can't
+  wake a machine "by accident".
+- `validation.validate_dns_name`/`validate_dns_record_type`
+  (`src/mcp_mikrotik/validation.py`, new): hostname/domain shape (reused for
+  both a static DNS entry's `name` and, when `record_type="CNAME"`, its
+  `address`/alias-target param - unlike `validate_ping_address`, never
+  accepts a literal IP), and the `"A"`/`"CNAME"` record-type enum
+  (case-insensitive, normalized to upper-case). `add_static_dns`/
+  `remove_static_dns` reuse the existing `validate_ip_address` (an `"A"`
+  record's `address`), `validate_timeout` (`ttl`, reused - not a full
+  RouterOS DNS TTL grammar, same best-effort duration/clock check already
+  used for address-list `timeout`), and `validate_comment`. `remove_dhcp_lease`
+  reuses `validate_ip_address`/`validate_mac_address`; `wake_on_lan` reuses
+  `validate_mac_address`/`validate_interface_name` - no other new validators
+  needed.
+- `MikrotikClient.flush`/`.wol` (`src/mcp_mikrotik/client.py`, new): two more
+  action-command write primitives, alongside `.start`/`.stop`. Unlike
+  `.start`/`.stop` (which target one specific row's `.id` via
+  `path(*segments)(cmd, **{".id": id})`), neither `/ip/dns/cache/flush` nor
+  `/tool/wol` targets a row at all - both are standalone, one-shot commands,
+  so `.flush`/`.wol` use the connection's CALLABLE form
+  (`connection(cmd, **kwargs)`) instead, the same mechanism `ping`/
+  `traceroute`/`monitor_traffic` already use. Each still sends exactly one
+  fixed, hardcoded command string built only from a menu-path `segments`
+  argument plus its own literal command word (`"flush"`/`"wol"`) - never a
+  command assembled from caller input. No retry (same reasoning as every
+  other write primitive). Reply is materialized with `list(...)` before
+  being discarded, per the v0.7.1 lesson; `tests/fakes.py`'s
+  `FakeConnection.__call__` now returns a real (empty) generator for
+  `/ip/dns/cache/flush`/`/tool/wol` (reusing the existing
+  `_once_reply_stream(None)` helper), so a regression back to
+  unmaterialized indexing would fail the suite the same way v0.7.1's did.
+
+### How `clear_dns_cache`/`wake_on_lan` extend the guard
+
+These are the second pair of `ALLOWLIST` entries (after v0.7's
+`start_container`/`stop_container`) whose `action` is neither `"update"`,
+`"add"`, nor `"remove"` - `"flush"`/`"wol"` are RouterOS's own literal
+command words for `/ip/dns/cache/flush`/`/tool/wol`, exactly the same
+"`action` is a literal RouterOS command word" convention `"start"`/`"stop"`
+established. Dispatch is unchanged: `ALLOWLIST["clear_dns_cache"].action ==
+"flush"` and `ALLOWLIST["wake_on_lan"].action == "wol"` are what actually
+get called, via the exact same `getattr(client, op.action)` indirection
+every write here already uses - `guard.clear_dns_cache`/`.wake_on_lan` never
+call `client.flush`/`.wol` directly. The one new wrinkle versus
+`start`/`stop`: neither operation targets a specific `/container`-style row
+by `.id` - see `MikrotikClient.flush`/`.wol`'s docstrings above for why they
+use the connection's callable form instead of `start`/`stop`'s
+`path(*segments)(cmd, **{".id": id})` form. Same read-only gate,
+confirm/preview flow, and `_audited` journaling as every other write,
+unchanged.
+
+### Tests
+
+105 new tests (627 → 732, full suite green): `validate_dns_name`/
+`validate_dns_record_type` (accept/reject, including the deliberate
+"a literal IP is rejected as a DNS name, unlike `validate_route_gateway`'s
+interface-name exception" case); `MikrotikClient.flush`/`.wol` (fixed
+command string / structured params not a command string, transport-error
+wrapping, no retry - extending the existing "writes never retry"
+parametrized case); guard-level coverage for all five new writes (blocked
+when read-only, read-only gate before touching the device, preview vs
+confirm, `ALLOWLIST.action`-driven dispatch, name+type duplicate →
+`ResourceAlreadyExistsError`, round-robin ambiguity →
+`AmbiguousResourceError`, not-found, the static-vs-dynamic DHCP lease
+warning present/absent, `mac_address`-tried-before-`address` resolution
+order); audit-journal coverage (preview/applied/error outcomes, no password
+leak, folded into the existing cross-tool sweep - now 22 events); and
+server-level `call_tool` coverage mirroring the guard-level cases end to
+end through `FastMCP`, including the CNAME-writes-`cname`-not-`address`
+case and the DHCP static-lease-warning case.
+
 ## [0.9.0] - Unreleased
 
 Failover **write** round: the five atomic write tools v0.8's read-only

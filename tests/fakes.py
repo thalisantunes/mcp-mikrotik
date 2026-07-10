@@ -142,6 +142,18 @@ class FakeConnection:
             return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
         if cmd == "/interface/lte/monitor":
             return _once_reply_stream(self._lte_monitor_replies.get(kwargs.get("interface")))
+        if cmd == "/ip/dns/cache/flush":
+            # v0.10: MikrotikClient.flush() - a fire-and-forget ACTION
+            # command with no meaningful reply. Reuses _once_reply_stream(None)
+            # (yields nothing but is still a real generator, not a list) so a
+            # regression to unmaterialized `replies[0]`-style indexing in
+            # client.py would fail the suite, exactly like the v0.7.1 lesson
+            # for monitor_traffic/poe_monitor/lte_monitor above.
+            return _once_reply_stream(None)
+        if cmd == "/tool/wol":
+            # v0.10: MikrotikClient.wol() - same empty-generator reply shape
+            # as the DNS cache flush above.
+            return _once_reply_stream(None)
         return []
 
     def close(self) -> None:

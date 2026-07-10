@@ -71,6 +71,11 @@ EXPECTED_TOOLS = {
     "disable_route",
     "add_netwatch",
     "remove_netwatch",
+    "add_static_dns",
+    "remove_static_dns",
+    "clear_dns_cache",
+    "remove_dhcp_lease",
+    "wake_on_lan",
 }
 
 
@@ -1654,6 +1659,303 @@ async def test_remove_netwatch_unknown_host_raises_clear_error(device: Device, f
     assert "9.9.9.9" in str(exc_info.value)
 
 
+# --- add_static_dns / remove_static_dns (v0.10) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_static_dns_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+    names = {row["name"] for row in fake_connection.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" not in names
+
+
+@pytest.mark.asyncio
+async def test_add_static_dns_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_static_dns",
+        {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["after"] == {"name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}
+    names = {row["name"] for row in fake_connection.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" not in names
+
+    _content, applied = await mcp.call_tool(
+        "add_static_dns",
+        {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True},
+    )
+    assert applied["applied"] is True
+    names = {row["name"] for row in fake_connection.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" in names
+
+
+@pytest.mark.asyncio
+async def test_add_static_dns_cname_writes_cname_field(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_static_dns",
+        {
+            "device_name": "core-switch",
+            "name": "www.example.com",
+            "address": "target.example.com",
+            "record_type": "CNAME",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    row = next(row for row in fake_connection.path("ip", "dns", "static")._rows if row["name"] == "www.example.com")
+    assert row["cname"] == "target.example.com"
+    assert "address" not in row
+
+
+@pytest.mark.asyncio
+async def test_add_static_dns_rejects_duplicate_name_and_type(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    await mcp.call_tool(
+        "add_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "address": "0.0.0.0", "confirm": True}
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_static_dns",
+            {"device_name": "core-switch", "name": "blocked.example.com", "address": "1.2.3.4", "confirm": True},
+        )
+    assert "blocked.example.com" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_static_dns_rejects_invalid_name_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_static_dns", {"device_name": "core-switch", "name": "not a host", "address": "0.0.0.0", "confirm": True}
+        )
+    assert "not a valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_static_dns_blocked_read_only_by_default(device: Device):
+    fake = FakeConnection(data={("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]})
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_static_dns_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("ip", "dns", "static"): [{".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "confirm": False}
+    )
+    assert preview["applied"] is False
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" in names
+
+    _content, applied = await mcp.call_tool(
+        "remove_static_dns", {"device_name": "core-switch", "name": "blocked.example.com", "confirm": True}
+    )
+    assert applied["applied"] is True
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" not in names
+
+
+@pytest.mark.asyncio
+async def test_remove_static_dns_unknown_name_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "ghost.example.com", "confirm": True})
+    assert "ghost.example.com" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_static_dns_ambiguous_without_record_type_raises_clear_error(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "dns", "static"): [
+                {".id": "*1", "name": "roundrobin.example.com", "type": "A", "address": "10.0.0.1"},
+                {".id": "*2", "name": "roundrobin.example.com", "type": "A", "address": "10.0.0.2"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_static_dns", {"device_name": "core-switch", "name": "roundrobin.example.com", "confirm": True})
+    assert "ambiguous" in str(exc_info.value).lower()
+
+
+# --- clear_dns_cache (v0.10) --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clear_dns_cache_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("clear_dns_cache", {"device_name": "core-switch", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_clear_dns_cache_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    """The shared fixture's ("ip", "dns", "cache") has exactly one cached entry."""
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool("clear_dns_cache", {"device_name": "core-switch", "confirm": False})
+    assert preview["applied"] is False
+    assert preview["before"] == {"cached_entries": 1}
+    assert preview["after"] == {"cached_entries": 0}
+
+    _content, applied = await mcp.call_tool("clear_dns_cache", {"device_name": "core-switch", "confirm": True})
+    assert applied["applied"] is True
+    assert ("/ip/dns/cache/flush", {}) in fake_connection.calls
+
+
+# --- remove_dhcp_lease (v0.10) ------------------------------------------------
+
+
+def _dhcp_leases_server_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ip", "dhcp-server", "lease"): [
+                {".id": "*1", "address": "10.0.0.50", "mac-address": "AA:BB:CC:DD:EE:01", "dynamic": "true"},
+                {".id": "*2", "address": "10.0.0.60", "mac-address": "AA:BB:CC:DD:EE:02", "dynamic": "false"},
+            ]
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_dhcp_lease_blocked_read_only_by_default(device: Device):
+    fake = _dhcp_leases_server_fixture()
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": True})
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_dhcp_lease_dynamic_preview_then_confirm_carries_no_warning(device: Device):
+    fake = _dhcp_leases_server_fixture()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["warning"] is None
+
+    _content, applied = await mcp.call_tool(
+        "remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:01", "confirm": True}
+    )
+    assert applied["applied"] is True
+    macs = {row["mac-address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
+    assert "AA:BB:CC:DD:EE:01" not in macs
+
+
+@pytest.mark.asyncio
+async def test_remove_dhcp_lease_static_lease_carries_warning(device: Device):
+    fake = _dhcp_leases_server_fixture()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:02", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["warning"] is not None
+    assert "STATIC" in preview["warning"]
+
+
+@pytest.mark.asyncio
+async def test_remove_dhcp_lease_unknown_raises_clear_error(device: Device):
+    fake = _dhcp_leases_server_fixture()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_dhcp_lease", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:99", "confirm": True})
+    assert "AA:BB:CC:DD:EE:99" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_dhcp_lease_requires_address_or_mac(device: Device):
+    fake = _dhcp_leases_server_fixture()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_dhcp_lease", {"device_name": "core-switch", "confirm": True})
+    assert "address" in str(exc_info.value).lower() or "mac_address" in str(exc_info.value).lower()
+
+
+# --- wake_on_lan (v0.10) -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wake_on_lan_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "wake_on_lan", {"device_name": "core-switch", "mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_wake_on_lan_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "wake_on_lan",
+        {"device_name": "core-switch", "mac_address": "aa:bb:cc:dd:ee:ff", "interface": "ether1", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["after"] == {"mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"}
+
+    _content, applied = await mcp.call_tool(
+        "wake_on_lan",
+        {"device_name": "core-switch", "mac_address": "aa:bb:cc:dd:ee:ff", "interface": "ether1", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert ("/tool/wol", {"mac-address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"}) in fake_connection.calls
+
+
+@pytest.mark.asyncio
+async def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings: Settings):
+    write_settings = Settings(allow_write=True, devices=settings.devices)
+    mcp = build_server(
+        settings=write_settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "wake_on_lan", {"device_name": "core-switch", "mac_address": "not-a-mac", "interface": "ether1", "confirm": True}
+        )
+    assert "not valid" in str(exc_info.value)
+
+
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------
 
 
@@ -1741,7 +2043,7 @@ def test_server_never_calls_write_primitives_directly():
     server_src = (Path(__file__).resolve().parent.parent / "src" / "mcp_mikrotik" / "server.py").read_text(
         encoding="utf-8"
     )
-    forbidden = re.compile(r"\.(update|add|remove|start|stop)\(")
+    forbidden = re.compile(r"\.(update|add|remove|start|stop|flush|wol)\(")
     match = forbidden.search(server_src)
     assert match is None, (
         f"server.py contains a direct write-primitive call ({match.group() if match else ''!r}) - "

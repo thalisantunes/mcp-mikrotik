@@ -212,11 +212,16 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
     )
     guard.add_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
     guard.remove_netwatch(client, settings_write_enabled, host="1.1.1.1", confirm=True)
+    guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
+    guard.remove_static_dns(client, settings_write_enabled, name="blocked.example.com", confirm=True)
+    guard.clear_dns_cache(client, settings_write_enabled, confirm=True)
+    guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
+    guard.wake_on_lan(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 17
+    assert len(events) == 22
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -577,3 +582,157 @@ def test_remove_netwatch_not_found_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "remove_netwatch"
+
+
+# --- add_static_dns / remove_static_dns / clear_dns_cache / -----------------
+# --- remove_dhcp_lease / wake_on_lan (v0.10) --------------------------------
+
+
+def test_add_static_dns_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_static_dns"
+    assert event["operation"] == "add_static_dns"
+    assert event["action"] == "add"
+    assert event["summary"]["after"]["address"] == "0.0.0.0"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_add_static_dns_duplicate_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
+
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="1.2.3.4", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 2
+    assert events[1]["outcome"] == "error"
+    assert events[1]["operation"] == "add_static_dns"
+
+
+def test_remove_static_dns_confirmed_call_journals_outcome_applied(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.add_static_dns(client, settings_write_enabled, name="blocked.example.com", address="0.0.0.0", confirm=True)
+    guard.remove_static_dns(client, settings_write_enabled, name="blocked.example.com", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 2
+    event = events[1]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "remove_static_dns"
+    assert event["operation"] == "remove_static_dns"
+    assert event["action"] == "remove"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_remove_static_dns_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_static_dns(client, settings_write_enabled, name="ghost.example.com", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_static_dns"
+
+
+def test_clear_dns_cache_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.clear_dns_cache(client, settings_write_enabled, confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "clear_dns_cache"
+    assert event["operation"] == "clear_dns_cache"
+    assert event["action"] == "flush"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_clear_dns_cache_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.clear_dns_cache(client, settings, confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "clear_dns_cache"
+
+
+def test_remove_dhcp_lease_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "remove_dhcp_lease"
+    assert event["operation"] == "remove_dhcp_lease"
+    assert event["action"] == "remove"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_remove_dhcp_lease_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:99", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_dhcp_lease"
+
+
+def test_wake_on_lan_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.wake_on_lan(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "wake_on_lan"
+    assert event["operation"] == "wake_on_lan"
+    assert event["action"] == "wol"
+    assert event["summary"]["after"]["mac_address"] == "AA:BB:CC:DD:EE:FF"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_wake_on_lan_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.wake_on_lan(client, settings, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "wake_on_lan"

@@ -13,24 +13,26 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0.9: everything from v0.8 (the core read-tool inventory, `ping`/
-`traceroute` diagnostics, guarded write tools through `stop_container`,
-production-hardening layers - audit journal, correlation ids, read retry,
-circuit breaker; physical layer / L2 observability; LTE/5G, containers,
-USB; six read-only VPN/routing/Netwatch diagnostics tools), plus the
-failover **write** round this built toward: five new guarded write tools -
-`set_route_distance`, `enable_route`/`disable_route` (adjust/flip an
-`/ip/route` row, resolved by the STABLE `dst-address`+`gateway` pair, never
-a dynamic `.id`/index), `add_netwatch`/`remove_netwatch` (a Netwatch host
-monitor - deliberately **never** accepting an up-script/down-script
-parameter). `disable_route`'s preview carries a `warning` field whenever
-the route being disabled is the default route (`0.0.0.0/0`/`::/0`) - see
-"Failover control" below. All five go through the exact same write-guard
-mechanism as every other write tool - see "Security model" below. See
-`CHANGELOG.md` for what changed since v0.1.0, and `src/mcp_mikrotik/guard.py`
-for how to add the next write tool.
+v0.10: everything from v0.9 (the core read-tool inventory, `ping`/
+`traceroute` diagnostics, guarded write tools through the v0.9 failover
+round, production-hardening layers - audit journal, correlation ids, read
+retry, circuit breaker), plus a DNS/DHCP/Wake-on-LAN **write** round: five
+new guarded write tools - `add_static_dns`/`remove_static_dns` (a named
+`/ip/dns/static` entry - an "A" address record or a "CNAME" alias, resolved
+by the STABLE `name`+`record_type` pair, never a dynamic `.id`/index),
+`clear_dns_cache` (flush `/ip/dns/cache`), `remove_dhcp_lease` (remove a
+dynamic OR static `/ip/dhcp-server/lease` row - typically to force a client
+to renew its IP), and `wake_on_lan` (send a `/tool/wol` magic packet).
+`clear_dns_cache`/`wake_on_lan` are the second pair of guarded writes (after
+v0.7's `start_container`/`stop_container`) whose RouterOS operation is an
+ACTION command rather than an update/add/remove `set` - see "Security
+model" below. `remove_dhcp_lease`'s preview carries a `warning` field
+whenever the resolved lease is static - see "DHCP lease removal" below. All
+five go through the exact same write-guard mechanism as every other write
+tool. See `CHANGELOG.md` for what changed since v0.1.0, and
+`src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
-The full pytest suite currently has 627 tests, all passing against the
+The full pytest suite currently has 732 tests, all passing against the
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
@@ -161,6 +163,11 @@ model" below for the full guard mechanism.
 | `disable_route` | Disable a route (`disabled=yes`). Same resolution as `enable_route`. **The returned preview's `warning` field is non-null whenever the route is the default route (`0.0.0.0/0`/`::/0`)** - disabling it cuts outbound traffic through that gateway. See "Failover control" below. |
 | `add_netwatch` | Create a Netwatch host monitor (`host`, optional `interval`/`comment`). **Never accepts an up-script/down-script** - see "Failover control" below. Refuses a duplicate `host`. |
 | `remove_netwatch` | Remove a Netwatch host monitor by `host` or `comment`. |
+| `add_static_dns` | Create a static DNS entry (`/ip/dns/static`) resolving `name` to `address`. `record_type` is `"A"` (default, `address` a literal IP) or `"CNAME"` (`address` is itself the alias target hostname). Refuses a duplicate `name`+`record_type` pair. See "DNS management" below. |
+| `remove_static_dns` | Remove a static DNS entry by `name`, optionally narrowed by `record_type`. Errors if more than one row still matches after narrowing (`AmbiguousResourceError`) - never guesses which one to remove. |
+| `clear_dns_cache` | Flush the device's DNS resolver cache (`/ip/dns/cache/flush`, no arguments). Benign (only cached answers are cleared), but still guarded/confirm-gated. |
+| `remove_dhcp_lease` | Remove a DHCP lease (dynamic OR static) by `address` or `mac_address` - typically to force a client to renew its IP. **The returned preview's `warning` field is non-null if the resolved lease is STATIC** - removing it deletes the pinned IP↔MAC mapping, not just a renewable entry. See "DHCP lease removal" below. |
+| `wake_on_lan` | Send a Wake-on-LAN magic packet (`/tool/wol`) for `mac_address`, out `interface`. Benign and targets no existing device row, but still guarded/confirm-gated. See "Wake-on-LAN" below. |
 
 Not yet exposed, deliberately: device reboot and firewall rule writes. See
 "Roadmap / non-goals" below for why.
@@ -409,6 +416,67 @@ device (WinBox/CLI) once the monitor exists. The read-only `netwatch` tool
 already only ever surfaces `has-up-script`/`has-down-script` as presence
 booleans, never a script body, for the same reason.
 
+### DNS management (v0.10)
+
+`add_static_dns`/`remove_static_dns` manage `/ip/dns/static` - typical uses:
+
+- **Block a malicious/unwanted domain**: `add_static_dns` with `address`
+  set to `0.0.0.0` (or another sinkhole address) - any client that resolves
+  the blocked `name` through this device's DNS server gets that address
+  instead of the real one.
+- **Internal DNS override**: point an internal hostname at a specific
+  internal IP, or (`record_type="CNAME"`) alias one hostname to another.
+
+`record_type` selects what `address` means: `"A"` (default) is a literal
+IPv4/IPv6 address; `"CNAME"` means `address` is itself another hostname (the
+alias target), written to RouterOS's `cname` field - a CNAME row has no
+`address` field of its own on the device.
+
+**Resolution: `name`+`record_type`, never a dynamic index.** `add_static_dns`
+refuses to create a second row for the same `name`+`record_type` pair
+(`ResourceAlreadyExistsError`) - this also means RouterOS round-robin DNS
+(two "A" records sharing a `name` but pointing at different addresses) is
+not something this tool creates; add the second record manually on the
+device if that's genuinely intended. `remove_static_dns` resolves by `name`,
+narrowed by `record_type` if given; if more than one row still matches after
+narrowing (e.g. an existing round-robin pair), `AmbiguousResourceError` -
+the tool never guesses which one to remove.
+
+`clear_dns_cache` (`/ip/dns/cache/flush`) is unrelated to `/ip/dns/static` -
+it clears cached upstream DNS *answers*, not any configured entry. Benign
+(cached answers repopulate on the next resolution) but still a guarded,
+confirm-gated write, like every other tool here.
+
+### DHCP lease removal (v0.10)
+
+`remove_dhcp_lease` removes an existing `/ip/dhcp-server/lease` row by
+`address` or `mac_address` (`mac_address` is tried first if both are given -
+the more stable identifier, since an `address` can be reused by a different
+lease over time). The typical use is forcing a client to renew its IP: the
+existing lease is deleted, and the client is offered a new one on its next
+DHCP exchange.
+
+**This removes EITHER a dynamic or a static lease.** RouterOS's `dynamic`
+field on the resolved row tells them apart. Removing a DYNAMIC lease is the
+ordinary case above. Removing a STATIC lease (one pinned by
+`add_static_dhcp_lease`) is also allowed - not blocked outright - but it
+deletes the pinned IP↔MAC mapping itself, not just a renewable entry, so the
+returned preview's `warning` field is non-null whenever the resolved lease
+is static, on both the `confirm=false` preview and the `confirm=true`
+applied result. Always check `warning` before calling again with
+`confirm=true`.
+
+### Wake-on-LAN (v0.10)
+
+`wake_on_lan` sends a `/tool/wol` magic packet for `mac_address`, out
+`interface`. Unlike every other write tool in this package, there is
+nothing existing on the device to resolve or verify first - `mac_address`/
+`interface` are validated for shape only (this does NOT check that
+`interface` exists on the device; RouterOS itself rejects an unknown
+interface name at send time). Benign - it never changes device
+configuration - but still guarded/confirm-gated like every other write
+tool, so an LLM caller can't wake a machine "by accident".
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -427,7 +495,15 @@ Three independent controls apply to every write tool, all centralized in
    RouterOS's `/container/start`/`/container/stop` ACTION commands - but the
    dispatch mechanism (`getattr(client, op.action)`) and the fixed,
    individually-reviewed `MikrotikClient` method it can ever reach are
-   unchanged; see `CHANGELOG.md`'s "How start/stop extends the guard".
+   unchanged; see `CHANGELOG.md`'s "How start/stop extends the guard". v0.10
+   adds a second such pair: `clear_dns_cache`/`wake_on_lan` use `flush`/`wol`
+   for RouterOS's `/ip/dns/cache/flush`/`/tool/wol` ACTION commands - same
+   `getattr(client, op.action)` dispatch, same fixed reviewed
+   `MikrotikClient.flush`/`.wol` methods, the only difference from
+   `start`/`stop` being that neither targets a specific row/`.id` (there is
+   no "list" to pick one row from - both are standalone, one-shot commands,
+   dispatched via the connection's callable form like `ping`, not the
+   `path(*segments)(cmd, **{".id": id})` form `start`/`stop` use).
    `set_wifi_ssid` and `set_client_bandwidth` are the two exceptions to "one
    tool, one allowlist entry": because RouterOS exposes wifi under different
    paths depending on generation (ROS7 `/interface/wifi` vs ROS6
@@ -621,6 +697,12 @@ Python 3.11 and 3.12.
   see "Failover control" above. Netwatch up/down-script configuration
   itself remains deliberately out of scope (manual, on the device) - see
   "Netwatch scripts are never accepted" above for why.
+- **DNS/DHCP/Wake-on-LAN write tools** (`add_static_dns`/`remove_static_dns`,
+  `clear_dns_cache`, `remove_dhcp_lease`, `wake_on_lan`) shipped in v0.10 -
+  see "DNS management", "DHCP lease removal", and "Wake-on-LAN" above. Only
+  the two simplest static DNS record types (`"A"`/`"CNAME"`) are exposed;
+  other RouterOS record types (`AAAA`/`MX`/`TXT`/`NS`/...) are a future
+  round's decision, not silently widened here.
 - Two write operations are deliberately **not** exposed yet, each because
   the standard guard/confirm/preview mechanism isn't sufficient protection
   on its own - see the comment above `ALLOWLIST` in `guard.py`:

@@ -513,6 +513,68 @@ class MikrotikClient:
 
         self._execute_once("/".join(segments) + "/stop", _do)
 
+    # --- v0.10: flush/wol action commands ----------------------------------
+    #
+    # Two more RouterOS ACTION commands, alongside start/stop above - but
+    # unlike start/stop, neither /ip/dns/cache/flush nor /tool/wol targets a
+    # specific row/.id: both are standalone, one-shot commands (there is no
+    # "list" of DNS caches or WoL packets to pick one row from), exactly like
+    # ping/traceroute/monitor_traffic already are. So these use the
+    # connection's CALLABLE form (`connection(cmd, **kwargs)`, same as
+    # ping/monitor_traffic above) rather than start/stop's
+    # `path(*segments)(cmd, **{".id": id})` form. Each still sends exactly
+    # one fixed, hardcoded command string built only from `segments` (the
+    # menu path) plus its own literal command word ("flush"/"wol") - never a
+    # command or path assembled from caller input, same invariant as every
+    # other write primitive in this section.
+    #
+    # guard.ALLOWLIST["clear_dns_cache"]/["wake_on_lan"] name these methods
+    # via their `action` field ("flush"/"wol" respectively - the literal
+    # RouterOS command word, same convention "start"/"stop" already
+    # established), dispatched through the same `getattr(client, op.action)`
+    # every other guarded write uses (see guard.py's set_identity A1
+    # comment) - never called directly by name from guard.py or server.py.
+
+    def flush(self, *segments: str) -> None:
+        """Run a RouterOS cache-flush ACTION command (used for
+        /ip/dns/cache/flush - see guard.clear_dns_cache). `segments` supplies
+        the menu path (e.g. ("ip", "dns", "cache")); this method appends the
+        fixed "/flush" command word itself.
+
+        The reply is expected empty, but is still materialized with list(...)
+        first - the v0.7.1 lesson (see monitor_traffic's docstring above):
+        librouteros' callable connection form returns a generator, not a
+        list, so any code that ever inspects the reply must materialize it
+        first rather than assume a list. No retry (writes never retry - see
+        this section's own docstring above).
+        """
+
+        def _do(connection: RouterosConnection) -> None:
+            list(connection("/" + "/".join(segments) + "/flush"))
+
+        self._execute_once("/".join(segments) + "/flush", _do)
+
+    def wol(self, *segments: str, mac_address: str, interface: str) -> None:
+        """Run /tool/wol (send a Wake-on-LAN magic packet) - see
+        guard.wake_on_lan. `mac_address`/`interface` are forwarded as
+        structured parameters (RouterOS field name `mac-address`), expected
+        to already be validated (validation.validate_mac_address/
+        validate_interface_name) - never part of a command string.
+
+        Same "materialize the reply with list(...) first" and "no retry"
+        notes as flush() above apply here too.
+        """
+
+        def _do(connection: RouterosConnection) -> None:
+            list(
+                connection(
+                    "/" + "/".join(segments) + "/wol",
+                    **{"mac-address": mac_address, "interface": interface},
+                )
+            )
+
+        self._execute_once("/".join(segments) + "/wol", _do)
+
     def close(self) -> None:
         if self._connection is not None:
             try:

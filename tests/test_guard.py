@@ -63,7 +63,7 @@ def test_allowlist_only_contains_named_operations():
     for name, op in guard.ALLOWLIST.items():
         assert op.name == name
         assert isinstance(op.path, tuple) and op.path
-        assert op.action in {"update", "add", "remove", "start", "stop"}
+        assert op.action in {"update", "add", "remove", "start", "stop", "flush", "wol"}
 
 
 def test_require_allowed_rejects_unknown_operation(settings_write_enabled: Settings):
@@ -1510,3 +1510,572 @@ def test_remove_netwatch_dispatches_via_allowlist_action(
     guard.remove_netwatch(client, settings_write_enabled, host="8.8.8.8", confirm=True)
 
     assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- add_static_dns / remove_static_dns (v0.10) -----------------------------
+
+
+def _static_dns_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ip", "dns", "static"): [
+                {".id": "*1", "name": "blocked.example.com", "type": "A", "address": "0.0.0.0"},
+                {".id": "*2", "name": "alias.example.com", "type": "CNAME", "cname": "target.example.com"},
+                # Round-robin: two "A" records sharing a `name` - the
+                # ambiguity case remove_static_dns must refuse to guess on.
+                {".id": "*3", "name": "roundrobin.example.com", "type": "A", "address": "10.0.0.1"},
+                {".id": "*4", "name": "roundrobin.example.com", "type": "A", "address": "10.0.0.2"},
+            ]
+        }
+    )
+
+
+def test_add_static_dns_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_static_dns(client, settings, name="new.example.com", address="10.0.0.9", confirm=True)
+
+
+def test_add_static_dns_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_static_dns(guarded_client, settings, name="new.example.com", address="10.0.0.9", confirm=True)
+
+
+def test_add_static_dns_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_static_dns(
+        client, settings_write_enabled, name="new.example.com", address="10.0.0.9", confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "new.example.com", "type": "A", "address": "10.0.0.9"}
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "new.example.com" not in names
+
+
+def test_add_static_dns_confirm_true_applies_a_record(settings_write_enabled: Settings, device: Device):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_static_dns(
+        client,
+        settings_write_enabled,
+        name="new.example.com",
+        address="10.0.0.9",
+        ttl="1d",
+        comment="internal override",
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    rows = fake.path("ip", "dns", "static")._rows
+    created = next(row for row in rows if row["name"] == "new.example.com")
+    assert created["type"] == "A"
+    assert created["address"] == "10.0.0.9"
+    assert created["ttl"] == "1d"
+    assert created["comment"] == "internal override"
+
+
+def test_add_static_dns_cname_writes_cname_field_not_address(settings_write_enabled: Settings, device: Device):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    guard.add_static_dns(
+        client,
+        settings_write_enabled,
+        name="www.example.com",
+        address="target.example.com",
+        record_type="CNAME",
+        confirm=True,
+    )
+
+    rows = fake.path("ip", "dns", "static")._rows
+    created = next(row for row in rows if row["name"] == "www.example.com")
+    assert created["type"] == "CNAME"
+    assert created["cname"] == "target.example.com"
+    assert "address" not in created
+
+
+def test_add_static_dns_rejects_duplicate_name_and_type(settings_write_enabled: Settings, device: Device):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_static_dns(
+            client, settings_write_enabled, name="blocked.example.com", address="1.2.3.4", confirm=True
+        )
+    # Nothing was added.
+    rows = [row for row in fake.path("ip", "dns", "static")._rows if row["name"] == "blocked.example.com"]
+    assert len(rows) == 1
+
+
+def test_add_static_dns_allows_same_name_different_type(settings_write_enabled: Settings, device: Device):
+    """A CNAME and an A record can legitimately share a `name` with a
+    different `type` - only the exact name+type pair is a duplicate."""
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_static_dns(
+        client, settings_write_enabled, name="alias.example.com", address="10.0.0.5", record_type="A", confirm=True
+    )
+    assert preview.applied is True
+
+
+def test_add_static_dns_rejects_invalid_name_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_static_dns(guarded_client, settings_write_enabled, name="not a host", address="10.0.0.9", confirm=True)
+
+
+def test_add_static_dns_rejects_invalid_address_for_a_record_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_static_dns(
+            guarded_client, settings_write_enabled, name="new.example.com", address="not-an-ip", confirm=True
+        )
+
+
+def test_add_static_dns_rejects_ip_as_cname_target_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """A CNAME target must be a hostname, not a literal IP - validate_dns_name
+    (not validate_ip_address) governs the `address` param when record_type
+    is CNAME."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_static_dns(
+            guarded_client,
+            settings_write_enabled,
+            name="www.example.com",
+            address="10.0.0.9",
+            record_type="CNAME",
+            confirm=True,
+        )
+
+
+def test_add_static_dns_rejects_invalid_record_type_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_static_dns(
+            guarded_client,
+            settings_write_enabled,
+            name="new.example.com",
+            address="10.0.0.9",
+            record_type="MX",
+            confirm=True,
+        )
+
+
+def test_add_static_dns_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_static_dns"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_static_dns", patched_op)
+
+    guard.add_static_dns(client, settings_write_enabled, name="new.example.com", address="10.0.0.9", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"name": "new.example.com", "type": "A", "address": "10.0.0.9"}}
+
+
+def test_remove_static_dns_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_static_dns(client, settings, name="blocked.example.com", confirm=True)
+
+
+def test_remove_static_dns_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_static_dns(guarded_client, settings, name="blocked.example.com", confirm=True)
+
+
+def test_remove_static_dns_preview_then_confirm(settings_write_enabled: Settings, device: Device):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_static_dns(client, settings_write_enabled, name="blocked.example.com", confirm=False)
+    assert preview.applied is False
+    assert preview.before["address"] == "0.0.0.0"
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" in names
+
+    applied = guard.remove_static_dns(client, settings_write_enabled, name="blocked.example.com", confirm=True)
+    assert applied.applied is True
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "blocked.example.com" not in names
+
+
+def test_remove_static_dns_unknown_name_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_static_dns(client, settings_write_enabled, name="ghost.example.com", confirm=True)
+    assert "ghost.example.com" in str(exc_info.value)
+
+
+def test_remove_static_dns_ambiguous_without_record_type_raises(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(AmbiguousResourceError):
+        guard.remove_static_dns(client, settings_write_enabled, name="roundrobin.example.com", confirm=True)
+    # Neither row was removed.
+    rows = [row for row in fake.path("ip", "dns", "static")._rows if row["name"] == "roundrobin.example.com"]
+    assert len(rows) == 2
+
+
+def test_remove_static_dns_resolves_uniquely_when_type_given(
+    settings_write_enabled: Settings, device: Device
+):
+    """Same `name` shared by two rows is only ambiguous when `record_type`
+    is also shared - a CNAME and an A record with the same `name` resolve
+    unambiguously by `record_type` alone."""
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.remove_static_dns(
+        client, settings_write_enabled, name="alias.example.com", record_type="CNAME", confirm=True
+    )
+    assert applied.applied is True
+    names = {row["name"] for row in fake.path("ip", "dns", "static")._rows}
+    assert "alias.example.com" not in names
+
+
+def test_remove_static_dns_rejects_invalid_name_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_static_dns(guarded_client, settings_write_enabled, name="not a host", confirm=True)
+
+
+def test_remove_static_dns_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _static_dns_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_static_dns"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_static_dns", patched_op)
+
+    guard.remove_static_dns(client, settings_write_enabled, name="blocked.example.com", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- clear_dns_cache (v0.10) -------------------------------------------------
+
+
+def test_clear_dns_cache_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.clear_dns_cache(client, settings, confirm=True)
+
+
+def test_clear_dns_cache_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.clear_dns_cache(guarded_client, settings, confirm=True)
+
+
+def test_clear_dns_cache_preview_reports_current_count_and_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    """The shared fixture's ("ip", "dns", "cache") has exactly one cached
+    entry."""
+    preview = guard.clear_dns_cache(client, settings_write_enabled, confirm=False)
+    assert preview.applied is False
+    assert preview.before == {"cached_entries": 1}
+    assert preview.after == {"cached_entries": 0}
+    assert fake_connection.calls == []  # nothing sent to the device yet
+
+
+def test_clear_dns_cache_confirm_true_sends_the_flush_command(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.clear_dns_cache(client, settings_write_enabled, confirm=True)
+    assert preview.applied is True
+    assert ("/ip/dns/cache/flush", {}) in fake_connection.calls
+
+
+def test_clear_dns_cache_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["clear_dns_cache"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "clear_dns_cache", patched_op)
+
+    guard.clear_dns_cache(client, settings_write_enabled, confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {}}
+
+
+# --- remove_dhcp_lease (v0.10) -----------------------------------------------
+
+
+def _dhcp_leases_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ip", "dhcp-server", "lease"): [
+                {
+                    ".id": "*1",
+                    "address": "10.0.0.50",
+                    "mac-address": "AA:BB:CC:DD:EE:01",
+                    "dynamic": "true",
+                    "status": "bound",
+                },
+                {
+                    ".id": "*2",
+                    "address": "10.0.0.60",
+                    "mac-address": "AA:BB:CC:DD:EE:02",
+                    "dynamic": "false",
+                    "status": "bound",
+                },
+            ]
+        }
+    )
+
+
+def test_remove_dhcp_lease_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_dhcp_lease(client, settings, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
+
+
+def test_remove_dhcp_lease_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_dhcp_lease(guarded_client, settings, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
+
+
+def test_remove_dhcp_lease_requires_address_or_mac(settings_write_enabled: Settings, device: Device):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ValidationError):
+        guard.remove_dhcp_lease(client, settings_write_enabled, confirm=True)
+
+
+def test_remove_dhcp_lease_by_mac_dynamic_no_warning(settings_write_enabled: Settings, device: Device):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_dhcp_lease(
+        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.warning is None
+    assert preview.before["address"] == "10.0.0.50"
+
+    applied = guard.remove_dhcp_lease(
+        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True
+    )
+    assert applied.applied is True
+    assert applied.warning is None
+    macs = {row["mac-address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
+    assert "AA:BB:CC:DD:EE:01" not in macs
+
+
+def test_remove_dhcp_lease_by_address_dynamic_no_warning(settings_write_enabled: Settings, device: Device):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    applied = guard.remove_dhcp_lease(client, settings_write_enabled, address="10.0.0.50", confirm=True)
+    assert applied.applied is True
+    assert applied.warning is None
+    addresses = {row["address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
+    assert "10.0.0.50" not in addresses
+
+
+def test_remove_dhcp_lease_static_lease_carries_warning_on_preview_and_apply(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_dhcp_lease(
+        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.warning is not None
+    assert "STATIC" in preview.warning
+
+    applied = guard.remove_dhcp_lease(
+        client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:02", confirm=True
+    )
+    assert applied.applied is True
+    assert applied.warning is not None
+    assert "STATIC" in applied.warning
+    macs = {row["mac-address"] for row in fake.path("ip", "dhcp-server", "lease")._rows}
+    assert "AA:BB:CC:DD:EE:02" not in macs
+
+
+def test_remove_dhcp_lease_mac_tried_before_address_when_both_given(
+    settings_write_enabled: Settings, device: Device
+):
+    """mac_address is the more stable identifier - tried first if both are
+    given, mirroring remove_netwatch's "host tried first" convention."""
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    # Mismatched pair: mac_address resolves to the dynamic lease, address
+    # would resolve to the static one - the mac_address match must win.
+    preview = guard.remove_dhcp_lease(
+        client,
+        settings_write_enabled,
+        mac_address="AA:BB:CC:DD:EE:01",
+        address="10.0.0.60",
+        confirm=False,
+    )
+    assert preview.before["mac-address"] == "AA:BB:CC:DD:EE:01"
+    assert preview.warning is None  # resolved the dynamic one, not the static one
+
+
+def test_remove_dhcp_lease_unknown_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:99", confirm=True)
+    assert "AA:BB:CC:DD:EE:99" in str(exc_info.value)
+
+
+def test_remove_dhcp_lease_rejects_invalid_mac_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_dhcp_lease(guarded_client, settings_write_enabled, mac_address="not-a-mac", confirm=True)
+
+
+def test_remove_dhcp_lease_rejects_invalid_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.remove_dhcp_lease(guarded_client, settings_write_enabled, address="not-an-ip", confirm=True)
+
+
+def test_remove_dhcp_lease_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _dhcp_leases_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_dhcp_lease"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_dhcp_lease", patched_op)
+
+    guard.remove_dhcp_lease(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:01", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- wake_on_lan (v0.10) ------------------------------------------------------
+
+
+def test_wake_on_lan_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.wake_on_lan(client, settings, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+
+
+def test_wake_on_lan_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.wake_on_lan(guarded_client, settings, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+
+
+def test_wake_on_lan_preview_never_touches_the_device(settings_write_enabled: Settings, device: Device):
+    """wake_on_lan resolves nothing on the device first (unlike every other
+    write tool, there is no existing row to read) - a preview must not call
+    the connection at all."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    preview = guard.wake_on_lan(
+        guarded_client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.after == {"mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"}
+
+
+def test_wake_on_lan_confirm_true_sends_the_wol_command(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.wake_on_lan(
+        client, settings_write_enabled, mac_address="aa:bb:cc:dd:ee:ff", interface="ether1", confirm=True
+    )
+    assert preview.applied is True
+    assert ("/tool/wol", {"mac-address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"}) in fake_connection.calls
+
+
+def test_wake_on_lan_rejects_invalid_mac_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.wake_on_lan(guarded_client, settings_write_enabled, mac_address="not-a-mac", interface="ether1", confirm=True)
+
+
+def test_wake_on_lan_rejects_invalid_interface_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.wake_on_lan(
+            guarded_client,
+            settings_write_enabled,
+            mac_address="AA:BB:CC:DD:EE:FF",
+            interface="ether 1",
+            confirm=True,
+        )
+
+
+def test_wake_on_lan_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["wake_on_lan"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "wake_on_lan", patched_op)
+
+    guard.wake_on_lan(client, settings_write_enabled, mac_address="AA:BB:CC:DD:EE:FF", interface="ether1", confirm=True)
+
+    assert called == {
+        "path": patched_op.path,
+        "fields": {"mac_address": "AA:BB:CC:DD:EE:FF", "interface": "ether1"},
+    }

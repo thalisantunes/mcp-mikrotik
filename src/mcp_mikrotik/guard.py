@@ -50,6 +50,8 @@ from .validation import (
     validate_address_list_name,
     validate_comment,
     validate_container_identifier,
+    validate_dns_name,
+    validate_dns_record_type,
     validate_dst_address,
     validate_interface_name,
     validate_ip_address,
@@ -67,7 +69,7 @@ from .validation import (
 class WriteOperation:
     name: str
     path: tuple[str, ...]
-    action: str  # "update" | "add" | "remove" | "start" | "stop"
+    action: str  # "update" | "add" | "remove" | "start" | "stop" | "flush" | "wol"
     description: str
 
 
@@ -230,6 +232,46 @@ ALLOWLIST: dict[str, WriteOperation] = {
         path=("tool", "netwatch"),
         action="remove",
         description="Remove a Netwatch host monitor by host or comment.",
+    ),
+    # v0.10: static DNS, DNS cache flush, DHCP lease removal, Wake-on-LAN.
+    # clear_dns_cache/wake_on_lan are the second pair of ALLOWLIST entries
+    # (after start_container/stop_container in v0.7) whose `action` is
+    # neither update/add/remove - "flush"/"wol" are RouterOS's own literal
+    # command words for /ip/dns/cache/flush and /tool/wol. Unlike start/stop
+    # (which target one specific /container row's .id), neither of these
+    # targets a row at all - see MikrotikClient.flush/.wol's docstrings.
+    "add_static_dns": WriteOperation(
+        name="add_static_dns",
+        path=("ip", "dns", "static"),
+        action="add",
+        description="Add a static DNS entry (/ip/dns/static) - name to an address (A) or a CNAME target.",
+    ),
+    "remove_static_dns": WriteOperation(
+        name="remove_static_dns",
+        path=("ip", "dns", "static"),
+        action="remove",
+        description="Remove a static DNS entry by name, optionally narrowed by record type.",
+    ),
+    "clear_dns_cache": WriteOperation(
+        name="clear_dns_cache",
+        path=("ip", "dns", "cache"),
+        action="flush",
+        description="Flush the device's DNS resolver cache (/ip/dns/cache/flush, no arguments).",
+    ),
+    "remove_dhcp_lease": WriteOperation(
+        name="remove_dhcp_lease",
+        path=("ip", "dhcp-server", "lease"),
+        action="remove",
+        description=(
+            "Remove a DHCP lease (dynamic or static) by address or mac-address - typically to force a "
+            "client to renew its IP. Removing a STATIC lease also deletes its pinned IP<->MAC mapping."
+        ),
+    ),
+    "wake_on_lan": WriteOperation(
+        name="wake_on_lan",
+        path=("tool",),
+        action="wol",
+        description="Send a Wake-on-LAN magic packet to a MAC address via an interface (/tool/wol).",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -1285,4 +1327,298 @@ def remove_netwatch(
 
     write = getattr(client, op.action)
     write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.10: static DNS, DNS cache flush, DHCP lease removal, Wake-on-LAN ----
+#
+# Five more guarded writes: `add_static_dns`/`remove_static_dns` (a named
+# `/ip/dns/static` row), `clear_dns_cache` (a fire-and-forget flush of
+# `/ip/dns/cache`), `remove_dhcp_lease` (removes an existing - dynamic OR
+# static - `/ip/dhcp-server/lease` row, e.g. to force a client to renew its
+# IP), and `wake_on_lan` (sends a `/tool/wol` magic packet). None of these
+# need any ROS6/ROS7 branching - static DNS, DNS cache, DHCP leases, and
+# /tool/wol are all present, at the same path, on both RouterOS generations.
+
+
+def _dns_record_type_of(row: dict[str, Any]) -> str:
+    """RouterOS omits the `type` field entirely on a plain address record
+    (the implicit default) - only a CNAME (or other non-address) row carries
+    an explicit `type`. Normalizes both to "A" so add_static_dns's duplicate
+    check and remove_static_dns's lookup compare the way RouterOS itself
+    treats an entry, not like an absent field."""
+    return row.get("type") or "A"
+
+
+def _find_static_dns_rows(
+    rows: list[dict[str, Any]], name: str, record_type: str | None = None
+) -> list[dict[str, Any]]:
+    """All /ip/dns/static rows matching `name`, optionally narrowed further
+    by `record_type`. More than one row can legitimately share a `name` -
+    e.g. two "A" records for round-robin, or an "A" and a "CNAME" that
+    happen to share a name - which is exactly why this returns every match
+    rather than just the first one; callers decide what "more than one"
+    means for their own operation (a duplicate for add, an ambiguity for
+    remove - see add_static_dns/remove_static_dns below)."""
+    matches = [row for row in rows if row.get("name") == name]
+    if record_type is not None:
+        matches = [row for row in matches if _dns_record_type_of(row) == record_type]
+    return matches
+
+
+@_audited("add_static_dns")
+def add_static_dns(
+    client: MikrotikClient,
+    settings: Settings,
+    name: str,
+    address: str,
+    confirm: bool,
+    record_type: str = "A",
+    ttl: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Create a static DNS entry (`/ip/dns/static add`) resolving `name` to
+    `address`.
+
+    `record_type` (default `"A"`) selects what `address` means:
+      - `"A"` (default): `address` is a literal IPv4/IPv6 address
+        (`validate_ip_address`), written to RouterOS's `address` field.
+        Useful to block a malicious domain (point it at `0.0.0.0`) or set up
+        an internal DNS override.
+      - `"CNAME"`: `address` is itself another hostname (`validate_dns_name`
+        - the alias TARGET, not a literal IP), written to RouterOS's `cname`
+        field - RouterOS's own `/ip/dns/static` menu has no `address` field
+        on a CNAME row, only `cname`.
+
+    Refuses to create a duplicate: ANY row already matching this `name`+
+    `record_type` pair - raises ResourceAlreadyExistsError instead of
+    creating a second one, regardless of whether `address` also matches.
+    (RouterOS round-robin DNS - two "A" records sharing a `name` but
+    pointing at different addresses - is therefore a configuration this
+    tool does not create; add the second record manually on the device if
+    that is genuinely intended.) This tool only ever adds; it never updates
+    or removes an existing entry.
+    """
+    op = _require_allowed(settings, "add_static_dns")
+
+    validated_name = validate_dns_name(name)
+    validated_type = validate_dns_record_type(record_type)
+    validated_ttl = validate_timeout(ttl, "ttl") if ttl is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+    validated_target = validate_dns_name(address) if validated_type == "CNAME" else validate_ip_address(address)
+
+    rows = client.path(*op.path)
+    if _find_static_dns_rows(rows, validated_name, validated_type):
+        raise ResourceAlreadyExistsError(
+            client.device.name, "Static DNS entry", f"{validated_name} ({validated_type})"
+        )
+
+    payload: dict[str, Any] = {"name": validated_name, "type": validated_type}
+    if validated_type == "CNAME":
+        payload["cname"] = validated_target
+    else:
+        payload["address"] = validated_target
+    if validated_ttl:
+        payload["ttl"] = validated_ttl
+    if validated_comment:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_static_dns")
+def remove_static_dns(
+    client: MikrotikClient,
+    settings: Settings,
+    name: str,
+    confirm: bool,
+    record_type: str | None = None,
+) -> WritePreview:
+    """Remove a static DNS entry (`/ip/dns/static remove`) by `name`,
+    optionally narrowed by `record_type` ("A"/"CNAME").
+
+    Raises ResourceNotFoundError if nothing matches `name` (narrowed by
+    `record_type`, if given). Raises AmbiguousResourceError if MORE THAN ONE
+    row still matches after narrowing - e.g. two "A" records sharing a
+    `name` (round-robin DNS) - the tool never guesses which one to remove;
+    the caller must supply `record_type`, or the device's `name` is simply
+    not unique enough on its own and must be corrected on the device first.
+    """
+    op = _require_allowed(settings, "remove_static_dns")
+
+    validated_name = validate_dns_name(name)
+    validated_type = validate_dns_record_type(record_type) if record_type is not None else None
+
+    rows = client.path(*op.path)
+    matches = _find_static_dns_rows(rows, validated_name, validated_type)
+
+    if not matches:
+        identifier = validated_name if validated_type is None else f"{validated_name} ({validated_type})"
+        raise ResourceNotFoundError(client.device.name, "Static DNS entry", identifier)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "Static DNS entry",
+            validated_name,
+            [_dns_record_type_of(row) for row in matches],
+        )
+
+    row = matches[0]
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("clear_dns_cache")
+def clear_dns_cache(client: MikrotikClient, settings: Settings, confirm: bool) -> WritePreview:
+    """Flush the device's DNS resolver cache (`/ip/dns/cache/flush`) - a
+    fire-and-forget RouterOS ACTION command that takes no arguments and
+    targets no specific row (it clears the whole cache at once, not one
+    entry).
+
+    Benign (it never changes device *configuration*, only cached DNS
+    answers, which repopulate on the next resolution), but still a guarded,
+    confirm-gated write like every other tool here, since it does change
+    device state (an LLM caller should not flush a cache "by accident" any
+    more than it should flip an interface). `before`/`after` report the
+    number of currently cached entries (`cached_entries`) as an informative
+    count, read fresh each call - not a specific row's fields, since there
+    is no specific row this operation targets. `after.cached_entries` is the
+    INTENDED post-flush count (`0`), not a verified re-read - RouterOS may
+    already have repopulated the cache with a new answer by the time a
+    caller reads it back.
+    """
+    op = _require_allowed(settings, "clear_dns_cache")
+
+    rows = client.path(*op.path)
+    before = {"cached_entries": len(rows)}
+    after = {"cached_entries": 0}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_dhcp_lease")
+def remove_dhcp_lease(
+    client: MikrotikClient,
+    settings: Settings,
+    confirm: bool,
+    address: str | None = None,
+    mac_address: str | None = None,
+) -> WritePreview:
+    """Remove a DHCP lease (`/ip/dhcp-server/lease remove`) by `address` or
+    `mac_address` - typically used to force a client to renew its IP (its
+    existing lease is deleted; the device requests/is offered a new one on
+    its next DHCP exchange). At least one of `address`/`mac_address` must be
+    given and must resolve to an existing lease (`mac_address` is tried
+    first if both are given, since a MAC is the more stable identifier - an
+    `address` can legitimately be reused by a different lease over time,
+    a MAC cannot); raises ResourceNotFoundError otherwise. Never removes
+    more than the one matching row.
+
+    STATIC vs DYNAMIC: this removes EITHER kind of lease - RouterOS's
+    `dynamic` field on the matched row (`"true"` for a normal DHCP-assigned
+    lease, `"false"` for one pinned by add_static_dhcp_lease) tells you
+    which. Removing a DYNAMIC lease is this tool's primary use case (forces
+    a renewal - a new dynamic lease is typically re-created on the client's
+    next DHCP request). Removing a STATIC lease is also allowed - it is not
+    blocked outright - but it deletes the pinned IP<->MAC mapping itself,
+    not just a transient cache entry, so the returned WritePreview's
+    `warning` field is set to a clear, non-null message whenever the
+    resolved lease is static (`dynamic == "false"`), on BOTH the preview
+    (`confirm=False`) and the applied result (`confirm=True`) - exactly the
+    same pattern `disable_route`'s default-route warning uses (see v0.9).
+    `warning` is `None` for a dynamic lease - removing one is unremarkable,
+    exactly what this tool is for.
+    """
+    op = _require_allowed(settings, "remove_dhcp_lease")
+
+    if not address and not mac_address:
+        raise ValidationError("remove_dhcp_lease requires 'address' or 'mac_address'.")
+
+    # Validate before touching the device at all, same as every other write
+    # tool's validation (see remove_simple_queue's equivalent comment).
+    validated_address = validate_ip_address(address) if address else None
+    validated_mac = validate_mac_address(mac_address) if mac_address else None
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "mac-address", validated_mac) if validated_mac else None
+    if row is None and validated_address:
+        row = _find_row_by_field(rows, "address", validated_address)
+
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "DHCP lease", mac_address or address or "")
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    warning: str | None = None
+    if row.get("dynamic") == "false":
+        warning = (
+            f"{before.get('address', '?')} <-> {before.get('mac-address', '?')} is a STATIC DHCP lease "
+            "(dynamic=false) - removing it deletes the pinned mapping itself, not just a renewable "
+            "cache entry. If you only meant to force a renewal, target a dynamic lease instead; if "
+            "removing this static pin is intended, confirm with confirm=true."
+        )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+@_audited("wake_on_lan")
+def wake_on_lan(
+    client: MikrotikClient, settings: Settings, mac_address: str, interface: str, confirm: bool
+) -> WritePreview:
+    """Send a Wake-on-LAN magic packet (`/tool/wol`) for `mac_address`, out
+    `interface`.
+
+    Benign - it never changes device configuration or targets any existing
+    RouterOS row (there is nothing to resolve/verify on the device first,
+    unlike every other write tool above) - but still guarded/confirm-gated
+    like every other write here, so an LLM caller can't wake a machine "by
+    accident" any more than it can flip an interface. `mac_address`/
+    `interface` are validated for shape only (`validate_mac_address`/
+    `validate_interface_name`) - this does NOT verify `interface` exists on
+    the device first; RouterOS itself rejects an unknown interface name at
+    send time.
+    """
+    op = _require_allowed(settings, "wake_on_lan")
+
+    validated_mac = validate_mac_address(mac_address)
+    validated_interface = validate_interface_name(interface)
+
+    before: dict[str, Any] = {}
+    after = {"mac_address": validated_mac, "interface": validated_interface}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, mac_address=validated_mac, interface=validated_interface)
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

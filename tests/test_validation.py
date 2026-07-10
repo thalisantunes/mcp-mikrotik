@@ -7,6 +7,8 @@ from mcp_mikrotik.validation import (
     validate_address_list_name,
     validate_comment,
     validate_container_identifier,
+    validate_dns_name,
+    validate_dns_record_type,
     validate_dst_address,
     validate_interface_name,
     validate_ip_address,
@@ -418,3 +420,53 @@ def test_validate_route_distance_rejects_out_of_range(value: int):
 def test_validate_route_distance_rejects_non_int(value):
     with pytest.raises(ValidationError):
         validate_route_distance(value)  # type: ignore[arg-type]
+
+
+# --- validate_dns_name (v0.10) -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value", ["example.com", "blocked.example.com", "a.b.c.example.co", "xn--80ak6aa92e.com", "a"]
+)
+def test_validate_dns_name_accepts_valid(value: str):
+    assert validate_dns_name(value) == value
+
+
+def test_validate_dns_name_strips_whitespace():
+    assert validate_dns_name("  example.com  ") == "example.com"
+
+
+@pytest.mark.parametrize(
+    "value", ["", "   ", "10.0.0.1", "999.1.1.1", "example.com; reboot", "example .com", "a" * 254]
+)
+def test_validate_dns_name_rejects_invalid(value: str):
+    """"10.0.0.1"/"999.1.1.1" are rejected - a static DNS entry's `name`
+    (or a CNAME target) is a hostname, never a literal IP/IP-look-alike, so
+    - unlike validate_route_gateway's deliberate "999.1.1.1 is accepted as
+    an interface-name shape" exception - both are rejected here."""
+    with pytest.raises(ValidationError):
+        validate_dns_name(value)
+
+
+def test_validate_dns_name_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_dns_name(None)  # type: ignore[arg-type]
+
+
+# --- validate_dns_record_type (v0.10) ------------------------------------------
+
+
+@pytest.mark.parametrize("value,expected", [("A", "A"), ("a", "A"), ("CNAME", "CNAME"), ("cname", "CNAME")])
+def test_validate_dns_record_type_accepts_valid_and_normalizes_case(value: str, expected: str):
+    assert validate_dns_record_type(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "AAAA", "MX", "TXT", "NS"])
+def test_validate_dns_record_type_rejects_unsupported(value: str):
+    with pytest.raises(ValidationError):
+        validate_dns_record_type(value)
+
+
+def test_validate_dns_record_type_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_dns_record_type(None)  # type: ignore[arg-type]

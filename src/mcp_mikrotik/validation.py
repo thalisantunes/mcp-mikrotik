@@ -440,3 +440,59 @@ def validate_route_distance(value: int) -> int:
     if not (1 <= value <= 255):
         raise ValidationError(f"distance {value!r} is out of range (expected 1-255).")
     return value
+
+
+# --- v0.10: static DNS + DNS cache + DHCP lease removal + Wake-on-LAN ------
+
+
+def validate_dns_name(value: str) -> str:
+    """Validate a static DNS entry's `name` (the domain/hostname being
+    resolved, e.g. "blocked.example.com") - used by add_static_dns/
+    remove_static_dns for the entry's `name`, and (when the entry is a
+    CNAME) for the `address` parameter's CNAME-target value too.
+
+    Unlike `validate_ping_address`, a DNS static `name` (or CNAME target) is
+    never itself a literal IP address - only the hostname shape is accepted
+    here, reusing the same `_HOSTNAME`/`_has_numeric_last_label` matchers
+    `validate_ping_address` uses for its own hostname branch.
+
+    Returns the (stripped) name on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("DNS name must be a non-empty string.")
+
+    value = value.strip()
+    if len(value) > _MAX_ADDRESS_LENGTH:
+        raise ValidationError("DNS name is too long.")
+
+    if _HOSTNAME.match(value) and not _has_numeric_last_label(value):
+        return value
+
+    raise ValidationError(f"DNS name {value!r} is not a valid hostname/domain.")
+
+
+# RouterOS /ip/dns/static supports several record types (A, AAAA, CNAME,
+# MX, NS, TXT, ...); this package only exposes the two simplest and most
+# common ones for add_static_dns's `record_type` - a plain address record
+# (the default) and a CNAME alias. Extending to other types is a future
+# round's decision, not something to widen silently here.
+_DNS_RECORD_TYPES = ("A", "CNAME")
+
+
+def validate_dns_record_type(value: str) -> str:
+    """Validate a static DNS entry's `type`, used by add_static_dns/
+    remove_static_dns. Must be one of "A" (default, a plain address record)
+    or "CNAME" (an alias to another hostname). Case-insensitive on input,
+    normalized to upper-case on return (RouterOS's own field is upper-case).
+
+    Returns the normalized value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("DNS record type must be a non-empty string.")
+
+    normalized = value.strip().upper()
+    if normalized not in _DNS_RECORD_TYPES:
+        raise ValidationError(
+            f"DNS record type {value!r} is not valid (expected one of {_DNS_RECORD_TYPES})."
+        )
+    return normalized
