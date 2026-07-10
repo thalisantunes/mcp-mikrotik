@@ -13,10 +13,12 @@ no tests. See "Security model" below for how each of those is avoided here.
 
 ## Status
 
-v0: read tools for the core device inventory, plus one exemplary write tool
-(`set_identity`) that exercises the full write-guard mechanism end to end.
-More write tools (wifi, interface enable/disable, etc.) are meant to be added
-on top of the same guard - see `src/mcp_mikrotik/guard.py`.
+v0.2: read tools covering the core device inventory plus DHCP leases, DNS
+cache, firewall filter rules, wireless client registrations and system
+health, and a small set of guarded write tools (`set_identity`,
+`enable_interface`/`disable_interface`, `set_wifi_ssid`) that all go through
+the same write-guard mechanism. See `CHANGELOG.md` for what changed since
+v0.1.0, and `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
 ## Installation
 
@@ -86,15 +88,31 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `ip_addresses` | List IPv4 addresses. |
 | `ip_routes` | List the IPv4 routing table; optional `limit` (capped at 500). |
 | `neighbors` | List neighbors discovered via CDP/MNDP/LLDP. |
+| `dhcp_leases` | List DHCP server leases (address, mac, host-name, status, server, comment). |
+| `wireless_registrations` | List wireless clients currently associated to the device. Tries the ROS7 wifi registration table first, falls back to the ROS6 wireless one; returns an empty list (not an error) for a device with no radio. |
+| `dns_cache` | List cached DNS records (name, type, data, ttl). |
+| `firewall_filter` | List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules. |
+| `system_health` | System health metrics (voltage, temperature, ...), if the device exposes any; empty list otherwise. |
 | `logs` | Recent log entries; `limit` (positive, capped at 500) and optional `topics` substring filter, applied before the `limit` cut. |
 | `ping` | Ping an address from the device; `address` is validated as IPv4/IPv6/hostname before use. |
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 
 ### Write (guarded)
 
+Every write tool below requires `MIKROTIK_ALLOW_WRITE=true` and is called
+twice: once with `confirm=false` (the default) to get a before/after
+preview, and again with `confirm=true` to actually apply it. See "Security
+model" below for the full guard mechanism.
+
 | Tool | Description |
 |---|---|
-| `set_identity` | Set a device's RouterOS identity (hostname). Requires `MIKROTIK_ALLOW_WRITE=true` and `confirm=true`; see below. |
+| `set_identity` | Set a device's RouterOS identity (hostname). |
+| `enable_interface` | Enable a network interface by name (`disabled=no`). Errors if the interface name doesn't exist; never creates one. |
+| `disable_interface` | Disable a network interface by name (`disabled=yes`). Errors if the interface name doesn't exist; never creates one. |
+| `set_wifi_ssid` | Set a wireless interface's SSID. Detects whether the interface lives under the ROS7 wifi package or the ROS6 wireless package and writes to whichever one matches; errors if the interface name isn't found under either. |
+
+Not yet exposed, deliberately: device reboot and firewall rule writes. See
+"Roadmap / non-goals" below for why.
 
 ## Security model
 
@@ -106,9 +124,16 @@ Three independent controls apply to every write tool, all centralized in
    the device - the gate is checked before any read or write call is made.
 2. **Central allowlist, no generic command tool.** There is no tool that
    accepts an arbitrary API path or command. Each write operation is a
-   dedicated, named function (e.g. `set_identity`) mapped to exactly one API
-   path and action in `guard.ALLOWLIST`. There is no code path by which a
-   caller can reach an API path outside that table.
+   dedicated, named function (e.g. `set_identity`, `enable_interface`)
+   mapped to exactly one API path and action in `guard.ALLOWLIST`. There is
+   no code path by which a caller can reach an API path outside that table.
+   `set_wifi_ssid` is the one exception to "one tool, one allowlist entry":
+   because RouterOS exposes wifi under different paths depending on
+   generation (ROS7 `/interface/wifi` vs ROS6 `/interface/wireless`), it is
+   backed by *two* fixed, reviewed allowlist entries
+   (`set_wifi_ssid_ros7`/`set_wifi_ssid_ros6`), and the guard function picks
+   between them by checking which path actually has a matching interface
+   name on the device - never by accepting a path from the caller.
 3. **Explicit confirm with before/after preview.** Every write tool takes a
    `confirm: bool` parameter. With `confirm=False` (the default), the tool
    computes and returns what would change - a `before`/`after` structure -
@@ -116,6 +141,11 @@ Three independent controls apply to every write tool, all centralized in
 
 On top of the write guard:
 
+- **Never creates the target.** Write tools that operate on a named resource
+  (`enable_interface`/`disable_interface`/`set_wifi_ssid`) look it up by name
+  first. If no interface/wireless network with that name exists on the
+  device, the tool raises a clear error instead of creating one - a typo in
+  `interface_name` can never silently provision something new.
 - **Structured API, not shell commands.** All device communication goes
   through [`librouteros`](https://github.com/luqasz/librouteros)'s
   structured API (`path().select()/.add()/.update()/.remove()`, and the
@@ -167,10 +197,23 @@ in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
 `client_factory` parameter on `build_server()`.
 
-## Roadmap / non-goals for v0
+CI (`.github/workflows/ci.yml`) runs the full suite on every push/PR against
+Python 3.11 and 3.12.
 
-- Additional write tools (wifi configuration, interface enable/disable,
-  firewall rules, ...) should be added by extending `guard.ALLOWLIST` with
+## Roadmap / non-goals
+
+- Two write operations are deliberately **not** exposed yet, each because
+  the standard guard/confirm/preview mechanism isn't sufficient protection
+  on its own - see the comment above `ALLOWLIST` in `guard.py`:
+  - **Reboot** (`system/reboot`): there's no meaningful before/after preview
+    for a reboot, and a bad batch reboot across a fleet has no dry-run or
+    rollback. Needs its own confirmation/cooldown policy first.
+  - **Firewall filter writes** (`ip/firewall/filter`): a single wrong rule
+    (e.g. one that blocks the API port itself) can lock out all remote
+    management access to the device, with no way to recover it over the
+    same connection. Needs staged/rollback support (e.g. RouterOS safe
+    mode) before it belongs in the allowlist.
+- Further write tools should be added by extending `guard.ALLOWLIST` with
   one new named operation and function each - see the comment block at the
   top of `guard.py`. Do not add a generic write tool.
 - A second entrypoint that periodically polls devices and pushes metrics to

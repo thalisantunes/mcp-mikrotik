@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from librouteros.exceptions import LibRouterosError
+
 
 class FakePath:
     def __init__(self, rows: list[dict[str, Any]]):
@@ -20,6 +22,21 @@ class FakePath:
         return iter(self._rows)
 
     def update(self, **fields: Any) -> None:
+        """Mirror librouteros' Path.update(): a `set` with the given fields.
+
+        A `.id` field (present for multi-row menus like /interface, where a
+        write must target one specific row among several) selects which row
+        gets updated; no match raises, like a real device would for an
+        unknown id. Single-row menus (e.g. /system/identity) never send a
+        `.id`, so that case keeps the original "just update row 0" behaviour.
+        """
+        row_id = fields.get(".id")
+        if row_id is not None:
+            for row in self._rows:
+                if row.get(".id") == row_id:
+                    row.update(fields)
+                    return
+            raise LibRouterosError(f"no such item (id={row_id!r})")
         if self._rows:
             self._rows[0].update(fields)
         else:
@@ -41,15 +58,23 @@ class FakeConnection:
         data: dict[tuple[str, ...], list[dict[str, Any]]] | None = None,
         ping_replies: list[dict[str, Any]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
+        raise_for: dict[tuple[str, ...], Exception] | None = None,
     ):
         self._data: dict[tuple[str, ...], list[dict[str, Any]]] = dict(data or {})
         self._ping_replies = ping_replies if ping_replies is not None else []
         self._on_call = on_call
+        # Simulates a RouterOS menu that doesn't exist on this device/version
+        # (e.g. /interface/wifi on a ROS6-only box, or /system/health on a
+        # board with no sensors): path() raises the given exception instead
+        # of returning an (empty) FakePath, like a real trap error would.
+        self._raise_for: dict[tuple[str, ...], Exception] = dict(raise_for or {})
         self.closed = False
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def path(self, *segments: str) -> FakePath:
         key = tuple(segments)
+        if key in self._raise_for:
+            raise self._raise_for[key]
         rows = self._data.setdefault(key, [])
         return FakePath(rows)
 

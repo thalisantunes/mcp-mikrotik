@@ -1,9 +1,10 @@
 """MCP server entrypoint.
 
-Registers the v0 read tools plus the single exemplary write tool
-(set_identity). Transport is stdio only for v0 - this process is meant to
-run on the operator's own machine, launched by an MCP client (e.g. Claude
-Code) over stdio, with no network exposure at all.
+Registers the read tools plus every guarded write tool (set_identity,
+enable_interface/disable_interface, set_wifi_ssid - see guard.py's ALLOWLIST
+for the full write-tool inventory). Transport is stdio only - this process is
+meant to run on the operator's own machine, launched by an MCP client (e.g.
+Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -25,7 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from . import guard
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
-from .exceptions import MikrotikMCPError
+from .exceptions import DeviceCommandError, MikrotikMCPError
 from .formatting import filter_disabled, rows_to_list
 from .validation import validate_ping_address, validate_positive_limit
 
@@ -155,6 +156,66 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
 
     @mcp.tool()
     @_safe
+    def dhcp_leases(device_name: str) -> list[dict[str, Any]]:
+        """List DHCP server leases (address, mac, host-name, status, server, comment)."""
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "dhcp-server", "lease"))
+
+    @mcp.tool()
+    @_safe
+    def wireless_registrations(device_name: str) -> list[dict[str, Any]]:
+        """List wireless clients currently associated to the device (mac, signal, interface, uptime).
+
+        RouterOS exposes this under two different paths depending on
+        generation: ROS7's wifi package (/interface/wifi/registration-table)
+        or ROS6's wireless package (/interface/wireless/registration-table).
+        This tries ROS7 first, falls back to ROS6, and returns an empty list
+        - rather than raising - for a device with no wireless radio at all
+        (or the relevant package not installed), since that is a completely
+        normal, expected state for a wired-only device.
+        """
+        client = _client(device_name)
+        for segments in (
+            ("interface", "wifi", "registration-table"),
+            ("interface", "wireless", "registration-table"),
+        ):
+            try:
+                return rows_to_list(client.path(*segments))
+            except DeviceCommandError:
+                continue
+        return []
+
+    @mcp.tool()
+    @_safe
+    def dns_cache(device_name: str) -> list[dict[str, Any]]:
+        """List cached DNS records on the device (name, type, data, ttl)."""
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "dns", "cache"))
+
+    @mcp.tool()
+    @_safe
+    def firewall_filter(device_name: str) -> list[dict[str, Any]]:
+        """List IPv4 firewall filter rules (chain, action, etc). Read-only - does not add/modify/remove rules."""
+        client = _client(device_name)
+        return rows_to_list(client.path("ip", "firewall", "filter"))
+
+    @mcp.tool()
+    @_safe
+    def system_health(device_name: str) -> list[dict[str, Any]]:
+        """Read system health metrics (e.g. voltage, temperature), if the device exposes them.
+
+        Not every RouterOS device/board type has health sensors (e.g. some
+        CHR/virtual instances have none) - in that case this returns an
+        empty list instead of raising.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("system", "health"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
     def logs(device_name: str, limit: int = DEFAULT_LOG_LIMIT, topics: str | None = None) -> list[dict[str, Any]]:
         """Read recent RouterOS log entries (most recent last).
 
@@ -228,6 +289,57 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         """
         client = _client(device_name)
         preview = guard.set_identity(client, settings, new_name=new_name, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def enable_interface(device_name: str, interface_name: str, confirm: bool = False) -> dict[str, Any]:
+        """Enable a network interface by name (sets disabled=no).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        `interface_name` does not exist on the device - it is never created.
+        """
+        client = _client(device_name)
+        preview = guard.enable_interface(client, settings, interface_name=interface_name, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def disable_interface(device_name: str, interface_name: str, confirm: bool = False) -> dict[str, Any]:
+        """Disable a network interface by name (sets disabled=yes).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors clearly if
+        `interface_name` does not exist on the device - it is never created.
+        """
+        client = _client(device_name)
+        preview = guard.disable_interface(client, settings, interface_name=interface_name, confirm=confirm)
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def set_wifi_ssid(
+        device_name: str, interface_name: str, new_ssid: str, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Set a wireless interface's SSID.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Works against
+        either RouterOS generation - it looks for `interface_name` under the
+        ROS7 wifi package first, then the ROS6 wireless package - and errors
+        clearly if it isn't found under either; it is never created.
+        """
+        client = _client(device_name)
+        preview = guard.set_wifi_ssid(
+            client, settings, interface_name=interface_name, new_ssid=new_ssid, confirm=confirm
+        )
         return asdict(preview)
 
     return mcp

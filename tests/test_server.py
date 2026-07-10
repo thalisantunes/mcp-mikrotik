@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 import pytest
+from librouteros.exceptions import LibRouterosError
 from mcp.server.fastmcp.exceptions import ToolError
 
 from mcp_mikrotik.client import MikrotikClient
@@ -24,10 +25,18 @@ EXPECTED_TOOLS = {
     "ip_addresses",
     "ip_routes",
     "neighbors",
+    "dhcp_leases",
+    "wireless_registrations",
+    "dns_cache",
+    "firewall_filter",
+    "system_health",
     "logs",
     "ping",
     "list_write_operations",
     "set_identity",
+    "enable_interface",
+    "disable_interface",
+    "set_wifi_ssid",
 }
 
 
@@ -74,6 +83,85 @@ async def test_interfaces_filters_disabled_by_default(settings: Settings, fake_c
     )
     names_all = {row["name"] for row in result_all["result"]}
     assert names_all == {"ether1", "ether2"}
+
+
+@pytest.mark.asyncio
+async def test_dhcp_leases_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("dhcp_leases", {"device_name": "core-switch"})
+    assert result["result"][0]["host-name"] == "laptop-1"
+
+
+@pytest.mark.asyncio
+async def test_dns_cache_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("dns_cache", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "example.com"
+
+
+@pytest.mark.asyncio
+async def test_firewall_filter_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("firewall_filter", {"device_name": "core-switch"})
+    assert result["result"][0]["chain"] == "input"
+
+
+@pytest.mark.asyncio
+async def test_system_health_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("system_health", {"device_name": "core-switch"})
+    names = {row["name"] for row in result["result"]}
+    assert names == {"voltage", "temperature"}
+
+
+@pytest.mark.asyncio
+async def test_system_health_returns_empty_when_unsupported(settings: Settings):
+    fake = FakeConnection(raise_for={("system", "health"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("system_health", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_wireless_registrations_ros7_happy_path(settings: Settings):
+    fake = FakeConnection(
+        data={
+            ("interface", "wifi", "registration-table"): [
+                {"mac-address": "AA:BB:CC:DD:EE:01", "signal-strength": "-55dBm", "interface": "wifi1", "uptime": "1h"}
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireless_registrations", {"device_name": "core-switch"})
+    assert result["result"][0]["interface"] == "wifi1"
+
+
+@pytest.mark.asyncio
+async def test_wireless_registrations_falls_back_to_ros6(settings: Settings):
+    fake = FakeConnection(
+        raise_for={("interface", "wifi", "registration-table"): LibRouterosError("no such command")},
+        data={
+            ("interface", "wireless", "registration-table"): [
+                {"mac-address": "AA:BB:CC:DD:EE:02", "signal-strength": "-60", "interface": "wlan1", "uptime": "2h"}
+            ]
+        },
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireless_registrations", {"device_name": "core-switch"})
+    assert result["result"][0]["interface"] == "wlan1"
+
+
+@pytest.mark.asyncio
+async def test_wireless_registrations_returns_empty_when_no_radio(settings: Settings):
+    fake = FakeConnection(
+        raise_for={
+            ("interface", "wifi", "registration-table"): LibRouterosError("no such command"),
+            ("interface", "wireless", "registration-table"): LibRouterosError("no such command"),
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("wireless_registrations", {"device_name": "core-switch"})
+    assert result["result"] == []
 
 
 @pytest.mark.asyncio
@@ -130,6 +218,152 @@ async def test_set_identity_preview_then_confirm(device: Device, fake_connection
     )
     assert applied["applied"] is True
     assert fake_connection.path("system", "identity")._rows == [{"name": "renamed"}]
+
+
+# --- enable_interface / disable_interface --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enable_interface_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_interface", {"device_name": "core-switch", "interface_name": "ether2", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+    # Device was never touched.
+    rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
+    assert rows == {"ether1": "false", "ether2": "true"}
+
+
+@pytest.mark.asyncio
+async def test_disable_interface_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "disable_interface", {"device_name": "core-switch", "interface_name": "ether1", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_enable_interface_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "enable_interface", {"device_name": "core-switch", "interface_name": "ether2", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["disabled"] == "true"
+    assert preview["after"]["disabled"] == "no"
+    # Preview must not have touched the device.
+    rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
+    assert rows["ether2"] == "true"
+
+    _content, applied = await mcp.call_tool(
+        "enable_interface", {"device_name": "core-switch", "interface_name": "ether2", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
+    assert rows == {"ether1": "false", "ether2": "no"}
+
+
+@pytest.mark.asyncio
+async def test_disable_interface_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "disable_interface", {"device_name": "core-switch", "interface_name": "ether1", "confirm": True}
+    )
+    assert applied["applied"] is True
+    rows = {row["name"]: row["disabled"] for row in fake_connection.path("interface")._rows}
+    assert rows == {"ether1": "yes", "ether2": "true"}
+
+
+@pytest.mark.asyncio
+async def test_enable_interface_unknown_interface_raises_clear_error(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "enable_interface", {"device_name": "core-switch", "interface_name": "ghost0", "confirm": False}
+        )
+    assert "ghost0" in str(exc_info.value)
+    # Nothing was created.
+    names = {row["name"] for row in fake_connection.path("interface")._rows}
+    assert names == {"ether1", "ether2"}
+
+
+# --- set_wifi_ssid ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_wifi_ssid_blocked_read_only_by_default(settings: Settings):
+    fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wifi_ssid",
+            {"device_name": "core-switch", "interface_name": "wifi1", "new_ssid": "new-ssid", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_wifi_ssid_ros7_preview_then_confirm(device: Device):
+    fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_wifi_ssid",
+        {"device_name": "core-switch", "interface_name": "wifi1", "new_ssid": "new-ssid", "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["operation"] == "set_wifi_ssid_ros7"
+    assert fake.path("interface", "wifi")._rows[0]["ssid"] == "old-ssid"
+
+    _content, applied = await mcp.call_tool(
+        "set_wifi_ssid",
+        {"device_name": "core-switch", "interface_name": "wifi1", "new_ssid": "new-ssid", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert fake.path("interface", "wifi")._rows[0]["ssid"] == "new-ssid"
+
+
+@pytest.mark.asyncio
+async def test_set_wifi_ssid_falls_back_to_ros6_when_ros7_path_unsupported(device: Device):
+    fake = FakeConnection(
+        raise_for={("interface", "wifi"): LibRouterosError("no such command")},
+        data={("interface", "wireless"): [{".id": "*1", "name": "wlan1", "ssid": "old-ssid"}]},
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "set_wifi_ssid",
+        {"device_name": "core-switch", "interface_name": "wlan1", "new_ssid": "new-ssid", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert applied["operation"] == "set_wifi_ssid_ros6"
+    assert fake.path("interface", "wireless")._rows[0]["ssid"] == "new-ssid"
+
+
+@pytest.mark.asyncio
+async def test_set_wifi_ssid_unknown_interface_raises_clear_error(device: Device):
+    fake = FakeConnection(data={("interface", "wifi"): [{".id": "*1", "name": "wifi1", "ssid": "old-ssid"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wifi_ssid",
+            {"device_name": "core-switch", "interface_name": "ghost-radio", "new_ssid": "x", "confirm": False},
+        )
+    assert "ghost-radio" in str(exc_info.value)
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------

@@ -57,6 +57,23 @@ class WriteDisabledError(MikrotikMCPError):
         self.operation = operation
 
 
+class ResourceNotFoundError(MikrotikMCPError):
+    """A named resource (interface, wireless network, ...) does not exist on the device.
+
+    Raised by guard.py write functions when the caller-supplied name (e.g. an
+    interface to enable/disable, or a wifi/wireless interface to rename)
+    doesn't match any row on the device. Write tools must never create the
+    resource in that case - this signals "no such thing here", not "make
+    one".
+    """
+
+    def __init__(self, device_name: str, resource_kind: str, resource_name: str):
+        super().__init__(f"{resource_kind} {resource_name!r} not found on device {device_name!r}.")
+        self.device_name = device_name
+        self.resource_kind = resource_kind
+        self.resource_name = resource_name
+
+
 class GuardViolationError(MikrotikMCPError):
     """A write operation was requested that is not present in the write allowlist.
 

@@ -41,6 +41,27 @@ def fake_connection() -> FakeConnection:
                 {".id": "*1", "time": "10:00:00", "topics": "system,info", "message": "boot"},
                 {".id": "*2", "time": "10:00:05", "topics": "interface,link", "message": "ether1 up"},
             ],
+            ("ip", "dhcp-server", "lease"): [
+                {
+                    ".id": "*1",
+                    "address": "10.0.0.50",
+                    "mac-address": "AA:BB:CC:DD:EE:01",
+                    "host-name": "laptop-1",
+                    "status": "bound",
+                    "server": "dhcp1",
+                    "comment": "",
+                }
+            ],
+            ("ip", "dns", "cache"): [
+                {"name": "example.com", "type": "A", "data": "93.184.216.34", "ttl": "1h"}
+            ],
+            ("ip", "firewall", "filter"): [
+                {".id": "*1", "chain": "input", "action": "accept", "comment": "allow established"}
+            ],
+            ("system", "health"): [
+                {"name": "voltage", "value": "24.1", "type": "V"},
+                {"name": "temperature", "value": "38", "type": "C"},
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},

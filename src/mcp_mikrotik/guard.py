@@ -33,7 +33,7 @@ from typing import Any
 
 from .client import MikrotikClient
 from .config import Settings
-from .exceptions import GuardViolationError, WriteDisabledError
+from .exceptions import DeviceCommandError, GuardViolationError, ResourceNotFoundError, WriteDisabledError
 
 
 @dataclass(frozen=True)
@@ -51,9 +51,48 @@ ALLOWLIST: dict[str, WriteOperation] = {
         action="update",
         description="Set the RouterOS device identity (hostname shown in WinBox/CLI).",
     ),
-    # --- Next iteration adds entries here (e.g. wifi, interface enable/disable),
-    # each with its own WriteOperation + dedicated function. See module
-    # docstring above for the steps.
+    "enable_interface": WriteOperation(
+        name="enable_interface",
+        path=("interface",),
+        action="update",
+        description="Enable a network interface by name (sets disabled=no).",
+    ),
+    "disable_interface": WriteOperation(
+        name="disable_interface",
+        path=("interface",),
+        action="update",
+        description="Disable a network interface by name (sets disabled=yes).",
+    ),
+    # set_wifi_ssid is exposed as ONE server.py tool, but a device may speak
+    # either of these two RouterOS generations - see set_wifi_ssid() below,
+    # which detects which one the target interface actually lives under and
+    # dispatches through that (and only that) allowlisted operation. Both
+    # entries stay individually named/reviewable; nothing here accepts an
+    # arbitrary path.
+    "set_wifi_ssid_ros7": WriteOperation(
+        name="set_wifi_ssid_ros7",
+        path=("interface", "wifi"),
+        action="update",
+        description="Set the SSID of a ROS7 wifi-package interface (/interface/wifi).",
+    ),
+    "set_wifi_ssid_ros6": WriteOperation(
+        name="set_wifi_ssid_ros6",
+        path=("interface", "wireless"),
+        action="update",
+        description="Set the SSID of a ROS6 wireless-package interface (/interface/wireless).",
+    ),
+    # --- Deliberately NOT added yet - each needs extra policy beyond the
+    # standard guard before it would be safe to expose:
+    #   * reboot ("system/reboot"): no before/after preview is meaningful for
+    #     a reboot, and a bad batch reboot across a fleet has no dry-run or
+    #     rollback. Needs its own confirmation/cooldown policy first.
+    #   * firewall filter writes ("ip/firewall/filter"): a single wrong rule
+    #     (e.g. an add/update that blocks the API port itself) can lock out
+    #     all management access to the device with no remote recovery. Needs
+    #     staged/rollback support (e.g. RouterOS safe mode) before it belongs
+    #     in this allowlist.
+    # --- Next iteration adds entries here, each with its own WriteOperation
+    # + dedicated function. See module docstring above for the steps.
 }
 
 
@@ -105,4 +144,116 @@ def set_identity(client: MikrotikClient, settings: Settings, new_name: str, conf
     # integrity as more operations are added.
     write = getattr(client, op.action)
     write(*op.path, name=new_name)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def _find_row_by_field(rows: list[dict[str, Any]], field: str, value: str) -> dict[str, Any] | None:
+    """First row whose `field` equals `value`, or None. Used to resolve a
+    caller-supplied name (interface, wifi/wireless network, ...) to the
+    specific RouterOS row a write must target, without ever letting the
+    caller supply a raw `.id` or path directly."""
+    for row in rows:
+        if row.get(field) == value:
+            return row
+    return None
+
+
+def _set_interface_disabled(
+    client: MikrotikClient,
+    settings: Settings,
+    operation_name: str,
+    interface_name: str,
+    disabled: bool,
+    confirm: bool,
+) -> WritePreview:
+    """Shared implementation behind enable_interface/disable_interface.
+
+    Both are the same RouterOS operation (set /interface disabled=yes|no by
+    name) with only the target value flipped, so they share this body while
+    staying two distinct, individually named ALLOWLIST entries/tools.
+    """
+    op = _require_allowed(settings, operation_name)
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", interface_name)
+    if row is None:
+        # Never create an interface - a name that doesn't exist is an error,
+        # not an implicit "add".
+        raise ResourceNotFoundError(client.device.name, "Interface", interface_name)
+
+    before = dict(row)
+    after = dict(row)
+    after["disabled"] = "yes" if disabled else "no"
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "disabled": after["disabled"]})
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+def enable_interface(client: MikrotikClient, settings: Settings, interface_name: str, confirm: bool) -> WritePreview:
+    """Enable a network interface by name (sets disabled=no). Errors if the
+    interface name doesn't exist on the device; never creates one."""
+    return _set_interface_disabled(
+        client, settings, "enable_interface", interface_name, disabled=False, confirm=confirm
+    )
+
+
+def disable_interface(client: MikrotikClient, settings: Settings, interface_name: str, confirm: bool) -> WritePreview:
+    """Disable a network interface by name (sets disabled=yes). Errors if the
+    interface name doesn't exist on the device; never creates one."""
+    return _set_interface_disabled(
+        client, settings, "disable_interface", interface_name, disabled=True, confirm=confirm
+    )
+
+
+def set_wifi_ssid(
+    client: MikrotikClient, settings: Settings, interface_name: str, new_ssid: str, confirm: bool
+) -> WritePreview:
+    """Set a wireless interface's SSID, on either RouterOS generation.
+
+    The read-only gate is identical for both candidate operations, so it is
+    checked once up front (anchored on the ROS7 entry purely to reuse
+    _require_allowed's ALLOWLIST/gate check) before anything is read from the
+    device, exactly like every other guarded write.
+
+    Which underlying path is actually touched is then decided by looking for
+    `interface_name` first under /interface/wifi (ROS7), then under
+    /interface/wireless (ROS6) - mirroring server.py's wireless_registrations
+    read tool's own ROS7-then-ROS6 fallback. A device that doesn't have a
+    given package installed at all raises DeviceCommandError from
+    client.path(); that is treated the same as "not found here" and the next
+    candidate is tried, so a non-wifi device or a ROS6-only device never
+    produces a confusing transport error - only a clear "not found" once both
+    candidates are exhausted, or a WritePreview from whichever one matched.
+    """
+    _require_allowed(settings, "set_wifi_ssid_ros7")
+
+    op = None
+    row = None
+    for operation_name in ("set_wifi_ssid_ros7", "set_wifi_ssid_ros6"):
+        candidate_op = ALLOWLIST[operation_name]
+        try:
+            candidate_rows = client.path(*candidate_op.path)
+        except DeviceCommandError:
+            continue
+        candidate_row = _find_row_by_field(candidate_rows, "name", interface_name)
+        if candidate_row is not None:
+            op, row = candidate_op, candidate_row
+            break
+
+    if row is None or op is None:
+        raise ResourceNotFoundError(client.device.name, "Wireless interface", interface_name)
+
+    before = dict(row)
+    after = dict(row)
+    after["ssid"] = new_ssid
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **{".id": row.get(".id"), "ssid": new_ssid})
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
