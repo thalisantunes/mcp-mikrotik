@@ -7,13 +7,15 @@ remove_from_address_list, set_poe_out, start_container/stop_container,
 set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule,
-add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer - see
-guard.py's ALLOWLIST for the full write-tool inventory), plus the read-only
-connection_tracking tool (v0.11), the read-only security_audit/
-security_events tools (v0.12 - see security.py), and the read-only
-wireguard_interfaces tool (v0.13). Transport is stdio only - this process is
-meant to run on the operator's own machine, launched by an MCP client (e.g.
-Claude Code) over stdio, with no network exposure at all.
+add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
+add_hotspot_user, create_backup - see guard.py's ALLOWLIST for the full
+write-tool inventory), plus the read-only connection_tracking tool (v0.11),
+the read-only security_audit/security_events tools (v0.12 - see
+security.py), the read-only wireguard_interfaces tool (v0.13), and (v0.14,
+the last feature round before 1.0) three more read-only tools -
+hotspot_active, torch, list_backups. Transport is stdio only - this process
+is meant to run on the operator's own machine, launched by an MCP client
+(e.g. Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -78,6 +80,13 @@ MAX_CONNTRACK_LIMIT = 100
 # just pre-filtered to security-relevant rows (see security.py).
 DEFAULT_SECURITY_EVENTS_LIMIT = 50
 MAX_SECURITY_EVENTS_LIMIT = 500
+# v0.14: torch's hard result cap - regardless of how many flows RouterOS
+# reports for the requested instant, at most this many are ever returned
+# (the biggest talkers by tx+rx bytes first) - same "cap it, tell the caller
+# how many really matched" shape as connection_tracking's MAX_CONNTRACK_LIMIT
+# above. A live traffic snapshot on a busy interface can carry far more rows
+# than an LLM caller's context/token budget can sensibly absorb.
+MAX_TORCH_LIMIT = 50
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
@@ -812,6 +821,117 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         except DeviceCommandError:
             disks = []
         return {"usb_ports": usb_ports, "disks": disks}
+
+    # --- v0.14: hotspot vouchers, live traffic (torch), backup -------------
+
+    @mcp.tool()
+    @_safe
+    def hotspot_active(device_name: str) -> list[dict[str, Any]]:
+        """List clients currently logged into the RouterOS hotspot
+        (`/ip/hotspot/active`): `user`, `address`, `mac-address`, `uptime`,
+        `bytes-in`/`bytes-out` - who is on the hotspot right now, and how
+        much they've each moved this session.
+
+        Returns an empty list (never an error) for a device with no hotspot
+        server configured, or simply no one logged in right now - same
+        convention as `ppp_active`/`ipsec_active_peers` for an optional
+        feature with no active sessions.
+        """
+        client = _client(device_name)
+        try:
+            return rows_to_list(client.path("ip", "hotspot", "active"))
+        except DeviceCommandError:
+            return []
+
+    @mcp.tool()
+    @_safe
+    def torch(
+        device_name: str,
+        interface: str,
+        src_address: str | None = None,
+        dst_address: str | None = None,
+        port: int | None = None,
+    ) -> dict[str, Any]:
+        """Live traffic snapshot of one `interface`
+        (`/tool/torch interface=<interface> once=yes`) - RouterOS's own
+        real-time traffic monitor, useful to answer "who is consuming
+        bandwidth on this link RIGHT NOW". `interface` is validated for
+        shape (`validate_interface_name`) before it is ever sent to the
+        device - existence isn't checked separately, so a typo'd/unknown
+        interface name simply produces whatever error RouterOS itself
+        returns.
+
+        `src_address`/`dst_address` (plain IPv4/IPv6 addresses -
+        `validate_ip_address`) and `port` (1-65535 -
+        `validate_conntrack_dst_port`, reused here for the same "TCP/UDP
+        port" shape) are all optional filters forwarded to RouterOS itself,
+        narrowing the snapshot BEFORE it ever leaves the device - use them
+        to cut down volume on a busy interface rather than fetching every
+        flow and filtering client-side.
+
+        `once=yes` makes this a single instantaneous snapshot, not a
+        continuous stream (same "once" convention as `interface_traffic`/
+        `poe_status`/`lte_status` - see `client.MikrotikClient.torch`), so
+        the call always returns promptly instead of opening RouterOS's
+        normal interactive torch stream.
+
+        VOLUME CAP: regardless of how many flows RouterOS reports for this
+        snapshot, the result's `flows` list is sorted by total traffic
+        (tx+rx bytes, biggest first - the "top talkers") and hard-capped at
+        `MAX_TORCH_LIMIT` (50) entries - `truncated` is `true` whenever more
+        flows matched than were returned, and `total_matched` always reports
+        the real (pre-cap) count. RouterOS's own torch field names for a
+        flow's traffic volume aren't perfectly uniform across RouterOS
+        versions/hardware - this sorts by whichever of `tx`/`rx` (bits- or
+        bytes-per-second, depending on version) the device actually
+        returned, defaulting a flow with neither to 0 (sorted last) rather
+        than failing the whole call over one unexpected row shape.
+        """
+        validated_interface = validate_interface_name(interface)
+        validated_src = validate_ip_address(src_address) if src_address else None
+        validated_dst = validate_ip_address(dst_address) if dst_address else None
+        validated_port = validate_conntrack_dst_port(port) if port is not None else None
+
+        client = _client(device_name)
+        rows = client.torch(
+            validated_interface, src_address=validated_src, dst_address=validated_dst, port=validated_port
+        )
+
+        def _traffic_volume(row: dict[str, Any]) -> int:
+            total = 0
+            for key in ("tx", "rx"):
+                try:
+                    total += int(row.get(key, 0))
+                except (TypeError, ValueError):
+                    continue
+            return total
+
+        sorted_rows = sorted(rows, key=_traffic_volume, reverse=True)
+        total_matched = len(sorted_rows)
+        return {
+            "flows": sorted_rows[:MAX_TORCH_LIMIT],
+            "total_matched": total_matched,
+            "truncated": total_matched > MAX_TORCH_LIMIT,
+        }
+
+    @mcp.tool()
+    @_safe
+    def list_backups(device_name: str) -> list[dict[str, Any]]:
+        """List backup files stored on the device (`/file`, filtered to
+        names ending in `.backup`): `name`, `size`, `creation-time`.
+
+        Reads the same `/file` menu `create_backup`'s duplicate-name check
+        uses - call this after `create_backup` to confirm a new backup
+        landed and see its real size. Returns an empty list (never an
+        error) if the device has no backup files at all.
+        """
+        client = _client(device_name)
+        rows = rows_to_list(client.path("file"))
+        return [
+            {"name": row.get("name"), "size": row.get("size"), "creation-time": row.get("creation-time")}
+            for row in rows
+            if str(row.get("name", "")).endswith(".backup")
+        ]
 
     @mcp.tool()
     @_safe
@@ -1643,6 +1763,107 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.remove_wireguard_peer(
             client, settings, interface=interface, public_key=public_key, comment=comment, confirm=confirm
         )
+        return asdict(preview)
+
+    # --- v0.14: hotspot vouchers + backup --------------------------------
+
+    @mcp.tool()
+    @_safe
+    def add_hotspot_user(
+        device_name: str,
+        name: str,
+        password: str,
+        profile: str | None = None,
+        limit_uptime: str | None = None,
+        limit_bytes_total: int | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a hotspot voucher user (`/ip/hotspot/user add`) for a
+        visitor - `name`/`password` are the login credentials; `profile`
+        (an existing hotspot user profile), `limit_uptime` (a RouterOS
+        duration, e.g. "01:00:00"), and `limit_bytes_total` (a positive
+        integer byte quota) are all optional.
+
+        QR/VOUCHER: the result always also includes `username`, `password`
+        (the plaintext voucher credentials - THIS IS THE POINT: the visitor
+        needs them), and `qr_payload` - a plain STRING the caller renders as
+        a QR code itself; this package deliberately does NOT generate a QR
+        IMAGE (no extra imaging dependency). Format chosen for `qr_payload`:
+        `"<username>:<password>"` - a plain, self-describing credential
+        pair, NOT a login URL and NOT a `WIFI:` payload. Two alternatives
+        were considered and rejected: a login URL
+        (`http://<hotspot>/login?username=..&password=..`) would need a
+        reliably-known hotspot LAN address, which this package has no way to
+        determine for an arbitrary device/deployment - and RouterOS's actual
+        captive-portal login is normally a POST with additional
+        session-specific tokens (`chap-id`/`chap-challenge`), so a bare GET
+        URL with a plaintext password wouldn't even reliably work; a `WIFI:`
+        payload is for auto-joining a WPA network, which is a different
+        credential than a hotspot LOGIN (walled-garden HTTP auth) entirely.
+        `username:password` makes no claim about network topology or login
+        mechanics that could be wrong for a given deployment - a caller
+        integrating with a specific captive portal can build its own login
+        URL from these two fields plus its own known portal address.
+
+        PASSWORD IN THE JOURNAL: unlike every secret this package has
+        handled before (a device password, a WireGuard private-key), this
+        tool's `password` is DELIBERATELY present in its result - but still
+        never written to the audit journal. See `guard.add_hotspot_user`'s
+        docstring for exactly how that asymmetry holds.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview (including `qr_payload`) without changing
+        anything; call again with confirm=True to actually create it.
+        Errors clearly (without creating anything) if `name` already exists
+        on the device - it never creates a duplicate or resets an existing
+        voucher's password.
+        """
+        client = _client(device_name)
+        preview = guard.add_hotspot_user(
+            client,
+            settings,
+            name=name,
+            password=password,
+            profile=profile,
+            limit_uptime=limit_uptime,
+            limit_bytes_total=limit_bytes_total,
+            confirm=confirm,
+        )
+        result = asdict(preview)
+        voucher_username = preview.after.get("name")
+        voucher_password = preview.after.get("password")
+        result["username"] = voucher_username
+        result["password"] = voucher_password
+        result["qr_payload"] = f"{voucher_username}:{voucher_password}"
+        return result
+
+    @mcp.tool()
+    @_safe
+    def create_backup(
+        device_name: str, name: str, password: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Create a RouterOS system backup file (`/system/backup/save
+        name=<name>`) - captures the device's full configuration into one
+        binary `.backup` file on its own storage. Use `list_backups`
+        afterward to confirm it landed and see its real size/creation-time.
+
+        `password`, if given, is RouterOS's own backup-FILE encryption
+        option (unrelated to any device/API credential) - forwarded to the
+        device, but NEVER included in the returned preview, and never
+        journaled. See `guard.create_backup`'s docstring for how that
+        redaction is enforced.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview of the file that would be created without
+        changing anything; call again with confirm=True to actually create
+        it. Errors clearly (without creating anything) if a `.backup` file
+        matching `name` already exists on the device - it never silently
+        overwrites one.
+        """
+        client = _client(device_name)
+        preview = guard.create_backup(client, settings, name=name, password=password, confirm=confirm)
         return asdict(preview)
 
     return mcp

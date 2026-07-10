@@ -123,6 +123,83 @@ def test_lte_monitor_retries_on_transient_oserror_and_succeeds(device: Device):
     assert flaky.calls_made == 2
 
 
+# --- v0.14: torch (live traffic snapshot - a MULTI-row "once" command) -----
+
+
+def test_torch_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    rows = client.torch("ether1")
+    assert len(rows) == 2
+    assert rows[0]["src-address"] == "10.0.0.50"
+    assert fake_connection.calls == [("/tool/torch", {"interface": "ether1", "once": ""})]
+
+
+def test_torch_sends_optional_filters_as_structured_params(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    client.torch("ether1", src_address="10.0.0.50", dst_address="8.8.8.8", port=443)
+    assert fake_connection.calls == [
+        (
+            "/tool/torch",
+            {
+                "interface": "ether1",
+                "once": "",
+                "src-address": "10.0.0.50",
+                "dst-address": "8.8.8.8",
+                "port": "443",
+            },
+        )
+    ]
+
+
+def test_torch_omits_filters_that_were_not_given(client: MikrotikClient, fake_connection: FakeConnection):
+    client.torch("ether1")
+    _cmd, kwargs = fake_connection.calls[-1]
+    assert "src-address" not in kwargs
+    assert "dst-address" not in kwargs
+    assert "port" not in kwargs
+
+
+def test_torch_returns_empty_list_when_device_replies_nothing(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    assert client.torch("ether2") == []
+
+
+def test_fake_connection_returns_a_generator_not_a_list_for_torch(fake_connection: FakeConnection):
+    """Same v0.7.1-style regression guard as monitor_traffic/poe_monitor/
+    lte_monitor above, but for torch's MULTI-row reply: the fake must hand
+    back a generator (truthy-but-empty, not subscriptable), never a real
+    list - otherwise a regression to unmaterialized indexing in client.py's
+    torch() couldn't be caught by this suite."""
+    import types
+
+    result = fake_connection("/tool/torch", interface="ether1", once="")
+    assert isinstance(result, types.GeneratorType)
+    assert bool(result) is True
+    with pytest.raises(TypeError):
+        result[0]
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_torch_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.torch("ether1")
+    assert device.name in str(exc_info.value)
+
+
+def test_torch_retries_on_transient_oserror_and_succeeds(device: Device):
+    flaky = FlakyConnection(OSError("link blip"), fail_times=1)
+    client = MikrotikClient(device, connection=flaky)
+
+    rows = client.torch("ether1")
+
+    assert rows == []
+    assert flaky.calls_made == 2
+
+
 # --- Regression: librouteros' callable connection form returns a GENERATOR,
 # not a list, for monitor-once commands. `replies[0] if replies else {}` on
 # the raw generator raised `TypeError: 'generator' object is not
@@ -262,6 +339,44 @@ def test_wol_wraps_transport_errors_as_device_command_error(device: Device, exc:
     client = MikrotikClient(device, connection=TransportErrorConnection(exc))
     with pytest.raises(DeviceCommandError) as exc_info:
         client.wol("tool", mac_address="AA:BB:CC:DD:EE:FF", interface="ether1")
+    assert device.name in str(exc_info.value)
+
+
+# --- v0.14: save (RouterOS ACTION command - backup creation, callable form) -
+
+
+def test_save_forwards_structured_params_not_a_command_string(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    client.save("system", "backup", name="core-switch-2026-01-01")
+    assert fake_connection.calls == [
+        ("/system/backup/save", {"name": "core-switch-2026-01-01"})
+    ]
+
+
+def test_save_forwards_password_as_structured_param_when_given(
+    client: MikrotikClient, fake_connection: FakeConnection
+):
+    client.save("system", "backup", name="core-switch-2026-01-01", password="s3cr3t-file-key")
+    assert fake_connection.calls == [
+        (
+            "/system/backup/save",
+            {"name": "core-switch-2026-01-01", "password": "s3cr3t-file-key"},
+        )
+    ]
+
+
+def test_save_omits_password_field_when_not_given(client: MikrotikClient, fake_connection: FakeConnection):
+    client.save("system", "backup", name="core-switch-2026-01-01")
+    _cmd, kwargs = fake_connection.calls[-1]
+    assert "password" not in kwargs
+
+
+@pytest.mark.parametrize("exc", [OSError("link down"), LibRouterosError("boom")])
+def test_save_wraps_transport_errors_as_device_command_error(device: Device, exc: Exception):
+    client = MikrotikClient(device, connection=TransportErrorConnection(exc))
+    with pytest.raises(DeviceCommandError) as exc_info:
+        client.save("system", "backup", name="core-switch-2026-01-01")
     assert device.name in str(exc_info.value)
 
 

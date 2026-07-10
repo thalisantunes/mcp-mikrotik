@@ -235,11 +235,13 @@ def test_journal_never_leaks_device_password_across_every_write_tool(
         public_key="OaQx4l1wQNnz9J+odnvI4yyND+HG699QWpM8fL1XAO0=",
         confirm=True,
     )
+    guard.add_hotspot_user(client, settings_write_enabled, name="sweep-visitor", password="Passw0rd!", confirm=True)
+    guard.create_backup(client, settings_write_enabled, name="sweep-backup", password="file-key", confirm=True)
 
     raw = audit_log.read_text(encoding="utf-8")
     assert "s3cret" not in raw
     events = _events(audit_log)
-    assert len(events) == 27
+    assert len(events) == 29
     for event in events:
         assert "s3cret" not in json.dumps(event)
 
@@ -1006,3 +1008,159 @@ def test_remove_wireguard_peer_not_found_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "remove_wireguard_peer"
+
+
+# --- add_hotspot_user / create_backup (v0.14) -------------------------------
+
+
+def test_add_hotspot_user_confirmed_call_journals_outcome_applied(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.add_hotspot_user(
+        client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_hotspot_user"
+    assert event["operation"] == "add_hotspot_user"
+    assert event["action"] == "add"
+    assert event["summary"]["after"]["name"] == "visitor2"
+
+
+def test_add_hotspot_user_password_never_in_audit_journal(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """THE deliberate asymmetry this round introduces: unlike every secret
+    this package has handled before (a device password, a WireGuard
+    private-key - never returned to any caller at all), a hotspot voucher's
+    `password` is DELIBERATELY present in what guard.add_hotspot_user
+    returns (see its own docstring - the caller needs it to hand to a
+    visitor). It must still never reach the audit journal. Proven on both
+    outcomes: the returned WritePreview DOES carry the password, but the
+    journal - fed the exact same before/after by `_audited` - does not."""
+    preview = guard.add_hotspot_user(
+        client, settings_write_enabled, name="visitor2", password="Sup3rSecretVoucher!", confirm=True
+    )
+    # (a) the tool's own return value DOES carry the password - this is the
+    # whole point of the tool, not a bug.
+    assert preview.after["password"] == "Sup3rSecretVoucher!"
+
+    # (b) the audit journal does not - anywhere, in before or after.
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "Sup3rSecretVoucher!" not in raw
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert "password" not in events[0]["summary"]["after"]
+    assert events[0]["summary"]["after"]["name"] == "visitor2"
+
+
+def test_add_hotspot_user_password_never_in_audit_journal_on_preview(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Same asymmetry as the applied case above, but for a confirm=False
+    preview - the password must be absent from the journal there too, even
+    though it's present in the preview's own `after`."""
+    preview = guard.add_hotspot_user(
+        client, settings_write_enabled, name="visitor2", password="Sup3rSecretVoucher!", confirm=False
+    )
+    assert preview.after["password"] == "Sup3rSecretVoucher!"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "Sup3rSecretVoucher!" not in raw
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert "password" not in events[0]["summary"]["after"]
+
+
+def test_add_hotspot_user_duplicate_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_hotspot_user(
+            client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 2
+    assert events[1]["outcome"] == "error"
+    assert events[1]["operation"] == "add_hotspot_user"
+
+
+def test_add_hotspot_user_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.add_hotspot_user(client, settings, name="visitor2", password="Passw0rd!", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_hotspot_user"
+
+
+def test_create_backup_confirmed_call_journals_outcome_applied_without_leaking_device_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings, device: Device
+):
+    guard.create_backup(client, settings_write_enabled, name="nightly-backup", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "create_backup"
+    assert event["operation"] == "create_backup"
+    assert event["action"] == "save"
+    assert event["summary"]["after"]["name"] == "nightly-backup"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert device.password not in raw
+
+
+def test_create_backup_encryption_password_never_in_audit_journal(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Unlike add_hotspot_user's voucher password, create_backup's
+    `password` (RouterOS's own backup-FILE encryption option) is NOT
+    returned to the caller either - redacted before the WritePreview is
+    ever constructed, same "redact before constructing the preview" rule
+    v0.13's WireGuard round established. Never in the journal, never in the
+    returned preview."""
+    preview = guard.create_backup(
+        client, settings_write_enabled, name="nightly-backup", password="file-encrypt-key", confirm=True
+    )
+    assert "password" not in preview.after
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "file-encrypt-key" not in raw
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert "password" not in events[0]["summary"]["after"]
+
+
+def test_create_backup_duplicate_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.create_backup(client, settings_write_enabled, name="core-switch-2026-01-01", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "create_backup"
+
+
+def test_create_backup_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.create_backup(client, settings, name="nightly-backup", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "create_backup"

@@ -295,6 +295,25 @@ def fake_connection() -> FakeConnection:
                     "disabled": "false",
                 }
             ],
+            # v0.14: hotspot vouchers + backup.
+            ("ip", "hotspot", "active"): [
+                {
+                    ".id": "*1",
+                    "user": "visitor1",
+                    "address": "10.5.0.10",
+                    "mac-address": "AA:BB:CC:DD:EE:80",
+                    "uptime": "12m30s",
+                    "bytes-in": "1048576",
+                    "bytes-out": "5242880",
+                }
+            ],
+            # A mix of backup and non-backup files, so list_backups' own
+            # filtering can be exercised against the shared fixture too, not
+            # just a dedicated FakeConnection.
+            ("file",): [
+                {".id": "*1", "name": "core-switch-2026-01-01.backup", "size": "524288", "creation-time": "jan/01/2026 00:00:00"},
+                {".id": "*2", "name": "flash/skins", "type": "directory"},
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},
@@ -338,6 +357,12 @@ def fake_connection() -> FakeConnection:
                 "registration-status": "registered",
                 "cell-id": "12345678",
             },
+        },
+        torch_replies={
+            "ether1": [
+                {"src-address": "10.0.0.50", "dst-address": "93.184.216.34", "protocol": "tcp", "tx": "500000", "rx": "1500000"},
+                {"src-address": "10.0.0.60", "dst-address": "8.8.8.8", "protocol": "udp", "tx": "1000", "rx": "2000"},
+            ],
         },
     )
 

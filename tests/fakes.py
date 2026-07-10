@@ -111,6 +111,17 @@ def _once_reply_stream(reply: dict[str, Any] | None):
         yield dict(reply)
 
 
+def _multi_reply_stream(rows: list[dict[str, Any]]):
+    """Same generator-not-list shape as `_once_reply_stream`, but for a
+    `once=` command that can genuinely reply with MORE than one row -
+    v0.14's `/tool/torch` (a live traffic snapshot: one row per flow), as
+    opposed to monitor_traffic/poe_monitor/lte_monitor's single-row replies.
+    Callers (client.py's `torch`) must call list(...) on the result before
+    inspecting it, same v0.7.1 lesson as `_once_reply_stream`."""
+    for row in rows:
+        yield dict(row)
+
+
 class FakeConnection:
     """Stand-in for a connected librouteros.Api, entirely in memory."""
 
@@ -122,6 +133,7 @@ class FakeConnection:
         monitor_traffic_replies: dict[str, dict[str, Any]] | None = None,
         poe_monitor_replies: dict[str, dict[str, Any]] | None = None,
         lte_monitor_replies: dict[str, dict[str, Any]] | None = None,
+        torch_replies: dict[str, list[dict[str, Any]]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
     ):
@@ -137,6 +149,10 @@ class FakeConnection:
         self._monitor_traffic_replies: dict[str, dict[str, Any]] = dict(monitor_traffic_replies or {})
         self._poe_monitor_replies: dict[str, dict[str, Any]] = dict(poe_monitor_replies or {})
         self._lte_monitor_replies: dict[str, dict[str, Any]] = dict(lte_monitor_replies or {})
+        # v0.14: keyed by interface name like the three above, but each value
+        # is a LIST of flow rows (a torch snapshot can genuinely report many
+        # flows for one interface) rather than a single dict.
+        self._torch_replies: dict[str, list[dict[str, Any]]] = dict(torch_replies or {})
         self._on_call = on_call
         # Simulates a RouterOS menu that doesn't exist on this device/version
         # (e.g. /interface/wifi on a ROS6-only box, or /system/health on a
@@ -167,6 +183,15 @@ class FakeConnection:
             return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
         if cmd == "/interface/lte/monitor":
             return _once_reply_stream(self._lte_monitor_replies.get(kwargs.get("interface")))
+        if cmd == "/tool/torch":
+            return _multi_reply_stream(self._torch_replies.get(kwargs.get("interface"), []))
+        if cmd == "/system/backup/save":
+            # v0.14: MikrotikClient.save() - a fire-and-forget ACTION command
+            # with no meaningful reply, same empty-generator shape as the DNS
+            # cache flush/WoL below (client.py's create_backup deliberately
+            # never re-reads the created file - see guard.create_backup's
+            # docstring).
+            return _once_reply_stream(None)
         if cmd == "/ip/dns/cache/flush":
             # v0.10: MikrotikClient.flush() - a fire-and-forget ACTION
             # command with no meaningful reply. Reuses _once_reply_stream(None)

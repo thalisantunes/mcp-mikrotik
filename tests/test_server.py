@@ -14,6 +14,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
+from mcp_mikrotik.exceptions import DeviceCommandError
 from mcp_mikrotik.server import _resolve_log_level, build_server
 
 from .fakes import FakeConnection, FakePath, RaisingConnection
@@ -85,6 +86,11 @@ EXPECTED_TOOLS = {
     "add_wireguard_interface",
     "add_wireguard_peer",
     "remove_wireguard_peer",
+    "hotspot_active",
+    "torch",
+    "list_backups",
+    "add_hotspot_user",
+    "create_backup",
 }
 
 
@@ -2897,7 +2903,7 @@ def test_server_never_calls_write_primitives_directly():
     server_src = (Path(__file__).resolve().parent.parent / "src" / "mcp_mikrotik" / "server.py").read_text(
         encoding="utf-8"
     )
-    forbidden = re.compile(r"\.(update|add|remove|start|stop|flush|wol)\(")
+    forbidden = re.compile(r"\.(update|add|remove|start|stop|flush|wol|save)\(")
     match = forbidden.search(server_src)
     assert match is None, (
         f"server.py contains a direct write-primitive call ({match.group() if match else ''!r}) - "
@@ -3008,3 +3014,319 @@ async def test_unhandled_error_log_line_is_prefixed_with_a_correlation_id(
     # "[<12 hex chars>] Unhandled error in tool system_info"
     prefix = matches[0].message.split("]")[0].lstrip("[")
     assert len(prefix) == 12
+
+
+# --- hotspot_active / torch / list_backups (v0.14, read-only) --------------
+
+
+@pytest.mark.asyncio
+async def test_hotspot_active_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("hotspot_active", {"device_name": "core-switch"})
+    assert result["result"][0]["user"] == "visitor1"
+    assert result["result"][0]["address"] == "10.5.0.10"
+
+
+@pytest.mark.asyncio
+async def test_hotspot_active_does_not_require_write_enabled(
+    settings: Settings, fake_connection: FakeConnection
+):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("hotspot_active", {"device_name": "core-switch"})
+    assert result["result"]
+
+
+@pytest.mark.asyncio
+async def test_hotspot_active_returns_empty_list_for_device_with_no_hotspot(settings: Settings):
+    """A device with no hotspot server configured at all raises
+    DeviceCommandError from client.path() - treated the same as "no active
+    sessions here" rather than a hard failure, same convention as
+    ppp_active/ipsec_active_peers."""
+    fake = FakeConnection(raise_for={("ip", "hotspot", "active"): DeviceCommandError("core-switch", "ip/hotspot/active", "no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("hotspot_active", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_torch_happy_path_sorts_by_traffic_volume_descending(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
+    # Fixture's ether1 torch data: flow 1 has tx=500000+rx=1500000=2,000,000;
+    # flow 2 has tx=1000+rx=2000=3,000 - flow 1 must sort first.
+    assert result["total_matched"] == 2
+    assert result["truncated"] is False
+    assert len(result["flows"]) == 2
+    assert result["flows"][0]["src-address"] == "10.0.0.50"
+    assert result["flows"][1]["src-address"] == "10.0.0.60"
+
+
+@pytest.mark.asyncio
+async def test_torch_does_not_require_write_enabled(settings: Settings, fake_connection: FakeConnection):
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
+    assert result["flows"]
+
+
+@pytest.mark.asyncio
+async def test_torch_returns_empty_flows_for_interface_with_no_traffic(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether2"})
+    assert result == {"flows": [], "total_matched": 0, "truncated": False}
+
+
+@pytest.mark.asyncio
+async def test_torch_rejects_invalid_interface_name_before_touching_device(settings: Settings):
+    mcp = build_server(
+        settings=settings,
+        client_factory=lambda s, n: MikrotikClient(s.get_device(n), connection=RaisingConnection()),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1; reboot"})
+    assert "not valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_torch_sends_optional_filters_and_once_flag_as_structured_params(settings: Settings):
+    fake = FakeConnection()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    await mcp.call_tool(
+        "torch",
+        {
+            "device_name": "core-switch",
+            "interface": "ether1",
+            "src_address": "10.0.0.50",
+            "dst_address": "8.8.8.8",
+            "port": 443,
+        },
+    )
+    cmd, kwargs = fake.calls[-1]
+    assert cmd == "/tool/torch"
+    assert kwargs == {
+        "interface": "ether1",
+        "once": "",
+        "src-address": "10.0.0.50",
+        "dst-address": "8.8.8.8",
+        "port": "443",
+    }
+
+
+@pytest.mark.asyncio
+async def test_torch_caps_results_at_max_torch_limit_and_sets_truncated(settings: Settings):
+    fake = FakeConnection(
+        torch_replies={
+            "ether1": [{"src-address": f"10.0.0.{i}", "tx": str(i), "rx": "0"} for i in range(60)]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("torch", {"device_name": "core-switch", "interface": "ether1"})
+    assert result["total_matched"] == 60
+    assert result["truncated"] is True
+    assert len(result["flows"]) == 50
+    # Biggest talker (tx=59) sorts first.
+    assert result["flows"][0]["src-address"] == "10.0.0.59"
+
+
+@pytest.mark.asyncio
+async def test_list_backups_happy_path_filters_to_backup_files(
+    settings: Settings, fake_connection: FakeConnection
+):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("list_backups", {"device_name": "core-switch"})
+    names = {row["name"] for row in result["result"]}
+    assert names == {"core-switch-2026-01-01.backup"}
+    entry = result["result"][0]
+    assert entry["size"] == "524288"
+    assert entry["creation-time"] == "jan/01/2026 00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_list_backups_returns_empty_list_when_no_backups_exist(settings: Settings):
+    fake = FakeConnection(data={("file",): [{".id": "*1", "name": "flash/skins", "type": "directory"}]})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("list_backups", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+# --- add_hotspot_user (v0.14, write, guarded) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_hotspot_user_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_hotspot_user",
+            {"device_name": "core-switch", "name": "visitor2", "password": "Passw0rd!", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_hotspot_user_preview_then_confirm_includes_qr_payload(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_hotspot_user",
+        {"device_name": "core-switch", "name": "visitor2", "password": "Passw0rd!", "confirm": False},
+    )
+    assert preview["applied"] is False
+    # The tool result DOES contain the plaintext password - this IS the
+    # point of a voucher (see guard.add_hotspot_user's docstring).
+    assert preview["username"] == "visitor2"
+    assert preview["password"] == "Passw0rd!"
+    assert preview["qr_payload"] == "visitor2:Passw0rd!"
+    names = {row["name"] for row in fake_connection.path("ip", "hotspot", "user")._rows}
+    assert "visitor2" not in names
+
+    _content, applied = await mcp.call_tool(
+        "add_hotspot_user",
+        {"device_name": "core-switch", "name": "visitor2", "password": "Passw0rd!", "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert applied["qr_payload"] == "visitor2:Passw0rd!"
+    names = {row["name"] for row in fake_connection.path("ip", "hotspot", "user")._rows}
+    assert "visitor2" in names
+
+
+@pytest.mark.asyncio
+async def test_add_hotspot_user_rejects_duplicate_name(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    await mcp.call_tool(
+        "add_hotspot_user",
+        {"device_name": "core-switch", "name": "visitor2", "password": "Passw0rd!", "confirm": True},
+    )
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_hotspot_user",
+            {"device_name": "core-switch", "name": "visitor2", "password": "AnotherPass1", "confirm": True},
+        )
+    assert "visitor2" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_hotspot_user_password_in_result_but_never_in_audit_journal(
+    device: Device, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end proof of the v0.14 password asymmetry, through the actual
+    MCP tool call boundary (not just guard.py directly - see
+    tests/test_guard_audit.py's guard-level version of this same proof):
+    the tool RESULT contains the plaintext voucher password, but the audit
+    journal - fed by the exact same guard.WritePreview - never does."""
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_hotspot_user",
+        {
+            "device_name": "core-switch",
+            "name": "visitor-secure",
+            "password": "TotallySecretVoucher!",
+            "confirm": True,
+        },
+    )
+
+    # (a) the tool RESULT contains the plaintext password.
+    assert applied["password"] == "TotallySecretVoucher!"
+    assert applied["qr_payload"] == "visitor-secure:TotallySecretVoucher!"
+
+    # (b) the audit journal never does.
+    raw = log_path.read_text(encoding="utf-8")
+    assert "TotallySecretVoucher!" not in raw
+    event = json.loads(raw.strip().splitlines()[-1])
+    assert "password" not in event["summary"]["after"]
+
+
+# --- create_backup (v0.14, write, guarded) ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_backup_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "create_backup", {"device_name": "core-switch", "name": "nightly-backup", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_create_backup_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "create_backup", {"device_name": "core-switch", "name": "nightly-backup", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["after"] == {"name": "nightly-backup"}
+    assert ("/system/backup/save", {"name": "nightly-backup"}) not in fake_connection.calls
+
+    _content, applied = await mcp.call_tool(
+        "create_backup", {"device_name": "core-switch", "name": "nightly-backup", "confirm": True}
+    )
+    assert applied["applied"] is True
+    assert ("/system/backup/save", {"name": "nightly-backup"}) in fake_connection.calls
+
+
+@pytest.mark.asyncio
+async def test_create_backup_rejects_duplicate_name(device: Device, fake_connection: FakeConnection):
+    """The shared fixture's ("file",) table already has a
+    "core-switch-2026-01-01.backup" file (see conftest)."""
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "create_backup",
+            {"device_name": "core-switch", "name": "core-switch-2026-01-01", "confirm": True},
+        )
+    assert "core-switch-2026-01-01" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_create_backup_password_never_in_result_or_audit_journal(
+    device: Device, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Unlike add_hotspot_user's voucher password, create_backup's optional
+    encryption `password` must never reach the CALLER either - only the
+    device."""
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "create_backup",
+        {
+            "device_name": "core-switch",
+            "name": "encrypted-backup",
+            "password": "file-encrypt-key",
+            "confirm": True,
+        },
+    )
+    assert "password" not in applied["after"]
+    assert "file-encrypt-key" not in str(applied)
+    assert ("/system/backup/save", {"name": "encrypted-backup", "password": "file-encrypt-key"}) in fake_connection.calls
+
+    raw = log_path.read_text(encoding="utf-8")
+    assert "file-encrypt-key" not in raw
+    event = json.loads(raw.strip().splitlines()[-1])
+    assert "password" not in event["summary"]["after"]

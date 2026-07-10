@@ -50,6 +50,9 @@ from .formatting import WIREGUARD_SENSITIVE_FIELDS, strip_sensitive_fields
 from .validation import (
     validate_address_list_name,
     validate_allowed_address_list,
+    validate_backup_name,
+    validate_backup_password,
+    validate_byte_count,
     validate_comment,
     validate_container_identifier,
     validate_dns_name,
@@ -57,6 +60,9 @@ from .validation import (
     validate_dst_address,
     validate_firewall_chain,
     validate_firewall_rule_comment,
+    validate_hotspot_password,
+    validate_hotspot_profile,
+    validate_hotspot_username,
     validate_interface_name,
     validate_ip_address,
     validate_mac_address,
@@ -76,7 +82,7 @@ from .validation import (
 class WriteOperation:
     name: str
     path: tuple[str, ...]
-    action: str  # "update" | "add" | "remove" | "start" | "stop" | "flush" | "wol"
+    action: str  # "update" | "add" | "remove" | "start" | "stop" | "flush" | "wol" | "save"
     description: str
 
 
@@ -337,6 +343,33 @@ ALLOWLIST: dict[str, WriteOperation] = {
         action="remove",
         description="Remove a WireGuard peer from an interface, resolved by public-key or comment.",
     ),
+    # v0.14: hotspot vouchers + backup - the last feature round before 1.0.
+    # add_hotspot_user creates a visitor login (/ip/hotspot/user add) - see
+    # the module note above add_hotspot_user below for the deliberate
+    # password asymmetry (in the tool RESULT, never in the audit journal).
+    # create_backup is a third ACTION-command entry (after start/stop and
+    # flush/wol above) - "save" is RouterOS's own literal command word for
+    # `/system/backup/save`, dispatched via the same
+    # `getattr(client, op.action)` mechanism as every other guarded write.
+    "add_hotspot_user": WriteOperation(
+        name="add_hotspot_user",
+        path=("ip", "hotspot", "user"),
+        action="add",
+        description=(
+            "Create a hotspot voucher user (name, password, optional profile/limit-uptime/"
+            "limit-bytes-total) for a visitor. Refuses to create a duplicate name."
+        ),
+    ),
+    "create_backup": WriteOperation(
+        name="create_backup",
+        path=("system", "backup"),
+        action="save",
+        description=(
+            "Create a RouterOS system backup file (/system/backup/save name=<name>, optional "
+            "encryption password - never journaled). Refuses to overwrite an existing file of "
+            "the same name."
+        ),
+    ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
     #   * reboot ("system/reboot"): no before/after preview is meaningful for
@@ -351,6 +384,14 @@ ALLOWLIST: dict[str, WriteOperation] = {
     #     enable_firewall_rule/disable_firewall_rule above) - authoring or
     #     otherwise editing a rule still needs staged/rollback support (e.g.
     #     RouterOS safe mode) before it belongs in this allowlist.
+    #   * backup RESTORE ("system/backup/load"): same class of risk as
+    #     reboot - loading a backup overwrites the device's ENTIRE running
+    #     configuration and reboots it, with no meaningful before/after
+    #     preview and no rollback if the wrong file (or the right file, at
+    #     the wrong time) is loaded. v0.14 only ever exposes CREATING a
+    #     backup (create_backup) and listing existing ones (list_backups) -
+    #     restoring one stays a manual, on-device (WinBox/CLI) operation
+    #     until it has its own confirmation/cooldown policy, same as reboot.
     # --- Next iteration adds entries here, each with its own WriteOperation
     # + dedicated function. See module docstring above for the steps.
 }
@@ -2046,4 +2087,171 @@ def remove_wireguard_peer(
 
     write = getattr(client, op.action)
     write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v0.14: hotspot vouchers + backup ---------------------------------------
+#
+# The last feature round before 1.0. Two independent tools, neither touching
+# any menu a previous round already guards:
+#   - add_hotspot_user creates a `/ip/hotspot/user` row - a VISITOR login
+#     voucher, not a device/API credential. Its password is deliberately
+#     handled the OPPOSITE way v0.13's WireGuard private-key is: WireGuard's
+#     private-key must never reach the CALLER (RouterOS-internal only,
+#     stripped from every return value); a voucher's password is the whole
+#     POINT of the tool - the caller needs it to hand to a visitor - so it
+#     DOES appear in this function's returned WritePreview.after (and, one
+#     layer up, in server.py's `qr_payload`). It must still never reach the
+#     audit journal, though - see add_hotspot_user's own docstring below for
+#     exactly how that asymmetry is enforced (spoiler: no new code was
+#     needed - audit._SENSITIVE_KEY already matches "password", and it
+#     applies to ANY dict key at ANY depth in the summary `_audited` logs,
+#     not just a device's own connection password).
+#   - create_backup is a third ACTION-command entry (after start/stop, v0.7,
+#     and flush/wol, v0.10) - "save" is RouterOS's own literal command word
+#     for /system/backup/save. Its optional `password` (encrypts the backup
+#     FILE - unrelated to a device/API credential) is redacted BEFORE the
+#     WritePreview is constructed, the same "redact before constructing the
+#     preview" rule v0.13 established for WireGuard's private/preshared
+#     keys - see _redact_wireguard_row's usage above - so it can never reach
+#     the journal even as a first line of defense, on top of
+#     audit._SENSITIVE_KEY's second one.
+
+
+@_audited("add_hotspot_user")
+def add_hotspot_user(
+    client: MikrotikClient,
+    settings: Settings,
+    name: str,
+    password: str,
+    confirm: bool,
+    profile: str | None = None,
+    limit_uptime: str | None = None,
+    limit_bytes_total: int | None = None,
+) -> WritePreview:
+    """Create a hotspot voucher user (`/ip/hotspot/user add`) for a visitor.
+
+    `profile` (an existing `/ip/hotspot/user/profile` name - not verified to
+    exist here; RouterOS itself rejects an unknown one at write time),
+    `limit_uptime` (a RouterOS duration, e.g. "01:00:00" -
+    `validate_timeout`), and `limit_bytes_total` (a positive integer byte
+    quota - `validate_byte_count`) are all optional.
+
+    PASSWORD ASYMMETRY (read this before touching this function): the
+    plaintext `password` is the whole point of a voucher - the visitor needs
+    it - so it DOES appear in this function's returned `WritePreview.after`
+    (both on `confirm=false` preview and `confirm=true` applied - see
+    server.py's `add_hotspot_user` tool, which builds `qr_payload` straight
+    from it). This is the OPPOSITE of v0.13's WireGuard private-key handling
+    (never returned to any caller at all) - deliberately, because a voucher
+    password's only purpose is to be handed to someone.
+
+    It must still NEVER reach the audit journal. `_audited` (this function's
+    decorator) journals exactly whatever this function returns - so if
+    `password` merely stayed out of the RETURN value, it would already be
+    safe from the journal too; the fact that it's deliberately IN the return
+    value makes this the one write tool in this package where "safe in the
+    result" and "safe in the journal" pull in opposite directions. The
+    journal side is still covered: `audit._SENSITIVE_KEY` matches "password"
+    case-insensitively and `audit._sanitize` drops any dict key matching it
+    at ANY depth of the `{"before": ..., "after": ...}` summary `_audited`
+    logs - so the exact same `after` dict returned here gets its `password`
+    key silently dropped before it ever reaches `audit.record()`'s caller.
+    No new redaction code was needed for this - it falls out of the existing
+    device-password protection `_SENSITIVE_KEY` already provided. See
+    `tests/test_guard_audit.py`'s
+    `test_add_hotspot_user_password_never_in_audit_journal` for the proof.
+
+    Refuses to create a duplicate `name` - raises ResourceAlreadyExistsError
+    instead of creating a second voucher (or silently resetting the first
+    one's password). This tool only ever adds; it never updates or removes
+    an existing hotspot user.
+    """
+    op = _require_allowed(settings, "add_hotspot_user")
+
+    validated_name = validate_hotspot_username(name)
+    validated_password = validate_hotspot_password(password)
+    validated_profile = validate_hotspot_profile(profile) if profile is not None else None
+    validated_limit_uptime = validate_timeout(limit_uptime, "limit_uptime") if limit_uptime is not None else None
+    validated_limit_bytes = (
+        validate_byte_count(limit_bytes_total, "limit_bytes_total") if limit_bytes_total is not None else None
+    )
+
+    rows = client.path(*op.path)
+    if _find_row_by_field(rows, "name", validated_name) is not None:
+        raise ResourceAlreadyExistsError(client.device.name, "Hotspot user", validated_name)
+
+    payload: dict[str, Any] = {"name": validated_name, "password": validated_password}
+    if validated_profile:
+        payload["profile"] = validated_profile
+    if validated_limit_uptime:
+        payload["limit-uptime"] = validated_limit_uptime
+    if validated_limit_bytes is not None:
+        payload["limit-bytes-total"] = validated_limit_bytes
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("create_backup")
+def create_backup(
+    client: MikrotikClient, settings: Settings, name: str, confirm: bool, password: str | None = None
+) -> WritePreview:
+    """Create a RouterOS system backup file (`/system/backup/save
+    name=<name>`) - captures the device's FULL configuration (interfaces,
+    firewall, users, ...) into one binary `.backup` file on the device's own
+    storage. Use the read-only `list_backups` tool afterward to confirm it
+    landed and see its real size/creation-time.
+
+    `password`, if given, is RouterOS's own `/system/backup/save
+    password=<password>` option - it encrypts the backup FILE itself, and is
+    entirely unrelated to any device/API credential. It is redacted (never
+    included in `before`/`after`) BEFORE the `WritePreview` this returns is
+    ever constructed - the same "redact before constructing the preview"
+    rule v0.13's WireGuard round established for private/preshared keys (see
+    the module note above `_redact_wireguard_row`) - so it can't reach the
+    audit journal even as a first line of defense, on top of
+    `audit._SENSITIVE_KEY` (which already matches "password" too) as a
+    second, independent one.
+
+    The `after` preview only describes the (validated) file `name` that WILL
+    be created - RouterOS decides the real on-device size/creation-time
+    itself, which `list_backups` surfaces afterward; this write does not
+    re-read the file it just created.
+
+    Refuses to overwrite: if a `.backup` file matching `name` already exists
+    on the device (`/file`, the same menu `list_backups` reads and filters),
+    raises `ResourceAlreadyExistsError` instead of silently overwriting it -
+    RouterOS's own `/system/backup/save` WOULD silently overwrite an
+    existing file of the same name; this check exists purely in this
+    package, before the command is ever sent.
+    """
+    op = _require_allowed(settings, "create_backup")
+
+    validated_name = validate_backup_name(name)
+    validated_password = validate_backup_password(password) if password is not None else None
+
+    full_name = validated_name if validated_name.endswith(".backup") else f"{validated_name}.backup"
+    file_rows = client.path("file")
+    if any(row.get("name") == full_name for row in file_rows):
+        raise ResourceAlreadyExistsError(client.device.name, "Backup file", full_name)
+
+    before: dict[str, Any] = {}
+    after: dict[str, Any] = {"name": validated_name}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    if validated_password is not None:
+        write(*op.path, name=validated_name, password=validated_password)
+    else:
+        write(*op.path, name=validated_name)
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

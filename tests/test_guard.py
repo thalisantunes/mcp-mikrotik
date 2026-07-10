@@ -63,7 +63,7 @@ def test_allowlist_only_contains_named_operations():
     for name, op in guard.ALLOWLIST.items():
         assert op.name == name
         assert isinstance(op.path, tuple) and op.path
-        assert op.action in {"update", "add", "remove", "start", "stop", "flush", "wol"}
+        assert op.action in {"update", "add", "remove", "start", "stop", "flush", "wol", "save"}
 
 
 def test_require_allowed_rejects_unknown_operation(settings_write_enabled: Settings):
@@ -2642,3 +2642,240 @@ def test_remove_wireguard_peer_dispatches_via_allowlist_action(
     )
 
     assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}
+
+
+# --- add_hotspot_user / create_backup (v0.14) -------------------------------
+#
+# The last feature round before 1.0. add_hotspot_user's password asymmetry
+# (present in the tool RESULT, absent from the audit journal) is proven in
+# tests/test_guard_audit.py, not here - these tests cover the ordinary
+# guard mechanics (gate, preview/confirm, duplicate rejection, validation).
+
+
+def test_add_hotspot_user_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_hotspot_user(client, settings, name="visitor2", password="Passw0rd!", confirm=True)
+
+
+def test_add_hotspot_user_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_hotspot_user(guarded_client, settings, name="visitor2", password="Passw0rd!", confirm=True)
+
+
+def test_add_hotspot_user_preview_does_not_create(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_hotspot_user(
+        client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "visitor2", "password": "Passw0rd!"}
+    assert fake_connection.path("ip", "hotspot", "user")._rows == []
+
+
+def test_add_hotspot_user_confirm_true_creates(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_hotspot_user(
+        client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True
+    )
+    assert preview.applied is True
+    assert preview.after == {"name": "visitor2", "password": "Passw0rd!"}
+    rows = fake_connection.path("ip", "hotspot", "user")._rows
+    assert rows == [{"name": "visitor2", "password": "Passw0rd!"}]
+
+
+def test_add_hotspot_user_confirm_true_with_optional_fields(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.add_hotspot_user(
+        client,
+        settings_write_enabled,
+        name="visitor3",
+        password="Passw0rd!",
+        profile="guest-profile",
+        limit_uptime="01:00:00",
+        limit_bytes_total=104857600,
+        confirm=True,
+    )
+    assert preview.applied is True
+    assert preview.after == {
+        "name": "visitor3",
+        "password": "Passw0rd!",
+        "profile": "guest-profile",
+        "limit-uptime": "01:00:00",
+        "limit-bytes-total": "104857600",
+    }
+
+
+def test_add_hotspot_user_rejects_duplicate_name(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_hotspot_user(
+            client, settings_write_enabled, name="visitor2", password="AnotherPass1", confirm=True
+        )
+    assert "visitor2" in str(exc_info.value)
+    assert len(fake_connection.path("ip", "hotspot", "user")._rows) == 1
+
+
+def test_add_hotspot_user_rejects_invalid_username_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_hotspot_user(
+            guarded_client, settings_write_enabled, name="visitor 2!", password="Passw0rd!", confirm=True
+        )
+
+
+def test_add_hotspot_user_rejects_empty_password_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_hotspot_user(guarded_client, settings_write_enabled, name="visitor2", password="", confirm=True)
+
+
+def test_add_hotspot_user_rejects_invalid_limit_bytes_total_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_hotspot_user(
+            guarded_client,
+            settings_write_enabled,
+            name="visitor2",
+            password="Passw0rd!",
+            limit_bytes_total=-5,
+            confirm=True,
+        )
+
+
+def test_add_hotspot_user_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_hotspot_user"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_hotspot_user", patched_op)
+
+    guard.add_hotspot_user(client, settings_write_enabled, name="visitor2", password="Passw0rd!", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"name": "visitor2", "password": "Passw0rd!"}}
+
+
+# --- create_backup (v0.14) --------------------------------------------------
+#
+# The shared fixture's ("file",) table (see conftest) already has one
+# ".backup" file - "core-switch-2026-01-01.backup" - used below to exercise
+# the duplicate-name rejection.
+
+
+def test_create_backup_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.create_backup(client, settings, name="nightly-backup", confirm=True)
+
+
+def test_create_backup_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.create_backup(guarded_client, settings, name="nightly-backup", confirm=True)
+
+
+def test_create_backup_preview_does_not_apply(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.create_backup(client, settings_write_enabled, name="nightly-backup", confirm=False)
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "nightly-backup"}
+    assert ("/system/backup/save", {"name": "nightly-backup"}) not in fake_connection.calls
+
+
+def test_create_backup_confirm_true_sends_the_save_command(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    preview = guard.create_backup(client, settings_write_enabled, name="nightly-backup", confirm=True)
+    assert preview.applied is True
+    assert preview.after == {"name": "nightly-backup"}
+    assert ("/system/backup/save", {"name": "nightly-backup"}) in fake_connection.calls
+
+
+def test_create_backup_confirm_true_forwards_password_to_the_device(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    guard.create_backup(
+        client, settings_write_enabled, name="nightly-backup", password="encrypt-me", confirm=True
+    )
+    assert (
+        "/system/backup/save",
+        {"name": "nightly-backup", "password": "encrypt-me"},
+    ) in fake_connection.calls
+
+
+def test_create_backup_preview_and_applied_never_carry_the_password(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    """See guard.create_backup's docstring: the backup-file encryption
+    password is redacted BEFORE a WritePreview is ever constructed - it must
+    never show up in `before`/`after`, on either preview or applied."""
+    preview = guard.create_backup(
+        client, settings_write_enabled, name="nightly-backup", password="encrypt-me", confirm=False
+    )
+    assert "password" not in preview.after
+    applied = guard.create_backup(
+        client, settings_write_enabled, name="another-backup", password="encrypt-me", confirm=True
+    )
+    assert "password" not in applied.after
+
+
+def test_create_backup_rejects_duplicate_name(
+    client: MikrotikClient, settings_write_enabled: Settings, fake_connection: FakeConnection
+):
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.create_backup(client, settings_write_enabled, name="core-switch-2026-01-01", confirm=True)
+    assert "core-switch-2026-01-01" in str(exc_info.value)
+
+
+def test_create_backup_rejects_duplicate_name_when_caller_already_included_the_extension(
+    client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.create_backup(
+            client, settings_write_enabled, name="core-switch-2026-01-01.backup", confirm=True
+        )
+
+
+def test_create_backup_rejects_invalid_name_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.create_backup(guarded_client, settings_write_enabled, name="bad name!", confirm=True)
+
+
+def test_create_backup_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["create_backup"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "create_backup", patched_op)
+
+    guard.create_backup(client, settings_write_enabled, name="nightly-backup", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"name": "nightly-backup"}}

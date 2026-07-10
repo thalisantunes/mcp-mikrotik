@@ -674,3 +674,143 @@ def validate_allowed_address_list(value: str) -> str:
         raise ValidationError(f"allowed_address {value!r} contains an empty entry.")
 
     return ",".join(validate_target(part) for part in parts)
+
+
+# --- v0.14: hotspot vouchers + backup ---------------------------------------
+#
+# add_hotspot_user (guard.py) creates a `/ip/hotspot/user` row - a visitor
+# voucher, not a device/API credential - so its `password` validator is
+# deliberately more permissive than every other validator in this module: a
+# voucher password is commonly short-lived, often machine-generated, and the
+# whole point of the tool is to hand it back to the caller (see
+# guard.add_hotspot_user's docstring for the "password IS in the tool result,
+# NEVER in the audit journal" asymmetry). Only control characters (the same
+# class `validate_comment`/`_COMMENT_UNSAFE` already reject) are disallowed -
+# still not an injection defense (see module docstring: every value is
+# always sent as a structured API parameter), just enough to keep a voucher
+# credential to plain, single-line text that renders cleanly in a QR payload.
+
+_HOTSPOT_USERNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_MAX_HOTSPOT_PASSWORD_LENGTH = 128
+_HOTSPOT_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def validate_hotspot_username(value: str) -> str:
+    """Validate a hotspot voucher `name` (RouterOS `/ip/hotspot/user`'s
+    `name` field - the login username a visitor types/scans). Same
+    conservative charset as `_LIST_NAME`/`_INTERFACE_NAME`: letters, digits,
+    '.', '_', '-' only, starting with a letter/digit, max 64 chars -
+    deliberately restrictive since this value is also embedded verbatim in
+    `qr_payload` (see guard.add_hotspot_user).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Hotspot username must be a non-empty string.")
+    value = value.strip()
+    if not _HOTSPOT_USERNAME.match(value):
+        raise ValidationError(
+            f"Hotspot username {value!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return value
+
+
+def validate_hotspot_password(value: str) -> str:
+    """Validate a hotspot voucher `password`. Deliberately more permissive
+    than `validate_hotspot_username` (see module note above) - any printable
+    text is accepted, only control characters (newlines, tabs, ...) are
+    rejected, within a sane length cap.
+
+    Returns `value` unchanged (not stripped - a voucher password is an exact
+    credential, not free text) on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValidationError("Hotspot password must be a non-empty string.")
+    if len(value) > _MAX_HOTSPOT_PASSWORD_LENGTH:
+        raise ValidationError(f"Hotspot password is too long (max {_MAX_HOTSPOT_PASSWORD_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("Hotspot password contains control characters, which are not allowed.")
+    return value
+
+
+def validate_hotspot_profile(value: str) -> str:
+    """Validate a hotspot user `profile` name (`/ip/hotspot/user/profile`'s
+    `name` - an existing profile this voucher is assigned to, e.g. to cap
+    its shared bandwidth). Shape-only, same conservative charset as
+    `validate_hotspot_username` - existence on the device is not checked
+    here (RouterOS itself rejects an unknown profile name at write time).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Hotspot profile must be a non-empty string.")
+    value = value.strip()
+    if not _HOTSPOT_PROFILE.match(value):
+        raise ValidationError(
+            f"Hotspot profile {value!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return value
+
+
+def validate_byte_count(value: int, field_name: str = "limit_bytes_total") -> str:
+    """Validate a positive byte-count limit (RouterOS's
+    `/ip/hotspot/user`'s `limit-bytes-total` field: the total data quota for
+    one voucher). RouterOS itself accepts this field as a string; this
+    returns it pre-stringified so guard.py never has to remember to convert
+    it before sending.
+
+    Returns `str(value)` on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValidationError(f"{field_name!r} must be a positive integer, got {value!r}.")
+    return str(value)
+
+
+# A backup file `name` (RouterOS `/system/backup/save`'s `name` field, and
+# the matching `/file` row `list_backups` reads back): conservative charset,
+# same spirit as `_LIST_NAME`/`_INTERFACE_NAME`, but allows a literal '.'
+# (including a caller-supplied ".backup" suffix - see
+# guard.create_backup, which appends one itself only if missing) and a
+# longer cap, since a backup name is often a timestamp/site identifier
+# (e.g. "core-switch-2026-07-09").
+_BACKUP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_MAX_BACKUP_PASSWORD_LENGTH = 128
+
+
+def validate_backup_name(value: str) -> str:
+    """Validate a backup file `name` (without requiring - but allowing - a
+    trailing ".backup"; see `guard.create_backup`, which appends the
+    extension itself only when the caller didn't already include one).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Backup name must be a non-empty string.")
+    value = value.strip()
+    if not _BACKUP_NAME.match(value):
+        raise ValidationError(
+            f"Backup name {value!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 128 chars)."
+        )
+    return value
+
+
+def validate_backup_password(value: str) -> str:
+    """Validate `create_backup`'s optional encryption `password` (RouterOS's
+    own `/system/backup/save password=<password>` option, which encrypts the
+    backup FILE itself - unrelated to any device/API credential). Same
+    "reject only control characters" permissiveness as
+    `validate_hotspot_password` - see that function's docstring - since this
+    too is a credential the caller must be free to choose, not free text.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValidationError("Backup password must be a non-empty string.")
+    if len(value) > _MAX_BACKUP_PASSWORD_LENGTH:
+        raise ValidationError(f"Backup password is too long (max {_MAX_BACKUP_PASSWORD_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("Backup password contains control characters, which are not allowed.")
+    return value

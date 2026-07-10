@@ -47,10 +47,23 @@ to login/logout/authentication-failure and other security-relevant
 entries. Both are heuristic and read-only - neither one fixes anything, and
 neither requires `MIKROTIK_ALLOW_WRITE`. See "Security audit" below.
 
+v0.13 adds WireGuard VPN management - see "WireGuard management" below.
+
+**v0.14 is the last feature round before 1.0**: hotspot visitor vouchers
+(`add_hotspot_user`, with a QR-renderable payload in the result),
+`hotspot_active` (who's logged into the hotspot right now), `torch` (a live
+traffic snapshot of one interface - "who's consuming bandwidth right now"),
+and RouterOS system backups (`create_backup`/`list_backups`). One
+deliberate, documented exception to this package's usual secret-handling
+rule: a hotspot voucher's plaintext password IS returned to the caller
+(that's the whole point of a voucher) - but still never reaches the audit
+journal. See "Hotspot vouchers", "Live traffic monitoring (torch)", and
+"Backup" below.
+
 See `CHANGELOG.md` for what changed since v0.1.0, and
 `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
-The full pytest suite currently has 869 tests, all passing against the
+The full pytest suite currently has 984 tests, all passing against the
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
@@ -158,6 +171,9 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
 | `security_audit` | Read-only, heuristic security audit: aggregates several config reads into `{"findings": [...], "summary": {...}}`. See "Security audit" below. |
 | `security_events` | Recent `/log` entries filtered to security-relevant ones (login/logout/auth-failure, critical/error topics); `limit` (positive, capped at 500, default 50) - same shape as `logs`' own `limit`. See "Security audit" below. |
+| `hotspot_active` | List clients currently logged into the RouterOS hotspot (user, address, mac-address, uptime, bytes-in/bytes-out). Empty list (not an error) with no hotspot server / no one logged in. See "Hotspot vouchers" below. |
+| `torch` | Live traffic snapshot of one `interface` (`/tool/torch once=yes`) - optional `src_address`/`dst_address`/`port` filters. Sorted by traffic volume (biggest talkers first) and capped at 50 flows, with `truncated`/`total_matched`. See "Live traffic monitoring (torch)" below. |
+| `list_backups` | List backup files on the device (`/file`, filtered to `*.backup`): name, size, creation-time. See "Backup" below. |
 
 ### Write (guarded)
 
@@ -195,11 +211,14 @@ model" below for the full guard mechanism.
 | `add_wireguard_interface` | Create a WireGuard tunnel interface (`name`, optional `listen_port`). RouterOS generates the private key internally - **never accepted or returned by this tool**. Refuses a duplicate `name`. See "WireGuard management" below. |
 | `add_wireguard_peer` | Add a WireGuard peer to an existing `interface` (remote `public_key`, `allowed_address`, optional `endpoint_address`/`endpoint_port`/`persistent_keepalive`/`comment`). **Never accepts a private-key or preshared-key.** Errors if `interface` doesn't exist; refuses a duplicate `public_key` on the same interface. |
 | `remove_wireguard_peer` | Remove a WireGuard peer from an `interface`, resolved by `public_key` or `comment`. Errors if more than one peer still matches after narrowing (`AmbiguousResourceError`) - never guesses which one to remove. |
+| `add_hotspot_user` | Create a hotspot voucher user (`name`, `password`, optional `profile`/`limit_uptime`/`limit_bytes_total`). Refuses a duplicate `name`. **Result always includes `username`/`password`/`qr_payload`** - the plaintext password IS in the result (that's the point) but never in the audit journal. See "Hotspot vouchers" below. |
+| `create_backup` | Create a RouterOS system backup file (`name`, optional encryption `password`). Refuses to overwrite an existing `.backup` file of the same name. `password` never appears in the result or the audit journal. See "Backup" below. |
 
-Not yet exposed, deliberately: device reboot, and creating/generally
-modifying a firewall filter rule (only the narrow `disabled` TOGGLE of an
-existing, admin-authored rule is exposed - see "Firewall rule toggle (by
-comment)" below). See "Roadmap / non-goals" below for why.
+Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
+- same risk class as reboot), and creating/generally modifying a firewall
+filter rule (only the narrow `disabled` TOGGLE of an existing,
+admin-authored rule is exposed - see "Firewall rule toggle (by comment)"
+below). See "Roadmap / non-goals" below for why.
 
 ### Limiting a client's bandwidth (v0.3)
 
@@ -758,6 +777,109 @@ on interface creation, and every test asserts that marker never reaches the
 tool's return value, the audit journal (`before` **and** `after`), or any
 other log line.
 
+### Hotspot vouchers (v0.14)
+
+`hotspot_active` (read) lists who's currently logged into the RouterOS
+hotspot (`/ip/hotspot/active`) - `user`, `address`, `mac-address`, `uptime`,
+`bytes-in`/`bytes-out`. `add_hotspot_user` (write, guarded) creates a new
+voucher - a visitor login, not a device/API credential:
+
+```
+add_hotspot_user(name="visitor-42", password="Xk7mQ2p9", limit_uptime="02:00:00")
+```
+
+`profile` (an existing `/ip/hotspot/user/profile` name, e.g. to cap shared
+bandwidth), `limit_uptime` (a RouterOS duration), and `limit_bytes_total` (a
+positive integer byte quota) are all optional. Refuses to create a
+duplicate `name` - it never resets an existing voucher's password.
+
+**QR/voucher payload.** The tool result always also includes `username`,
+`password`, and `qr_payload` - a plain string the caller renders as a QR
+code itself (this package deliberately does **not** generate a QR *image* -
+that would mean pulling in an imaging dependency for something a caller's
+own UI layer can do in a couple of lines). The format chosen for
+`qr_payload` is `"<username>:<password>"` - a plain, self-describing
+credential pair. Two alternatives were considered and rejected:
+
+- A login URL (`http://<hotspot>/login?username=..&password=..`) would need
+  a reliably-known hotspot LAN address, which this package has no way to
+  determine for an arbitrary device/deployment - and RouterOS's actual
+  captive-portal login is normally a POST carrying additional
+  session-specific tokens (`chap-id`/`chap-challenge`), so a bare GET URL
+  with a plaintext password wouldn't even reliably authenticate.
+- A `WIFI:T:WPA;S:<ssid>;P:<pass>;;` payload is for auto-joining a WPA
+  wireless network - a different credential (and a different protocol
+  layer) than a hotspot LOGIN (walled-garden HTTP auth), which can just as
+  easily run over a wired port.
+
+`username:password` makes no claim about network topology or login
+mechanics that could turn out to be wrong for a given deployment. A caller
+integrating with a specific captive portal is free to build its own login
+URL (or its own QR format) from `username`/`password` plus its own
+known portal address.
+
+**The deliberate password asymmetry.** Unlike every secret this package has
+handled before (a device password, a WireGuard private-key - never returned
+to any caller at all), a voucher's plaintext `password` **is** present in
+the tool's own result on both `confirm=false` (preview) and `confirm=true`
+(applied) - the caller needs it to hand to a visitor. It must still never
+reach the audit journal. No new redaction code was needed for that:
+`audit._SENSITIVE_KEY` already matches `"password"` case-insensitively at
+any depth of the journaled `{"before": ..., "after": ...}` summary (it's
+what already protects a device's own connection password - see the "Audit
+journal" bullet under "Production features" below), so the exact same
+`after` dict returned to the caller gets its `password` key silently
+dropped before `audit.record()` ever sees it. See
+`tests/test_guard_audit.py`'s
+`test_add_hotspot_user_password_never_in_audit_journal` and
+`tests/test_server.py`'s
+`test_add_hotspot_user_password_in_result_but_never_in_audit_journal` for
+the proof, at both the guard layer and the full MCP tool-call boundary.
+
+### Live traffic monitoring (torch) (v0.14)
+
+`torch` answers "who is consuming bandwidth on this interface **right
+now**" - a single live snapshot via RouterOS's own real-time traffic
+monitor (`/tool/torch interface=<interface> once=yes`), built the same
+"once" monitor-style way as `interface_traffic`/`poe_status`/`lte_status`.
+`interface` is validated for shape before use; optional `src_address`/
+`dst_address`/`port` filters are forwarded to RouterOS itself, narrowing
+the snapshot **before** it ever leaves the device - use them on a busy
+interface instead of fetching every flow and filtering client-side.
+
+Regardless of how many flows RouterOS reports for the requested instant,
+the result's `flows` list is sorted by total traffic (tx+rx, biggest
+talkers first) and hard-capped at 50 entries - `truncated` is `true`
+whenever more flows matched than were returned, and `total_matched` always
+reports the real (pre-cap) count, the same "cap it, tell the caller how
+much was cut" shape `connection_tracking` (v0.11) already established.
+Diagnostic only - `torch` never changes device state, so (like `ping`/
+`traceroute`) it is not gated by `MIKROTIK_ALLOW_WRITE`.
+
+### Backup (v0.14)
+
+`create_backup` (write, guarded) creates a RouterOS system backup file
+(`/system/backup/save name=<name>`) - the device's full configuration
+(interfaces, firewall, users, ...) as one binary `.backup` file on its own
+storage. `list_backups` (read) lists existing ones - use it after
+`create_backup` to confirm a new backup landed and see its real
+size/creation-time.
+
+`create_backup` refuses to overwrite an existing `.backup` file of the same
+`name` (`ResourceAlreadyExistsError`) - RouterOS's own `/system/backup/save`
+would otherwise silently overwrite one. An optional `password` encrypts the
+backup **file** itself (unrelated to any device/API credential) - it is
+redacted before the write's preview is ever constructed (the same
+"redact before constructing the preview" rule v0.13's WireGuard round
+established for private/preshared keys), so it never reaches the caller or
+the audit journal, either.
+
+**Backup restore is deliberately not exposed** - see "Roadmap / non-goals"
+below: loading a backup overwrites a device's entire running configuration
+and reboots it, the same risk class as a remote reboot, with no meaningful
+before/after preview and no rollback if the wrong file (or the right file,
+at the wrong time) is loaded.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -924,8 +1046,9 @@ entirely before `MikrotikClient` ever attempts a connection.
   failed at any point, however early (even a write blocked by the read-only
   gate before the device is ever touched). Each event has a `timestamp`,
   `correlation_id`, `device_name`, `tool`, `operation` (the `ALLOWLIST` key),
-  `action` (`add`/`update`/`remove`/`start`/`stop` - see v0.7's
-  `start_container`/`stop_container`), `confirm`, `outcome`
+  `action` (`add`/`update`/`remove`/`start`/`stop`/`flush`/`wol`/`save` - see
+  v0.7's `start_container`/`stop_container`, v0.10's `clear_dns_cache`/
+  `wake_on_lan`, and v0.14's `create_backup`), `confirm`, `outcome`
   (`preview`/`applied`/`error`), and a `summary` of the before/after change
   (or the error). **Never includes a device password or any field that
   looks like a secret** - see `src/mcp_mikrotik/audit.py`'s `_sanitize()`.
@@ -1023,12 +1146,26 @@ Python 3.11 and 3.12.
   rule creation or any other field. `connection_tracking` deliberately
   requires a filter and hard-caps its result at 100 rows - see its own
   section above for why.
-- One write operation is deliberately **not** exposed yet, because the
+- **WireGuard VPN management** (`wireguard_interfaces`,
+  `add_wireguard_interface`, `add_wireguard_peer`, `remove_wireguard_peer`)
+  shipped in v0.13 - see "WireGuard management" above.
+- **Hotspot vouchers, live traffic monitoring, and backup**
+  (`hotspot_active`, `torch`, `list_backups`, `add_hotspot_user`,
+  `create_backup`) shipped in v0.14, the last feature round before 1.0 - see
+  "Hotspot vouchers", "Live traffic monitoring (torch)", and "Backup" above.
+- Two write operations are deliberately **not** exposed, because the
   standard guard/confirm/preview mechanism isn't sufficient protection on
   its own - see the comment above `ALLOWLIST` in `guard.py`:
   - **Reboot** (`system/reboot`): there's no meaningful before/after preview
     for a reboot, and a bad batch reboot across a fleet has no dry-run or
     rollback. Needs its own confirmation/cooldown policy first.
+  - **Backup restore** (`system/backup/load`, v0.14): same risk class as
+    reboot - loading a backup overwrites the device's entire running
+    configuration and reboots it, with no meaningful before/after preview
+    and no rollback. `create_backup`/`list_backups` (v0.14) only ever
+    create/list backups; restoring one stays a manual, on-device
+    (WinBox/CLI) operation until it has its own confirmation/cooldown
+    policy.
 - **Firewall filter rule CREATION or general modification** (any
   `ip/firewall/filter` write other than the v0.11 `disabled` toggle) remains
   out of scope for the same reason it always has been: a single wrong rule

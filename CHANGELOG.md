@@ -3,6 +3,100 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.14.0] - Unreleased
+
+The last feature round before 1.0: hotspot visitor vouchers (with a
+QR-renderable payload), a live traffic monitor (torch), and RouterOS system
+backups. Three new read-only tools (`hotspot_active`, `torch`,
+`list_backups`) and two new guarded write tools (`add_hotspot_user`,
+`create_backup`). Same write-guard mechanism as every previous round
+(read-only default, central allowlist, confirm/preview, audit journal - none
+of it weakened or bypassed), plus one deliberate, documented exception to
+this package's usual secret-handling rule: a hotspot voucher's plaintext
+password IS returned to the caller (that's the whole point of a voucher),
+but still never reaches the audit journal.
+
+### Added
+
+- **`hotspot_active`** (read, `server.py`): lists clients currently logged
+  into the RouterOS hotspot (`/ip/hotspot/active`) - `user`, `address`,
+  `mac-address`, `uptime`, `bytes-in`/`bytes-out`. Empty list (not an error)
+  for a device with no hotspot server configured, or no one logged in right
+  now - same convention as `ppp_active`/`ipsec_active_peers`.
+- **`torch`** (read, `server.py` + `client.py`): a live traffic snapshot of
+  one `interface` (`/tool/torch interface=<interface> once=yes`) - "who is
+  consuming bandwidth on this link RIGHT NOW". Built the same "once"
+  monitor-style way as `interface_traffic`/`poe_status`/`lte_status`
+  (`MikrotikClient.torch`, materializing librouteros' generator reply with
+  `list(...)` before inspecting it - the same v0.7.1 lesson those three
+  already established), but unlike them a torch snapshot can genuinely carry
+  MANY rows (one per flow), not just one. Optional `src_address`/
+  `dst_address`/`port` filters are forwarded to RouterOS itself, narrowing
+  the snapshot BEFORE it ever leaves the device. Regardless of how many
+  flows matched, the result's `flows` list is sorted by total traffic
+  (tx+rx, biggest talkers first) and hard-capped at 50 entries -
+  `truncated`/`total_matched` report whether/how much was cut, the same
+  "cap it, tell the caller how many really matched" shape
+  `connection_tracking` (v0.11) already established.
+- **`list_backups`** (read, `server.py`): lists backup files on the device
+  (`/file`, filtered to names ending in `.backup`) - `name`, `size`,
+  `creation-time`. Empty list (not an error) with no backup files.
+- **`add_hotspot_user`** (write, guarded, `guard.py` + `server.py`): creates
+  a hotspot voucher user (`/ip/hotspot/user add` - `name`, `password`,
+  optional `profile`/`limit_uptime`/`limit_bytes_total`) for a visitor.
+  Refuses to create a duplicate `name` (`ResourceAlreadyExistsError`).
+  **QR/voucher**: the tool result always also includes `username`,
+  `password`, and `qr_payload` - a plain `"<username>:<password>"` string
+  the caller renders as a QR code itself (this package deliberately does
+  NOT generate a QR image - no extra imaging dependency). A login-URL or
+  `WIFI:` payload were both considered and rejected - see
+  `server.py`'s `add_hotspot_user` docstring for why. **The deliberate
+  password asymmetry**: unlike every secret this package has handled before
+  (a device password, a WireGuard private-key - never returned to any
+  caller at all), this voucher's plaintext `password` IS present in the
+  tool's own return value (the caller needs it to hand to a visitor) - but
+  it must still never reach the audit journal. No new redaction code was
+  needed for that: `audit._SENSITIVE_KEY` already matches "password"
+  case-insensitively at any depth of the journaled summary, so the exact
+  same `after` dict returned to the caller gets its `password` key silently
+  dropped before `audit.record()` ever sees it. See
+  `tests/test_guard_audit.py`'s
+  `test_add_hotspot_user_password_never_in_audit_journal` and
+  `tests/test_server.py`'s
+  `test_add_hotspot_user_password_in_result_but_never_in_audit_journal` for
+  the proof, at both the guard layer and the full MCP tool-call boundary.
+- **`create_backup`** (write, guarded): creates a RouterOS system backup
+  file (`/system/backup/save name=<name>`, optional encryption `password`).
+  A third ACTION-command allowlist entry (after `start`/`stop`, v0.7, and
+  `flush`/`wol`, v0.10) - `"save"` is RouterOS's own literal command word,
+  dispatched through the same `getattr(client, op.action)` mechanism as
+  every other guarded write (`MikrotikClient.save`, new). Refuses to
+  overwrite an existing `.backup` file of the same name
+  (`ResourceAlreadyExistsError`) - RouterOS itself would silently overwrite
+  one. `password` (the backup FILE's own encryption option, unrelated to any
+  device/API credential) is redacted **before** the `WritePreview` is ever
+  constructed - the same "redact before constructing the preview" rule
+  v0.13's WireGuard round established for private/preshared keys - so it
+  never reaches the caller or the journal.
+
+### Changed
+
+- `guard.ALLOWLIST`'s `WriteOperation.action` now also accepts `"save"`
+  (`create_backup`) alongside the existing `update`/`add`/`remove`/`start`/
+  `stop`/`flush`/`wol` set - `tests/test_guard.py`'s
+  `test_allowlist_only_contains_named_operations` and
+  `tests/test_server.py`'s `test_server_never_calls_write_primitives_directly`
+  (the meta-test enumerating every write-primitive method name) were both
+  updated accordingly.
+
+### Non-goals (still deliberately not exposed)
+
+- **Backup restore** (`/system/backup/load`): same risk class as reboot -
+  loading a backup overwrites the device's entire running configuration and
+  reboots it, with no meaningful before/after preview and no rollback.
+  Restoring a backup stays a manual, on-device (WinBox/CLI) operation until
+  it has its own confirmation/cooldown policy.
+
 ## [0.13.0] - Unreleased
 
 WireGuard VPN management round - the most security-sensitive round to date,

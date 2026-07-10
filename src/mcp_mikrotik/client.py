@@ -449,6 +449,53 @@ class MikrotikClient:
 
         return self._run_read("interface/lte/monitor", _do)
 
+    def torch(
+        self,
+        interface: str,
+        src_address: str | None = None,
+        dst_address: str | None = None,
+        port: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run /tool/torch once=yes for one interface - a single live
+        traffic snapshot (RouterOS's own real-time traffic monitor),
+        returning every flow RouterOS reports for that instant (one row per
+        src/dst/protocol tuple actively passing through `interface`),
+        optionally narrowed on-device by src-address/dst-address/port before
+        the snapshot ever leaves the router.
+
+        Same "once" semantics as monitor_traffic/poe_monitor/lte_monitor
+        above: `once=""` gets exactly one snapshot back instead of opening
+        RouterOS's normal continuous torch stream (interactive-only in
+        WinBox/CLI - the API form would otherwise keep the session open
+        waiting for further updates and never return). `interface` is
+        expected to already be validated (validation.validate_interface_name);
+        `src_address`/`dst_address`/`port`, if given, are forwarded as
+        RouterOS's own src-address/dst-address/port filter fields, also
+        expected to already be validated by the caller (server.py's `torch`
+        tool).
+
+        Same v0.7.1 lesson as monitor_traffic/poe_monitor/lte_monitor:
+        librouteros' callable connection form returns a GENERATOR here too -
+        this always materializes with list(...) before returning, rather
+        than assuming the reply is already a list. Unlike those three
+        (single-row replies), a torch snapshot can genuinely carry many rows
+        (one per flow) - server.py's `torch` tool is what caps how many of
+        them are actually returned to a caller. Retried automatically on a
+        transient network error - see _run_read.
+        """
+
+        def _do(connection: RouterosConnection) -> list[dict[str, Any]]:
+            kwargs: dict[str, Any] = {"interface": interface, "once": ""}
+            if src_address:
+                kwargs["src-address"] = src_address
+            if dst_address:
+                kwargs["dst-address"] = dst_address
+            if port is not None:
+                kwargs["port"] = str(port)
+            return [dict(row) for row in connection("/tool/torch", **kwargs)]
+
+        return self._run_read("tool/torch", _do)
+
     # --- Write primitives -------------------------------------------------
     # These are intentionally NOT exposed as MCP tools directly. The only
     # caller allowed to invoke them is guard.py, which maps each write
@@ -574,6 +621,40 @@ class MikrotikClient:
             )
 
         self._execute_once("/".join(segments) + "/wol", _do)
+
+    # --- v0.14: backup creation ACTION command -----------------------------
+    #
+    # /system/backup/save is RouterOS's own literal command word for "create
+    # a backup file now" - a third standalone, one-shot ACTION command
+    # alongside flush()/wol() above (no specific row/.id targeted; there is
+    # no "list" of backups to pick one row from), dispatched via the same
+    # connection CALLABLE form. guard.ALLOWLIST["create_backup"] names this
+    # method via its `action` field ("save"), dispatched through the same
+    # `getattr(client, op.action)` every other guarded write uses.
+
+    def save(self, *segments: str, name: str, password: str | None = None) -> None:
+        """Run /system/backup/save (create a RouterOS system backup file) -
+        see guard.create_backup. `segments` supplies the menu path
+        (("system", "backup")); this method appends the fixed "/save"
+        command word itself, mirroring flush()/wol()'s pattern above.
+        `name`/`password` are forwarded as structured parameters, expected
+        to already be validated (validation.validate_backup_name/
+        validate_backup_password) - never part of a command string.
+        `password`, RouterOS's own backup-FILE encryption option, is never
+        logged or echoed by this method - guard.create_backup keeps it out
+        of the WritePreview entirely (see that function's docstring).
+
+        Same "materialize the reply with list(...) first" and "no retry"
+        notes as flush()/wol() above apply here too.
+        """
+
+        def _do(connection: RouterosConnection) -> None:
+            kwargs: dict[str, Any] = {"name": name}
+            if password is not None:
+                kwargs["password"] = password
+            list(connection("/" + "/".join(segments) + "/save", **kwargs))
+
+        self._execute_once("/".join(segments) + "/save", _do)
 
     def close(self) -> None:
         if self._connection is not None:
