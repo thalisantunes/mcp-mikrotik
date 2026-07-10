@@ -877,3 +877,100 @@ def validate_firewall_rule_position(value: int) -> int:
     if value < 0:
         raise ValidationError(f"position {value!r} must be zero or greater.")
     return value
+
+
+# --- v1.3: PPP/PPPoE secrets -------------------------------------------------
+#
+# `/ppp/secret` rows are a *service* credential (dial-in access only, never
+# router admin - see ROADMAP.md's non-goal note on `/user`), the same risk
+# class `add_hotspot_user` (v0.14) already handles. `name`/`password` below
+# deliberately mirror `validate_hotspot_username`/`validate_hotspot_password`
+# exactly (own charset/length constants, not a shared function) - same
+# convention every other domain in this module follows (compare
+# `validate_backup_name` vs `validate_address_list_name`: identical shape,
+# separate functions so each keeps its own field-specific error text).
+
+_PPP_SECRET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_MAX_PPP_SECRET_PASSWORD_LENGTH = 128
+_PPP_SECRET_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+# RouterOS `/ppp/secret`'s `service` field: exactly these six values
+# (RouterOS itself rejects anything else at the CLI too) - "any" matches
+# every PPP service type, RouterOS's own default.
+_PPP_SERVICES = ("pppoe", "pptp", "l2tp", "ovpn", "sstp", "any")
+
+
+def validate_ppp_secret_name(value: str) -> str:
+    """Validate a PPP/PPPoE secret's `name` (RouterOS `/ppp/secret`'s `name`
+    field - the dial-in login username), used by `add_ppp_secret`/
+    `remove_ppp_secret`. Same conservative charset as
+    `validate_hotspot_username`/`_INTERFACE_NAME`: letters, digits, '.',
+    '_', '-' only, starting with a letter/digit, max 64 chars.
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("PPP secret name must be a non-empty string.")
+    value = value.strip()
+    if not _PPP_SECRET_NAME.match(value):
+        raise ValidationError(
+            f"PPP secret name {value!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return value
+
+
+def validate_ppp_secret_password(value: str) -> str:
+    """Validate a PPP/PPPoE secret's `password`. Same "reject only control
+    characters" permissiveness as `validate_hotspot_password` - see that
+    function's docstring - this too is a credential the caller must be free
+    to choose, not free text.
+
+    Returns `value` unchanged (not stripped - an exact credential, not free
+    text) on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValidationError("PPP secret password must be a non-empty string.")
+    if len(value) > _MAX_PPP_SECRET_PASSWORD_LENGTH:
+        raise ValidationError(f"PPP secret password is too long (max {_MAX_PPP_SECRET_PASSWORD_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("PPP secret password contains control characters, which are not allowed.")
+    return value
+
+
+def validate_ppp_service(value: str) -> str:
+    """Validate a PPP/PPPoE secret's `service`, used by `add_ppp_secret`.
+    Must be one of "pppoe", "pptp", "l2tp", "ovpn", "sstp", "any"
+    (RouterOS's own default). Case-insensitive on input, normalized to
+    lower-case on return (RouterOS's own field is lower-case).
+
+    Returns the normalized value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("PPP service must be a non-empty string.")
+
+    normalized = value.strip().lower()
+    if normalized not in _PPP_SERVICES:
+        raise ValidationError(f"PPP service {value!r} is not valid (expected one of {_PPP_SERVICES}).")
+    return normalized
+
+
+def validate_ppp_profile(value: str) -> str:
+    """Validate a PPP/PPPoE secret's `profile` name (`/ppp/profile`'s
+    `name` - an existing profile this secret is assigned to, e.g. to set its
+    local/remote address pool or rate limit). Shape-only, same conservative
+    charset as `validate_ppp_secret_name` - existence on the device is not
+    checked here (RouterOS itself rejects an unknown profile name at write
+    time).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("PPP profile must be a non-empty string.")
+    value = value.strip()
+    if not _PPP_SECRET_PROFILE.match(value):
+        raise ValidationError(
+            f"PPP profile {value!r} is not valid "
+            "(letters, digits, '.', '_', '-' only, starting with a letter/digit, max 64 chars)."
+        )
+    return value

@@ -3362,4 +3362,276 @@ def test_move_firewall_rule_dispatches_via_allowlist_action(
 
     guard.move_firewall_rule(client, settings_write_enabled, comment="rule-c", position=0, confirm=True)
 
-    assert called == {"path": patched_op.path, "fields": {"id": "*3", "destination": "*1"}}
+
+# --- v1.3: add_ppp_secret -----------------------------------------------------
+#
+# add_ppp_secret's password asymmetry (present in the tool RESULT, absent
+# from the audit journal - mirroring add_hotspot_user's own) is proven in
+# tests/test_guard_audit.py, not here - these tests cover the ordinary
+# guard mechanics (gate, preview/confirm, duplicate rejection, validation).
+
+
+def _ppp_secret_fixture() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("ppp", "secret"): [
+                {
+                    ".id": "*1",
+                    "name": "pppoe-client1",
+                    "password": "s3cret-fake",
+                    "service": "pppoe",
+                    "profile": "default-encryption",
+                    "remote-address": "10.40.0.10",
+                    "disabled": "false",
+                }
+            ]
+        }
+    )
+
+
+def test_add_ppp_secret_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.add_ppp_secret(client, settings, name="customer2", password="Passw0rd!", confirm=True)
+
+
+def test_add_ppp_secret_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.add_ppp_secret(guarded_client, settings, name="customer2", password="Passw0rd!", confirm=True)
+
+
+def test_add_ppp_secret_preview_does_not_create(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ppp_secret(
+        client, settings_write_enabled, name="customer2", password="Passw0rd!", confirm=False
+    )
+    assert preview.applied is False
+    assert preview.before == {}
+    assert preview.after == {"name": "customer2", "password": "Passw0rd!", "service": "any"}
+    names = {row["name"] for row in fake.path("ppp", "secret")._rows}
+    assert "customer2" not in names
+
+
+def test_add_ppp_secret_confirm_true_creates(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ppp_secret(client, settings_write_enabled, name="customer2", password="Passw0rd!", confirm=True)
+    assert preview.applied is True
+    assert preview.after == {"name": "customer2", "password": "Passw0rd!", "service": "any"}
+    rows = fake.path("ppp", "secret")._rows
+    created = next(row for row in rows if row["name"] == "customer2")
+    assert created["password"] == "Passw0rd!"
+    assert created["service"] == "any"
+
+
+def test_add_ppp_secret_confirm_true_with_optional_fields(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.add_ppp_secret(
+        client,
+        settings_write_enabled,
+        name="customer3",
+        password="Passw0rd!",
+        service="pppoe",
+        profile="guest-profile",
+        remote_address="10.40.0.99",
+        comment="new customer",
+        confirm=True,
+    )
+    assert preview.applied is True
+    assert preview.after == {
+        "name": "customer3",
+        "password": "Passw0rd!",
+        "service": "pppoe",
+        "profile": "guest-profile",
+        "remote-address": "10.40.0.99",
+        "comment": "new customer",
+    }
+
+
+def test_add_ppp_secret_rejects_duplicate_name(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceAlreadyExistsError) as exc_info:
+        guard.add_ppp_secret(
+            client, settings_write_enabled, name="pppoe-client1", password="AnotherPass1", confirm=True
+        )
+    assert "pppoe-client1" in str(exc_info.value)
+    rows = [row for row in fake.path("ppp", "secret")._rows if row["name"] == "pppoe-client1"]
+    assert len(rows) == 1
+
+
+def test_add_ppp_secret_rejects_invalid_name_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ppp_secret(
+            guarded_client, settings_write_enabled, name="bad name!", password="Passw0rd!", confirm=True
+        )
+
+
+def test_add_ppp_secret_rejects_empty_password_before_touching_device(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ppp_secret(guarded_client, settings_write_enabled, name="customer2", password="", confirm=True)
+
+
+def test_add_ppp_secret_rejects_invalid_service_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ppp_secret(
+            guarded_client, settings_write_enabled, name="customer2", password="Passw0rd!", service="ike2", confirm=True
+        )
+
+
+def test_add_ppp_secret_rejects_invalid_profile_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ppp_secret(
+            guarded_client,
+            settings_write_enabled,
+            name="customer2",
+            password="Passw0rd!",
+            profile="bad profile!",
+            confirm=True,
+        )
+
+
+def test_add_ppp_secret_rejects_invalid_remote_address_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.add_ppp_secret(
+            guarded_client,
+            settings_write_enabled,
+            name="customer2",
+            password="Passw0rd!",
+            remote_address="not-an-ip",
+            confirm=True,
+        )
+
+
+def test_add_ppp_secret_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["add_ppp_secret"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "add_ppp_secret", patched_op)
+
+    guard.add_ppp_secret(client, settings_write_enabled, name="customer2", password="Passw0rd!", confirm=True)
+
+    assert called == {
+        "path": patched_op.path,
+        "fields": {"name": "customer2", "password": "Passw0rd!", "service": "any"},
+    }
+
+
+# --- v1.3: remove_ppp_secret --------------------------------------------------
+
+
+def test_remove_ppp_secret_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_ppp_secret(client, settings, name="pppoe-client1", confirm=True)
+
+
+def test_remove_ppp_secret_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.remove_ppp_secret(guarded_client, settings, name="pppoe-client1", confirm=True)
+
+
+def test_remove_ppp_secret_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=False)
+
+    assert preview.applied is False
+    assert preview.before["name"] == "pppoe-client1"
+    assert preview.after == {}
+    names = {row["name"] for row in fake.path("ppp", "secret")._rows}
+    assert "pppoe-client1" in names
+
+
+def test_remove_ppp_secret_preview_never_includes_password(settings_write_enabled: Settings, device: Device):
+    """SECURITY: the matched row's `password` must be stripped from `before`
+    in guard.py itself, before the WritePreview is ever constructed - see
+    guard.remove_ppp_secret's docstring."""
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=False)
+    assert "password" not in preview.before
+
+
+def test_remove_ppp_secret_confirm_true_removes(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=True)
+
+    assert preview.applied is True
+    names = {row["name"] for row in fake.path("ppp", "secret")._rows}
+    assert "pppoe-client1" not in names
+
+
+def test_remove_ppp_secret_unknown_name_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.remove_ppp_secret(client, settings_write_enabled, name="ghost-secret", confirm=True)
+    assert "ghost-secret" in str(exc_info.value)
+
+
+def test_remove_ppp_secret_ambiguous_name_raises_and_removes_nothing(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("ppp", "secret"): [
+                {".id": "*1", "name": "dup-secret", "password": "one-fake", "service": "pppoe"},
+                {".id": "*2", "name": "dup-secret", "password": "two-fake", "service": "l2tp"},
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(AmbiguousResourceError) as exc_info:
+        guard.remove_ppp_secret(client, settings_write_enabled, name="dup-secret", confirm=True)
+    assert "dup-secret" in str(exc_info.value)
+    rows = [row for row in fake.path("ppp", "secret")._rows if row["name"] == "dup-secret"]
+    assert len(rows) == 2
+
+
+def test_remove_ppp_secret_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _ppp_secret_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["remove_ppp_secret"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "remove_ppp_secret", patched_op)
+
+    guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*1",)}}

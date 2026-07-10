@@ -8,13 +8,15 @@ set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule,
 add_wireguard_interface/add_wireguard_peer/remove_wireguard_peer,
-add_hotspot_user, create_backup, add_vlan/remove_vlan, move_firewall_rule -
+add_hotspot_user, create_backup, add_vlan/remove_vlan, move_firewall_rule,
+add_ppp_secret/remove_ppp_secret -
 see guard.py's ALLOWLIST for the full write-tool inventory), plus the
 read-only connection_tracking tool (v0.11), the read-only
 security_audit/security_events tools (v0.12 - see security.py), the
 read-only wireguard_interfaces tool (v0.13), three more read-only tools from
-v0.14 - hotspot_active, torch, list_backups - and (v1.2) one more read-only
-tool - list_vlans. Transport is stdio only - this process is meant to run on
+v0.14 - hotspot_active, torch, list_backups - (v1.2) one more read-only
+tool - list_vlans - and (v1.3) one more read-only tool - ppp_secrets.
+Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
 
@@ -99,6 +101,11 @@ _DEFAULT_LOG_LEVEL = "INFO"
 # (the same constant guard.py's write-preview redaction uses, so read and
 # write paths can never drift out of sync).
 _WIREGUARD_REDACTED_FIELDS = WIREGUARD_SENSITIVE_FIELDS
+
+# v1.3: a /ppp/secret row's `password` field must never be returned by
+# `ppp_secrets` - same "never a secret in a read tool's output" rule
+# `_WIREGUARD_REDACTED_FIELDS` above enforces for WireGuard.
+_PPP_SECRET_REDACTED_FIELDS = frozenset({"password"})
 
 
 def build_server(settings: Settings | None = None, client_factory: ClientFactory = get_client) -> FastMCP:
@@ -383,6 +390,32 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             return rows_to_list(client.path("ppp", "active"))
         except DeviceCommandError:
             return []
+
+    @mcp.tool()
+    @_safe
+    def ppp_secrets(device_name: str) -> list[dict[str, Any]]:
+        """List CONFIGURED PPP/PPPoE secrets (/ppp/secret): name, service
+        (pppoe/pptp/l2tp/ovpn/sstp/any), profile, remote-address,
+        local-address (if set), disabled, comment, last-logged-out (if set)
+        - the dial-in credentials themselves, as opposed to `ppp_active`'s
+        currently-CONNECTED sessions. See "PPP/PPPoE secrets" below.
+
+        SECURITY: RouterOS's own /ppp/secret reply carries each secret's
+        plaintext `password` - this is ALWAYS stripped before returning
+        (formatting.strip_sensitive_fields), the same mechanism
+        `wireguard_interfaces` uses for a tunnel interface's private-key. A
+        secret's password never leaves this process via this tool. See
+        test_ppp_secrets_never_exposes_password.
+
+        Returns an empty list (never an error) for a device with no PPP
+        package configured at all - same convention as `ppp_active`.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("ppp", "secret"))
+        except DeviceCommandError:
+            return []
+        return strip_sensitive_fields(rows, _PPP_SECRET_REDACTED_FIELDS)
 
     @mcp.tool()
     @_safe
@@ -1962,6 +1995,75 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             position=position,
             confirm=confirm,
         )
+        return asdict(preview)
+
+    # --- v1.3: PPP/PPPoE secrets ------------------------------------------
+
+    @mcp.tool()
+    @_safe
+    def add_ppp_secret(
+        device_name: str,
+        name: str,
+        password: str,
+        service: str = "any",
+        profile: str | None = None,
+        remote_address: str | None = None,
+        comment: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Create a PPP/PPPoE secret (`/ppp/secret add`) - `name`/`password`
+        are the dial-in login credentials for a PPPoE/PPTP/L2TP/OpenVPN/SSTP
+        service. `service` (default `"any"`) restricts which PPP service the
+        secret may authenticate for - one of "pppoe"/"pptp"/"l2tp"/"ovpn"/
+        "sstp"/"any". `profile` (an existing `/ppp/profile` name, e.g. to
+        assign an address pool or rate limit), `remote_address` (a literal
+        IP handed to the client on connect), and `comment` are all optional.
+
+        PASSWORD IN THE RESULT: like `add_hotspot_user`'s voucher password,
+        this tool's `password` is DELIBERATELY present in its result (the
+        caller supplied it and gets it echoed back as confirmation) - but
+        still never written to the audit journal. See
+        `guard.add_ppp_secret`'s docstring for exactly how that asymmetry
+        holds.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a preview without changing anything; call again
+        with confirm=True to actually create it. Errors clearly (without
+        creating anything) if `name` already exists on the device - it
+        never creates a duplicate or resets an existing secret's password.
+        """
+        client = _client(device_name)
+        preview = guard.add_ppp_secret(
+            client,
+            settings,
+            name=name,
+            password=password,
+            service=service,
+            profile=profile,
+            remote_address=remote_address,
+            comment=comment,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def remove_ppp_secret(device_name: str, name: str, confirm: bool = False) -> dict[str, Any]:
+        """Remove a PPP/PPPoE secret (`/ppp/secret remove`) by `name`.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually remove it. Errors clearly
+        if no secret matches `name` (`ResourceNotFoundError`), or if more
+        than one somehow does (`AmbiguousResourceError`) - never guesses
+        which one to remove. **The returned preview's `before` never
+        includes the secret's `password`** - redacted before the preview is
+        ever built (see `guard.remove_ppp_secret`'s docstring).
+        """
+        client = _client(device_name)
+        preview = guard.remove_ppp_secret(client, settings, name=name, confirm=confirm)
         return asdict(preview)
 
     return mcp

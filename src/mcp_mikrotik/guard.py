@@ -72,6 +72,10 @@ from .validation import (
     validate_ping_address,
     validate_poe_out,
     validate_port,
+    validate_ppp_profile,
+    validate_ppp_secret_name,
+    validate_ppp_secret_password,
+    validate_ppp_service,
     validate_rate_pair,
     validate_route_distance,
     validate_route_gateway,
@@ -414,6 +418,31 @@ ALLOWLIST: dict[str, WriteOperation] = {
             "comment (optionally narrowed by chain) - never creates or otherwise edits a rule; only "
             "its position in the chain's evaluation order changes."
         ),
+    ),
+    # v1.3: PPP/PPPoE secrets (/ppp/secret) - a *service* credential (dial-in
+    # network access only, never router admin - a different, lower risk
+    # class than a /user login), so it follows add_hotspot_user's (v0.14)
+    # precedent exactly: password DELIBERATELY present in the tool's own
+    # result, never in the audit journal (audit._SENSITIVE_KEY already
+    # matches "password" - no new redaction code needed). add_ppp_secret/
+    # remove_ppp_secret are otherwise an ordinary named-resource add/remove
+    # pair, following add_static_dns/add_vlan's shape (resolved by `name`,
+    # refuses a duplicate on add, raises AmbiguousResourceError on remove if
+    # more than one row somehow shares a `name`).
+    "add_ppp_secret": WriteOperation(
+        name="add_ppp_secret",
+        path=("ppp", "secret"),
+        action="add",
+        description=(
+            "Create a PPP/PPPoE secret (name, password, service, optional profile/remote-address/"
+            "comment) - a dial-in service credential. Refuses to create a duplicate name."
+        ),
+    ),
+    "remove_ppp_secret": WriteOperation(
+        name="remove_ppp_secret",
+        path=("ppp", "secret"),
+        action="remove",
+        description="Remove a PPP/PPPoE secret by name (/ppp/secret remove).",
     ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
@@ -2514,4 +2543,155 @@ def move_firewall_rule(
 
     write = getattr(client, op.action)
     write(*op.path, id=target_id, destination=destination_id)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v1.3: PPP/PPPoE secrets --------------------------------------------------
+#
+# add_ppp_secret/remove_ppp_secret manage `/ppp/secret` rows - RouterOS's
+# configured dial-in credentials for PPP-based services (PPPoE, PPTP, L2TP,
+# OpenVPN, SSTP), as opposed to `ppp_active` (server.py, read-only), which
+# lists currently-CONNECTED sessions. A `/ppp/secret` is a *service*
+# credential - it only grants network/dial-in access, never router admin
+# (unlike a `/user` login, which is deliberately NOT on this package's
+# roadmap - see ROADMAP.md's non-goal note) - the same risk class
+# `add_hotspot_user` (v0.14) already established a pattern for.
+#
+# PASSWORD ASYMMETRY (read this before touching add_ppp_secret): exactly
+# like `add_hotspot_user`'s voucher password, the plaintext `password` this
+# function is given DOES appear in its returned `WritePreview.after` (both
+# on `confirm=false` preview and `confirm=true` applied) - the caller
+# supplied it themselves, and gets it echoed back as confirmation of exactly
+# what was written, the same shape `add_hotspot_user` uses. It must still
+# NEVER reach the audit journal: no new redaction code is needed for that -
+# `audit._SENSITIVE_KEY` already matches "password" case-insensitively and
+# strips it from the `_audited` decorator's journaled summary regardless of
+# which function produced it (see add_hotspot_user's own module note above
+# for the full mechanism). See tests/test_guard_audit.py's
+# `test_add_ppp_secret_password_never_in_audit_journal` for the proof.
+#
+# remove_ppp_secret redacts the opposite way `add_ppp_secret` does: unlike
+# an add (which never reads back an existing row - it only ever proposes a
+# fresh `payload`), remove looks up an EXISTING row first, and that row's
+# own `password` field must never leak into `before` either - so it is
+# stripped here, in guard.py, before the WritePreview is ever constructed
+# (the same "redact before constructing the preview" rule v0.13's WireGuard
+# round established), on top of `audit._SENSITIVE_KEY` as a second,
+# independent line of defense.
+
+
+def _find_ppp_secret_rows(rows: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    """All /ppp/secret rows matching `name`. RouterOS itself expects a
+    secret `name` to be unique, but this returns every match rather than
+    just the first one - same defensive shape as `_find_static_dns_rows` -
+    so `remove_ppp_secret` can raise `AmbiguousResourceError` instead of
+    guessing, if the device somehow has more than one."""
+    return [row for row in rows if row.get("name") == name]
+
+
+@_audited("add_ppp_secret")
+def add_ppp_secret(
+    client: MikrotikClient,
+    settings: Settings,
+    name: str,
+    password: str,
+    confirm: bool,
+    service: str = "any",
+    profile: str | None = None,
+    remote_address: str | None = None,
+    comment: str | None = None,
+) -> WritePreview:
+    """Create a PPP/PPPoE secret (`/ppp/secret add`) - a dial-in service
+    credential for PPPoE/PPTP/L2TP/OpenVPN/SSTP.
+
+    `service` (default `"any"`) restricts which PPP service the secret may
+    authenticate for - must be one of "pppoe"/"pptp"/"l2tp"/"ovpn"/"sstp"/
+    "any" (`validate_ppp_service`). `profile` (an existing `/ppp/profile`
+    name, e.g. to assign an address pool or rate limit - not verified to
+    exist here; RouterOS itself rejects an unknown profile at write time)
+    and `remote_address` (a literal IP handed to the client on connect -
+    `validate_ip_address`) and `comment` are all optional.
+
+    PASSWORD ASYMMETRY: see the module note above this section - the
+    plaintext `password` DOES appear in this function's returned
+    `WritePreview.after`, mirroring `add_hotspot_user`'s voucher password,
+    but never reaches the audit journal (`audit._SENSITIVE_KEY`).
+
+    Refuses to create a duplicate `name` - raises ResourceAlreadyExistsError
+    instead of creating a second secret (or silently resetting the first
+    one's password). This tool only ever adds; it never updates or removes
+    an existing secret.
+    """
+    op = _require_allowed(settings, "add_ppp_secret")
+
+    validated_name = validate_ppp_secret_name(name)
+    validated_password = validate_ppp_secret_password(password)
+    validated_service = validate_ppp_service(service)
+    validated_profile = validate_ppp_profile(profile) if profile is not None else None
+    validated_remote_address = validate_ip_address(remote_address) if remote_address is not None else None
+    validated_comment = validate_comment(comment) if comment is not None else None
+
+    rows = client.path(*op.path)
+    if _find_ppp_secret_rows(rows, validated_name):
+        raise ResourceAlreadyExistsError(client.device.name, "PPP secret", validated_name)
+
+    payload: dict[str, Any] = {"name": validated_name, "password": validated_password, "service": validated_service}
+    if validated_profile:
+        payload["profile"] = validated_profile
+    if validated_remote_address:
+        payload["remote-address"] = validated_remote_address
+    if validated_comment:
+        payload["comment"] = validated_comment
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+@_audited("remove_ppp_secret")
+def remove_ppp_secret(client: MikrotikClient, settings: Settings, name: str, confirm: bool) -> WritePreview:
+    """Remove a PPP/PPPoE secret (`/ppp/secret remove`) by `name`.
+
+    Raises ResourceNotFoundError if no secret matches. Raises
+    AmbiguousResourceError if more than one row matches `name` - never
+    guesses which one to remove.
+
+    SECURITY: the matched row's `password` field is stripped from `before`
+    here, in guard.py, BEFORE the WritePreview is ever constructed - see the
+    module note above this section - so a remove_ppp_secret preview/journal
+    entry can never carry the secret being removed, on top of
+    `audit._SENSITIVE_KEY`'s own independent redaction.
+    """
+    op = _require_allowed(settings, "remove_ppp_secret")
+
+    validated_name = validate_ppp_secret_name(name)
+
+    rows = client.path(*op.path)
+    matches = _find_ppp_secret_rows(rows, validated_name)
+
+    if not matches:
+        raise ResourceNotFoundError(client.device.name, "PPP secret", validated_name)
+    if len(matches) > 1:
+        raise AmbiguousResourceError(
+            client.device.name,
+            "PPP secret",
+            validated_name,
+            [row.get("service", "") for row in matches],
+        )
+
+    row = matches[0]
+    before = strip_sensitive_fields([dict(row)], {"password"})[0]
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
     return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)

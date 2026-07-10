@@ -246,6 +246,22 @@ def fake_connection() -> FakeConnection:
                     "uptime": "1h2m",
                 }
             ],
+            # v1.3: PPP/PPPoE secrets - the CONFIGURED credential, distinct
+            # from ("ppp", "active") above (a currently-connected session).
+            # Carries a fake `password` so ppp_secrets' redaction (never
+            # returning it) has something real to strip in tests.
+            ("ppp", "secret"): [
+                {
+                    ".id": "*1",
+                    "name": "pppoe-client1",
+                    "password": "s3cret-fake",
+                    "service": "pppoe",
+                    "profile": "default-encryption",
+                    "remote-address": "10.40.0.10",
+                    "disabled": "false",
+                    "comment": "fiber customer #1",
+                }
+            ],
             ("ip", "ipsec", "active-peers"): [
                 {
                     ".id": "*1",

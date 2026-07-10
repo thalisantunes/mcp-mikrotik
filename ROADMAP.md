@@ -23,6 +23,11 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
+**Recently shipped:** PPP/PPPoE secrets — `ppp_secrets` (read),
+`add_ppp_secret` / `remove_ppp_secret` (guarded) — landed in **v1.3**
+(read+add+remove verified against real ROS7 hardware; password redacted in the
+audit journal and never returned by the read).
+
 ## Feasibility note
 
 Candidate API paths were probed against real hardware — a **mANTBox ax 15s on
@@ -65,18 +70,11 @@ separately-argued case. The default stance is: stay API-only.
 
 ## Tier 1 — next up
 
-Highest audience value plus the cheapest wins: three of these just extend a
-pattern already shipped and proven (toggle-by-comment, add/remove a leaf
-object). All paths verified present on ROS7 (see caveats above).
+The cheapest, lowest-risk wins: each just extends a pattern already shipped and
+proven (toggle-by-comment, add/remove a leaf object). All paths verified present
+on ROS7 (see caveats above). (PPP/PPPoE secrets, previously the headline item
+here, shipped in v1.3 — see "Recently shipped" above.)
 
-- **PPP / PPPoE secrets** (`/ppp/secret`) — read (`ppp_secrets`) plus guarded
-  `add_ppp_secret` / `remove_ppp_secret`. Today only `ppp_active` exists (active
-  *sessions*, `server.py`), not the configured secrets — this is the gap. The
-  single biggest audience of a public MikroTik tool runs PPPoE as an ISP, so
-  this is table-stakes for them. It's a *service* credential (network access
-  only, not router admin — see the non-goal above), and there's precedent:
-  `add_hotspot_user` already creates a service credential the same way.
-  Passwords redacted in the audit journal, same as the WPA2 passphrase handling.
 - **NAT rule toggle by comment** (`/ip/firewall/nat`) — guarded
   `enable_nat_rule` / `disable_nat_rule`, mirroring the already-shipped
   `enable_firewall_rule` / `disable_firewall_rule` exactly. `firewall_nat` is

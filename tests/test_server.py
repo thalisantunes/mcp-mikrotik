@@ -37,6 +37,7 @@ EXPECTED_TOOLS = {
     "wireguard_peers",
     "wireguard_interfaces",
     "ppp_active",
+    "ppp_secrets",
     "ipsec_active_peers",
     "bgp_sessions",
     "ospf_neighbors",
@@ -95,6 +96,8 @@ EXPECTED_TOOLS = {
     "add_vlan",
     "remove_vlan",
     "move_firewall_rule",
+    "add_ppp_secret",
+    "remove_ppp_secret",
 }
 
 
@@ -415,6 +418,34 @@ async def test_ppp_active_returns_empty_when_no_ppp_server(settings: Settings):
     fake = FakeConnection(raise_for={("ppp", "active"): LibRouterosError("no such command")})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("ppp_active", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+# --- ppp_secrets (v1.3, read-only) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ppp_secrets_happy_path(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ppp_secrets", {"device_name": "core-switch"})
+    assert result["result"][0]["name"] == "pppoe-client1"
+    assert result["result"][0]["service"] == "pppoe"
+    assert result["result"][0]["remote-address"] == "10.40.0.10"
+
+
+@pytest.mark.asyncio
+async def test_ppp_secrets_never_exposes_password(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("ppp_secrets", {"device_name": "core-switch"})
+    assert "password" not in result["result"][0]
+    assert "s3cret-fake" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_ppp_secrets_returns_empty_when_no_ppp_server(settings: Settings):
+    fake = FakeConnection(raise_for={("ppp", "secret"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("ppp_secrets", {"device_name": "core-switch"})
     assert result["result"] == []
 
 
@@ -3740,3 +3771,238 @@ async def test_move_firewall_rule_ambiguous_comment_raises_and_disambiguated_by_
     assert applied["applied"] is True
     order = [row[".id"] for row in fake.path("ip", "firewall", "filter")._rows]
     assert order == ["*1", "*3", "*2"]
+
+
+# --- add_ppp_secret / remove_ppp_secret (v1.3, write, guarded) --------------
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ppp_secret",
+            {"device_name": "core-switch", "name": "customer2", "password": "Passw0rd!", "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "add_ppp_secret",
+        {
+            "device_name": "core-switch",
+            "name": "customer2",
+            "password": "Passw0rd!",
+            "service": "pppoe",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+    assert preview["after"] == {"name": "customer2", "password": "Passw0rd!", "service": "pppoe"}
+    names = {row["name"] for row in fake_connection.path("ppp", "secret")._rows}
+    assert "customer2" not in names
+
+    _content, applied = await mcp.call_tool(
+        "add_ppp_secret",
+        {
+            "device_name": "core-switch",
+            "name": "customer2",
+            "password": "Passw0rd!",
+            "service": "pppoe",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    names = {row["name"] for row in fake_connection.path("ppp", "secret")._rows}
+    assert "customer2" in names
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_preview_with_optional_fields(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_ppp_secret",
+        {
+            "device_name": "core-switch",
+            "name": "customer3",
+            "password": "Passw0rd!",
+            "service": "pppoe",
+            "profile": "default-encryption",
+            "remote_address": "10.40.0.20",
+            "comment": "new fiber customer",
+            "confirm": True,
+        },
+    )
+    assert applied["after"] == {
+        "name": "customer3",
+        "password": "Passw0rd!",
+        "service": "pppoe",
+        "profile": "default-encryption",
+        "remote-address": "10.40.0.20",
+        "comment": "new fiber customer",
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_rejects_duplicate_name(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ppp_secret",
+            {"device_name": "core-switch", "name": "pppoe-client1", "password": "Passw0rd!", "confirm": True},
+        )
+    assert "pppoe-client1" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_rejects_invalid_service_before_touching_device(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "add_ppp_secret",
+            {
+                "device_name": "core-switch",
+                "name": "customer4",
+                "password": "Passw0rd!",
+                "service": "not-a-service",
+                "confirm": True,
+            },
+        )
+    assert "service" in str(exc_info.value).lower()
+    names = {row["name"] for row in fake_connection.path("ppp", "secret")._rows}
+    assert "customer4" not in names
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_rejects_invalid_name_before_touching_device(
+    device: Device, fake_connection: FakeConnection
+):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError):
+        await mcp.call_tool(
+            "add_ppp_secret",
+            {"device_name": "core-switch", "name": "bad name!", "password": "Passw0rd!", "confirm": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_add_ppp_secret_password_in_result_but_never_in_audit_journal(
+    device: Device, fake_connection: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end proof of the v1.3 password asymmetry (mirroring
+    add_hotspot_user's own, v0.14), through the actual MCP tool call
+    boundary: the tool RESULT contains the plaintext secret password, but
+    the audit journal - fed the exact same guard.WritePreview - never
+    does."""
+    import json
+
+    log_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("MIKROTIK_AUDIT_LOG", str(log_path))
+
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, applied = await mcp.call_tool(
+        "add_ppp_secret",
+        {
+            "device_name": "core-switch",
+            "name": "customer-secure",
+            "password": "TotallySecretDialup!",
+            "confirm": True,
+        },
+    )
+
+    # (a) the tool RESULT contains the plaintext password.
+    assert applied["after"]["password"] == "TotallySecretDialup!"
+
+    # (b) the audit journal never does.
+    raw = log_path.read_text(encoding="utf-8")
+    assert "TotallySecretDialup!" not in raw
+    event = json.loads(raw.strip().splitlines()[-1])
+    assert "password" not in event["summary"]["after"]
+
+
+@pytest.mark.asyncio
+async def test_remove_ppp_secret_blocked_read_only_by_default(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_ppp_secret", {"device_name": "core-switch", "name": "pppoe-client1", "confirm": True}
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_ppp_secret_preview_then_confirm(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_ppp_secret", {"device_name": "core-switch", "name": "pppoe-client1", "confirm": False}
+    )
+    assert preview["applied"] is False
+    assert preview["before"]["name"] == "pppoe-client1"
+    names = {row["name"] for row in fake_connection.path("ppp", "secret")._rows}
+    assert "pppoe-client1" in names
+
+    _content, applied = await mcp.call_tool(
+        "remove_ppp_secret", {"device_name": "core-switch", "name": "pppoe-client1", "confirm": True}
+    )
+    assert applied["applied"] is True
+    names = {row["name"] for row in fake_connection.path("ppp", "secret")._rows}
+    assert "pppoe-client1" not in names
+
+
+@pytest.mark.asyncio
+async def test_remove_ppp_secret_preview_never_includes_password(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+
+    _content, preview = await mcp.call_tool(
+        "remove_ppp_secret", {"device_name": "core-switch", "name": "pppoe-client1", "confirm": False}
+    )
+    assert "password" not in preview["before"]
+    assert "s3cret-fake" not in str(preview)
+
+
+@pytest.mark.asyncio
+async def test_remove_ppp_secret_unknown_name_raises_clear_error(device: Device, fake_connection: FakeConnection):
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "remove_ppp_secret", {"device_name": "core-switch", "name": "ghost-secret", "confirm": True}
+        )
+    assert "ghost-secret" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_remove_ppp_secret_ambiguous_name_raises_and_removes_nothing(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ppp", "secret"): [
+                {".id": "*1", "name": "dup-secret", "password": "one-fake", "service": "pppoe"},
+                {".id": "*2", "name": "dup-secret", "password": "two-fake", "service": "l2tp"},
+            ]
+        }
+    )
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("remove_ppp_secret", {"device_name": "core-switch", "name": "dup-secret", "confirm": True})
+    assert "ambiguous" in str(exc_info.value).lower()
+    rows = [row for row in fake.path("ppp", "secret")._rows if row["name"] == "dup-secret"]
+    assert len(rows) == 2

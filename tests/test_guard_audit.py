@@ -1200,3 +1200,134 @@ def test_create_backup_blocked_when_write_disabled_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "create_backup"
+
+
+# --- add_ppp_secret / remove_ppp_secret (v1.3) -------------------------------
+
+
+def test_add_ppp_secret_confirmed_call_journals_outcome_applied(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.add_ppp_secret(client, settings_write_enabled, name="customer2", password="Passw0rd!", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "add_ppp_secret"
+    assert event["operation"] == "add_ppp_secret"
+    assert event["action"] == "add"
+    assert event["summary"]["after"]["name"] == "customer2"
+
+
+def test_add_ppp_secret_password_never_in_audit_journal(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Same asymmetry as add_hotspot_user's voucher password (v0.14): the
+    plaintext `password` DOES appear in what guard.add_ppp_secret returns
+    (the caller supplied it and gets it echoed back), but it must never
+    reach the audit journal."""
+    preview = guard.add_ppp_secret(
+        client, settings_write_enabled, name="customer2", password="Sup3rSecretDialup!", confirm=True
+    )
+    # (a) the tool's own return value DOES carry the password.
+    assert preview.after["password"] == "Sup3rSecretDialup!"
+
+    # (b) the audit journal does not - anywhere, in before or after.
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "Sup3rSecretDialup!" not in raw
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert "password" not in events[0]["summary"]["after"]
+    assert events[0]["summary"]["after"]["name"] == "customer2"
+
+
+def test_add_ppp_secret_password_never_in_audit_journal_on_preview(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """Same asymmetry as the applied case above, but for a confirm=False
+    preview - the password must be absent from the journal there too, even
+    though it's present in the preview's own `after`."""
+    preview = guard.add_ppp_secret(
+        client, settings_write_enabled, name="customer2", password="Sup3rSecretDialup!", confirm=False
+    )
+    assert preview.after["password"] == "Sup3rSecretDialup!"
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "Sup3rSecretDialup!" not in raw
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert "password" not in events[0]["summary"]["after"]
+
+
+def test_add_ppp_secret_duplicate_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """The shared fixture's ("ppp", "secret") table (see conftest) already
+    has a "pppoe-client1" secret."""
+    with pytest.raises(ResourceAlreadyExistsError):
+        guard.add_ppp_secret(client, settings_write_enabled, name="pppoe-client1", password="Passw0rd!", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_ppp_secret"
+
+
+def test_add_ppp_secret_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.add_ppp_secret(client, settings, name="customer2", password="Passw0rd!", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "add_ppp_secret"
+
+
+def test_remove_ppp_secret_confirmed_call_journals_outcome_applied_without_leaking_password(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    """The shared fixture's "pppoe-client1" secret carries a fake password
+    ("s3cret-fake") - proves remove_ppp_secret's `before` never journals it,
+    on top of guard.py's own before-the-preview redaction."""
+    guard.remove_ppp_secret(client, settings_write_enabled, name="pppoe-client1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    event = events[0]
+    assert event["outcome"] == "applied"
+    assert event["tool"] == "remove_ppp_secret"
+    assert event["operation"] == "remove_ppp_secret"
+    assert event["action"] == "remove"
+    assert event["summary"]["before"]["name"] == "pppoe-client1"
+    assert "password" not in event["summary"]["before"]
+
+    raw = audit_log.read_text(encoding="utf-8")
+    assert "s3cret-fake" not in raw
+
+
+def test_remove_ppp_secret_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.remove_ppp_secret(client, settings_write_enabled, name="ghost-secret", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_ppp_secret"
+
+
+def test_remove_ppp_secret_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.remove_ppp_secret(client, settings, name="pppoe-client1", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "remove_ppp_secret"

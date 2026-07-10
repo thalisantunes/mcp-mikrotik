@@ -29,6 +29,10 @@ from mcp_mikrotik.validation import (
     validate_ping_address,
     validate_poe_out,
     validate_port,
+    validate_ppp_profile,
+    validate_ppp_secret_name,
+    validate_ppp_secret_password,
+    validate_ppp_service,
     validate_rate_pair,
     validate_route_distance,
     validate_route_gateway,
@@ -862,3 +866,86 @@ def test_validate_firewall_rule_position_rejects_negative():
 def test_validate_firewall_rule_position_rejects_non_int(value):
     with pytest.raises(ValidationError):
         validate_firewall_rule_position(value)  # type: ignore[arg-type]
+
+
+# --- validate_ppp_secret_name (v1.3) -----------------------------------------
+
+
+@pytest.mark.parametrize("value", ["pppoe-client1", "customer.1", "a", "A1_b-c.d"])
+def test_validate_ppp_secret_name_accepts_valid(value: str):
+    assert validate_ppp_secret_name(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_ppp_secret_name_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_ppp_secret_name(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["-leading-dash", "has space", "has;semicolon", "a" * 65])
+def test_validate_ppp_secret_name_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_ppp_secret_name(value)
+
+
+# --- validate_ppp_secret_password (v1.3) -------------------------------------
+
+
+@pytest.mark.parametrize("value", ["Xk7mQ2p9", "a", "!@#$%^&*()"])
+def test_validate_ppp_secret_password_accepts_valid(value: str):
+    assert validate_ppp_secret_password(value) == value
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_validate_ppp_secret_password_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_ppp_secret_password(value)  # type: ignore[arg-type]
+
+
+def test_validate_ppp_secret_password_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_ppp_secret_password("a" * 129)
+
+
+def test_validate_ppp_secret_password_rejects_control_characters():
+    with pytest.raises(ValidationError, match="control characters"):
+        validate_ppp_secret_password("bad\npassword")
+
+
+# --- validate_ppp_service (v1.3) ---------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["pppoe", "pptp", "l2tp", "ovpn", "sstp", "any", "PPPoE", "  l2tp  "])
+def test_validate_ppp_service_accepts_valid(value: str):
+    assert validate_ppp_service(value) == value.strip().lower()
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_ppp_service_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_ppp_service(value)  # type: ignore[arg-type]
+
+
+def test_validate_ppp_service_rejects_unknown_value():
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_ppp_service("ike2")
+
+
+# --- validate_ppp_profile (v1.3) ---------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["default", "default-encryption", "profile.1"])
+def test_validate_ppp_profile_accepts_valid(value: str):
+    assert validate_ppp_profile(value) == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_validate_ppp_profile_rejects_empty_or_non_string(value):
+    with pytest.raises(ValidationError, match="non-empty string"):
+        validate_ppp_profile(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["-leading-dash", "has space", "has;semicolon", "a" * 65])
+def test_validate_ppp_profile_rejects_invalid_shape(value: str):
+    with pytest.raises(ValidationError, match="not valid"):
+        validate_ppp_profile(value)

@@ -3,6 +3,45 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.3.0] - 2026-07-10
+
+**PPP/PPPoE secrets** (`/ppp/secret`), following the existing write-guard
+model exactly (read-only by default, every write routed through `guard.py`'s
+allowlist, confirm/preview before applying, audit-journaled) and, more
+specifically, `add_hotspot_user`'s (v0.14) own precedent for handling a
+*service* credential (dial-in network access only, never router admin - a
+different, lower risk class than a `/user` login, which remains deliberately
+off the roadmap - see `ROADMAP.md`'s non-goal note).
+
+- `ppp_secrets` (read-only): lists configured `/ppp/secret` rows - name,
+  service, profile, remote-address, local-address (if set), disabled,
+  comment, last-logged-out (if set) - as opposed to the pre-existing
+  `ppp_active`, which lists currently-CONNECTED sessions. **Never returns a
+  secret's `password`** - stripped via `formatting.strip_sensitive_fields`,
+  the same mechanism `wireguard_interfaces` uses for a tunnel interface's
+  private-key.
+- `add_ppp_secret` (guarded write): creates a secret - `name`/`password` are
+  the dial-in credentials, `service` (default `"any"`, one of
+  `pppoe`/`pptp`/`l2tp`/`ovpn`/`sstp`/`any`) restricts which PPP service it
+  authenticates for, `profile`/`remote_address`/`comment` are optional.
+  Refuses to create a duplicate `name`. **PASSWORD ASYMMETRY**: like
+  `add_hotspot_user`'s voucher password, `password` DELIBERATELY appears in
+  this tool's own result (the caller supplied it and gets it echoed back as
+  confirmation) but is never journaled - `audit._SENSITIVE_KEY` already
+  matches `"password"`, so no new redaction code was needed.
+- `remove_ppp_secret` (guarded write): removes a secret by `name`. Raises
+  `AmbiguousResourceError` instead of guessing if more than one row somehow
+  shares a `name`. Unlike `add_ppp_secret`, this reads an EXISTING row back
+  first - its `password` field is stripped in `guard.py`, before the
+  `WritePreview` is ever constructed (the same "redact before constructing
+  the preview" rule v0.13's WireGuard round established), so it can never
+  leak into the returned preview or the audit journal either.
+- Four new validators added to `validation.py`: `validate_ppp_secret_name`,
+  `validate_ppp_secret_password`, `validate_ppp_service` (enum-checked
+  against the six values above), `validate_ppp_profile` - `remote_address`
+  reuses the existing `validate_ip_address`, `comment` reuses
+  `validate_comment`.
+
 ## [1.2.0] - 2026-07-10
 
 Two new feature areas, both following the existing write-guard model

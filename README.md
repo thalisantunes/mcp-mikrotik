@@ -34,19 +34,19 @@ each of those is avoided here.
 
 ## Status
 
-**1.2.0.** Every planned tool round has shipped: the full read-tool
-inventory (interfaces, VLANs, routing, DHCP, wireless, VPN/WireGuard,
+**1.3.0.** Every planned tool round has shipped: the full read-tool
+inventory (interfaces, VLANs, routing, DHCP, wireless, VPN/WireGuard/PPP,
 containers, LTE/5G, USB, hotspot, live traffic, backups, a heuristic
 security audit), guarded writes across identity/interfaces/wifi/bandwidth/
 DHCP/address-lists/PoE/containers/failover-routing/Netwatch/DNS/
 Wake-on-LAN/firewall-rule-toggle/firewall-rule-reorder/WireGuard/
-hotspot-vouchers/backup/VLANs, and the production-hardening layers this
-needs to run unattended against a real fleet - audit journal, correlation
-IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
+hotspot-vouchers/backup/VLANs/PPP-PPPoE-secrets, and the production-hardening
+layers this needs to run unattended against a real fleet - audit journal,
+correlation IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
 version-by-version history (what shipped in each round), and "Roadmap &
 non-goals" below for what's deliberately still out of scope, and why.
 
-The full pytest suite currently has 1214 tests, all passing against an
+The full pytest suite currently has 1298 tests, all passing against an
 in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
 a 95% floor) - see "Development & CI" below.
 
@@ -203,6 +203,7 @@ representative exchanges:
 | `wireguard_peers` | List WireGuard VPN peers (name, interface, public-key, endpoint, last-handshake, rx/tx, allowed-address, disabled). Never exposes a private-key or preshared-key, even defensively. Empty list (not an error) with no WireGuard interfaces. See "VPN & routing diagnostics" below. |
 | `wireguard_interfaces` | List WireGuard tunnel interfaces (name, listen-port, public-key, running, disabled, mtu). **Never exposes a private-key** - RouterOS's own reply genuinely carries one here (unlike `wireguard_peers`), always stripped before returning. Empty list (not an error) with no WireGuard interfaces. See "WireGuard management" below. |
 | `ppp_active` | List active PPP-based VPN server sessions (`/ppp/active`: name, service - l2tp/pptp/sstp/ovpn/pppoe, caller-id, address, uptime). Empty list (not an error) with no PPP server / no active sessions. |
+| `ppp_secrets` | List CONFIGURED PPP/PPPoE secrets (`/ppp/secret`: name, service, profile, remote-address, local-address, disabled, comment, last-logged-out) - the dial-in credentials themselves, as opposed to `ppp_active`'s currently-connected sessions. **Never exposes a secret's `password`**, even defensively. Empty list (not an error) with no PPP server. See "PPP/PPPoE secrets" below. |
 | `ipsec_active_peers` | List active IPsec peers (remote-address, state, uptime, rx/tx, side). Empty list (not an error) for a device that doesn't use IPsec. |
 | `bgp_sessions` | BGP session status (remote-address/as, state, uptime, prefix-count). Tries ROS7's `/routing/bgp/session` first, falls back to ROS6's `/routing/bgp/peer`; empty list (not an error) for a device that doesn't run BGP. |
 | `ospf_neighbors` | OSPF neighbor adjacencies (address, state, router-id, adjacency). Empty list (not an error) for a device that doesn't run OSPF. |
@@ -271,6 +272,8 @@ model" below for the full guard mechanism.
 | `add_vlan` | Create a VLAN interface (`/interface/vlan`): `name`, `vlan_id` (1-4094), parent `interface`, optional `mtu`/`comment`. Refuses a duplicate `name`. See "VLAN management" below. |
 | `remove_vlan` | Remove a VLAN interface by `name`. Errors if no VLAN interface matches. |
 | `move_firewall_rule` | Reorder an **EXISTING** firewall filter rule (`/ip/firewall/filter move`), resolved by its `comment` (optionally narrowed by `chain`) - same resolution as `enable_firewall_rule`/`disable_firewall_rule`. **Never creates or edits a rule's fields** - only its position changes, to either immediately before another rule (`before_comment`) or a given 0-based `position`. See "Firewall rule reorder (by comment)" below. |
+| `add_ppp_secret` | Create a PPP/PPPoE secret (`name`, `password`, `service` - one of `pppoe`/`pptp`/`l2tp`/`ovpn`/`sstp`/`any`, default `any` - optional `profile`/`remote_address`/`comment`). Refuses a duplicate `name`. **`password` DELIBERATELY appears in the result** (echoed back as confirmation) but never in the audit journal - same asymmetry as `add_hotspot_user`. See "PPP/PPPoE secrets" below. |
+| `remove_ppp_secret` | Remove a PPP/PPPoE secret by `name`. Errors if no secret matches, or if more than one somehow does (`AmbiguousResourceError`). The returned preview's `before` never includes the secret's `password`. |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
@@ -1004,6 +1007,52 @@ plus its current vs. new position - not the full row (unlike
 `enable_firewall_rule`/`disable_firewall_rule`'s preview), since no field on
 the rule itself is changing, only where it sits in the list.
 
+### PPP/PPPoE secrets (v1.3)
+
+`ppp_secrets` (read) lists `/ppp/secret` rows - the CONFIGURED dial-in
+credentials (name, service, profile, remote-address, local-address,
+disabled, comment, last-logged-out) - as opposed to the pre-existing
+`ppp_active`, which lists currently-CONNECTED sessions. `add_ppp_secret`
+(write, guarded) creates a new one - a dial-in *service* credential, not a
+device/API login:
+
+```
+add_ppp_secret(name="fiber-customer-42", password="Xk7mQ2p9", service="pppoe", profile="default-encryption")
+```
+
+`service` (default `"any"`) restricts which PPP service the secret may
+authenticate for - one of `"pppoe"`/`"pptp"`/`"l2tp"`/`"ovpn"`/`"sstp"`/
+`"any"`. `profile` (an existing `/ppp/profile` name, e.g. to assign an
+address pool or rate limit) and `remote_address` (a literal IP handed to the
+client on connect) and `comment` are all optional. Refuses to create a
+duplicate `name`. `remove_ppp_secret` (write, guarded) removes one by
+`name`, erroring (`ResourceNotFoundError`) if it doesn't exist, or
+(`AmbiguousResourceError`) if more than one row somehow shares that name -
+never guessing which one to remove.
+
+**Same risk class, same precedent as `add_hotspot_user` (v0.14).** A
+`/ppp/secret` only grants network/dial-in access - it can never touch the
+router's own configuration, unlike a `/user` login (which is deliberately
+**not** on this package's roadmap - see "Roadmap & non-goals" below). So
+`add_ppp_secret` follows `add_hotspot_user`'s password handling exactly: the
+plaintext `password` DELIBERATELY appears in this tool's own result (the
+caller supplied it and gets it echoed back as confirmation of exactly what
+was written), but never reaches the audit journal - `audit._SENSITIVE_KEY`
+already matches `"password"`, so no new redaction code was needed. See
+`tests/test_guard_audit.py`'s `test_add_ppp_secret_password_never_in_audit_journal`
+for the proof.
+
+`remove_ppp_secret` redacts the opposite way: it looks up an EXISTING row
+first, and that row's own `password` field is stripped in `guard.py` -
+**before** the returned preview is ever constructed - so it can never leak
+into the tool's result or the audit journal either. See
+`tests/test_guard.py`'s `test_remove_ppp_secret_preview_never_includes_password`
+for the proof.
+
+`ppp_secrets` never returns a `password` field at all, the same
+`formatting.strip_sensitive_fields` mechanism `wireguard_interfaces` uses
+for a tunnel interface's private-key.
+
 ## Security model
 
 This section is the single consolidated reference for every control this
@@ -1247,7 +1296,7 @@ pytest -q
 The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
-`client_factory` parameter on `build_server()`. It currently has 1214 tests,
+`client_factory` parameter on `build_server()`. It currently has 1298 tests,
 zero of which touch a real device or the network, at 100% line coverage.
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every push to `main`
@@ -1271,7 +1320,9 @@ change is considered mergeable:
 Run all three locally before opening a PR - see `CONTRIBUTING.md` for the
 exact commands, plus the full checklist a PR is reviewed against (the
 security-model rules every write tool must follow, and the step-by-step
-guide for adding a new tool, read or write).
+guide for adding a new tool, read or write). See `ROADMAP.md` for what's
+next and why - candidate tools are filtered through the same security-model
+invariants before landing there.
 
 ## Roadmap & non-goals
 
