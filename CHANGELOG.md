@@ -3,6 +3,80 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.12.0] - Unreleased
+
+Security audit round: two new READ-ONLY tools, `security_audit` and
+`security_events` (both new `src/mcp_mikrotik/security.py`) - the "analyze
+this router's security" use case. Neither tool is gated by
+`MIKROTIK_ALLOW_WRITE` and neither changes device state; both report
+findings for a human/LLM operator to act on. The security model itself
+(read-only gate, central write allowlist, confirm/preview) is unchanged -
+this round adds no new write capability at all.
+
+### Added
+
+- **`security_audit`** (read, `server.py` + `security.py`): aggregates
+  seven independent, defensive checks into `{"findings": [{"severity",
+  "category", "title", "detail", "recommendation"}, ...], "summary":
+  {"high", "medium", "low", "info"}}`, `findings` sorted by severity (high
+  first):
+  1. Insecure management services (`/ip/service`: telnet/ftp/www/api
+     enabled - `high`/`medium`/`low` depending on protocol and whether
+     `address` is open to any origin; winbox open to any origin is its own
+     `medium`).
+  2. Firewall input chain with no final drop/reject rule (`/ip/firewall/
+     filter` chain=input) - a conservative, order-based heuristic,
+     explicitly not a certainty claim - `medium`.
+  3. SNMP community open (`/snmp/community`: default name `public` or no
+     `addresses` restriction) - `medium`.
+  4. DNS resolver open to remote requests (`/ip/dns`
+     `allow-remote-requests=yes`) - `medium`.
+  5. RouterOS not on the latest version (`/system/package/update`) - `low`.
+  6. Open wireless/wifi (ROS6 `/interface/wireless/security-profiles`
+     `mode=none`; ROS7 `/interface/wifi/security` with no passphrase AND no
+     `authentication-types`) - `high`.
+  7. Users with a write/full policy (`/user`) - `info`, visibility only.
+
+  Every check reads its own menu(s) and treats `DeviceCommandError` (menu
+  absent on this device/RouterOS generation) as "nothing to report" rather
+  than an error - one unavailable check never stops the rest of the audit,
+  the same convention `system_health`/`poe_status`/`wireless_registrations`
+  already use for optional hardware/menus. **No finding ever contains a
+  secret**: `/ip/service`, `/snmp/community`, the wireless/wifi security
+  menus, and `/user` can all carry a password/passphrase/community-string-
+  shaped field, but every finding's text comes from a fixed template
+  referencing only non-secret fields (name, mode, address restriction,
+  boolean presence checks, counts) - see `tests/test_security.py`'s
+  `test_run_security_audit_never_leaks_a_secret`. **Heuristic, not a
+  scanner**: findings prompt a review, they are not ground truth - see
+  README's "Security audit" section for the full disclaimer, especially
+  around check #2's rule-order-based heuristic.
+
+- **`security_events`** (read, `server.py` + `security.py`): filters
+  `/log` down to security-relevant entries - topic `account` (RouterOS's
+  own topic for login/logout/authentication-failure events), `critical`/
+  `error` topics, and a generic `system,info` entry whose message looks
+  like a login/logout. Same filter-then-cut ordering `logs`' `topics`
+  filter already documents, so the most recent `limit` MATCHING entries are
+  returned (never the last `limit` raw entries filtered afterward). `limit`
+  is positive, capped at 500 (default 50) - same shape as `logs`' own
+  `limit`.
+
+- `tests/test_security.py` (new, 47 tests): unit-level coverage of every
+  individual check (fires/doesn't fire per fixture, skips cleanly when its
+  menu is absent), `run_security_audit`'s sorting/summary/resilience (every
+  menu absent at once still returns a well-formed empty result), the
+  no-secret-leak guarantee, and `filter_security_events`'s topic/message
+  matching and filter-before-limit ordering. `tests/test_server.py` gains
+  end-to-end tool-call smoke tests for both tools (registration, not gated
+  by the read-only setting, severity sorting, `limit` validation).
+
+### Notes
+
+- Both v0.12 tools are purely additive to the read-tool inventory - no
+  existing tool's behavior, the write-guard mechanism, or `guard.ALLOWLIST`
+  changed in this round.
+
 ## [0.11.0] - Unreleased
 
 SAFE firewall control round: two new guarded write tools -

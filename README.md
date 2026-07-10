@@ -39,10 +39,18 @@ context/token budget on its own. The result is also hard-capped at 100
 rows, with a `truncated` flag whenever more matched than were returned. See
 "Connection tracking (filtered)" below.
 
+v0.12 adds two more read-only tools, both aimed at the "look at the
+security of this router" use case: `security_audit` aggregates several
+device-config reads into a structured list of findings (an LLM caller's
+"eyes" for a security review), and `security_events` filters `/log` down
+to login/logout/authentication-failure and other security-relevant
+entries. Both are heuristic and read-only - neither one fixes anything, and
+neither requires `MIKROTIK_ALLOW_WRITE`. See "Security audit" below.
+
 See `CHANGELOG.md` for what changed since v0.1.0, and
 `src/mcp_mikrotik/guard.py` for how to add the next write tool.
 
-The full pytest suite currently has 815 tests, all passing against the
+The full pytest suite currently has 869 tests, all passing against the
 in-memory fake device layer (`pytest -q`) - see "Development" below.
 
 ## Installation
@@ -147,6 +155,8 @@ environment variable - see the `TODO(http-transport)` note at the top of
 | `container_config` | Container subsystem configuration (registry-url, tmpdir, ram-high). Empty dict (not an error) with no container package. |
 | `usb_devices` | USB ports (`/system/routerboard/usb`) + attached storage (`/disk`) combined as `{"usb_ports": [...], "disks": [...]}`; either or both empty (not an error) with no USB hardware. See "USB" below. |
 | `list_write_operations` | List every guarded write operation and the RouterOS path/action it maps to (metadata only, no gate). |
+| `security_audit` | Read-only, heuristic security audit: aggregates several config reads into `{"findings": [...], "summary": {...}}`. See "Security audit" below. |
+| `security_events` | Recent `/log` entries filtered to security-relevant ones (login/logout/auth-failure, critical/error topics); `limit` (positive, capped at 500, default 50) - same shape as `logs`' own `limit`. See "Security audit" below. |
 
 ### Write (guarded)
 
@@ -568,6 +578,92 @@ TCP connections), `timeout`, and the `assured`/`confirmed`/`seen-reply`
 flags - RouterOS's own closest equivalent to a generic "connection state"
 for this table.
 
+### Security audit (v0.12)
+
+Two **read-only** tools, both in `src/mcp_mikrotik/security.py`, built for
+the "analyze this router's security" use case: an LLM caller reads config
+and recent logs and reports what it sees, rather than an operator manually
+walking every menu.
+
+**`security_audit(device_name)`** runs seven independent, defensive checks
+and returns `{"findings": [{"severity", "category", "title", "detail",
+"recommendation"}, ...], "summary": {"high", "medium", "low", "info"}}` -
+`findings` sorted by severity (high first), `summary` always including all
+four keys (0 for a severity with no findings):
+
+1. **Insecure management services** (`/ip/service`): `telnet`/`ftp`/`www`/
+   `api` enabled (cleartext/non-SSL protocols) - `high` if `telnet`/`ftp`
+   is also open to any address (`address` empty or `0.0.0.0/0`), `medium`
+   if `www`/`api` is, `low` if enabled but restricted to a narrower range.
+   `winbox` enabled and open to any address is its own `medium` finding.
+   `ssh`/`api-ssl`/`www-ssl` are never flagged - they're the secure
+   counterparts a caller is expected to prefer.
+2. **Firewall input chain has no final drop/reject** (`/ip/firewall/filter`
+   chain=input): a conservative heuristic based on rule order alone - if
+   the LAST enabled rule on chain=input isn't `action=drop`/`reject` (or
+   there are no enabled input rules at all), a `medium` finding recommends
+   reviewing whether unmatched management traffic is actually blocked. This
+   does **not** claim certainty - RouterOS's real evaluation semantics
+   (jump chains, address-list matches, etc.) are richer than one rule's
+   position can prove; see `security.py`'s `_check_firewall_input_drop`
+   docstring.
+3. **SNMP community open** (`/snmp/community`): a community named `public`
+   (RouterOS's default) or with no `addresses` restriction (empty/
+   `0.0.0.0/0`) - `medium`.
+4. **DNS resolver open to remote requests** (`/ip/dns`
+   `allow-remote-requests=yes`) - `medium`; can be abused for DNS
+   amplification/reflection if not also restricted by the firewall.
+5. **RouterOS outdated** (`/system/package/update`): installed version
+   differs from the latest available - `low`. Skipped (no finding) if the
+   device hasn't checked for updates yet.
+6. **Open wireless/wifi** (no security at all): ROS6
+   `/interface/wireless/security-profiles` with `mode=none`, or ROS7
+   `/interface/wifi/security` with no passphrase AND no
+   `authentication-types` configured (802.1X/EAP setups legitimately have
+   no passphrase, so only BOTH absent counts) - `high`.
+7. **Users with a write/full policy** (`/user`): an `info` finding counting
+   how many configured accounts have a `write`/`full` group - visibility,
+   not a vulnerability by itself.
+
+Each check is **defensive**: it reads its own menu(s) and, if that menu
+doesn't exist on this device/RouterOS generation (`DeviceCommandError`),
+contributes no findings instead of failing - the same "empty/skipped, not
+an error" convention `system_health`/`poe_status`/`wireless_registrations`
+already use. One check being unavailable never stops the rest of the audit.
+
+**NEVER a scanner, NEVER definitive.** Every check here is a best-effort
+read of a handful of RouterOS menus - it can both under-report (a real
+misconfiguration this module doesn't know to look for) and, for check #2
+specifically, over-report on an unusual-but-intentional ruleset. Findings
+exist to prompt a human/LLM review, not to be treated as ground truth.
+
+**No finding ever contains a secret.** `/ip/service`, `/snmp/community`,
+`/interface/wireless/security-profiles`, `/interface/wifi/security`, and
+`/user` can all carry a password/passphrase/community-string-shaped field -
+no check ever copies a raw row (or a credential field from one) into a
+finding; each finding's text is built from a fixed template referencing
+only non-secret fields (name, mode, address restriction, boolean presence
+checks, counts). See `tests/test_security.py`'s
+`test_run_security_audit_never_leaks_a_secret` (unit-level, every
+secret-bearing menu populated with a distinctive marker value while
+multiple checks are made to fire) and `test_server.py`'s
+`test_security_audit_*` (the same guarantee exercised through the actual
+MCP tool call).
+
+**`security_events(device_name, limit=50)`** filters `/log` down to
+security-relevant entries: topic `account` (RouterOS's own topic for
+login/logout/authentication-failure events), `critical`/`error` topics, and
+a generic `system,info` entry whose message looks like a login/logout.
+Filtering happens client-side (the same reasoning `logs`' `topics` filter
+already documents) and is applied BEFORE the `limit` cut, so a caller
+always gets the most recent `limit` MATCHING entries - `limit` is capped at
+500, same shape as `logs`' own `limit`. Useful to correlate access
+attempts/anomalies without reading the entire (often much larger)
+unfiltered log via `logs`.
+
+Both tools are **read-only** - neither is gated by `MIKROTIK_ALLOW_WRITE`,
+and neither changes anything on the device.
+
 ## Security model
 
 Three independent controls apply to every write tool, all centralized in
@@ -684,7 +780,13 @@ On top of the write guard:
   strips a `private-key` field from every row via
   `formatting.strip_sensitive_fields` before returning it - defensively,
   since RouterOS's own `/interface/wireguard/peers` reply doesn't carry one
-  in the first place (see "VPN & routing diagnostics" above).
+  in the first place (see "VPN & routing diagnostics" above). Since v0.12,
+  `security_audit` never copies a raw row (or a credential-shaped field
+  from one) into a finding - every finding's text comes from a fixed
+  template referencing only non-secret fields, even though several of the
+  menus it reads (`/ip/service`, `/snmp/community`, wireless/wifi security
+  profiles, `/user`) can carry a password/passphrase/community-string field
+  - see "Security audit" above.
 - **Structured errors.** All errors raised inside the package derive from
   `MikrotikMCPError` (see `src/mcp_mikrotik/exceptions.py`) and are caught at
   the tool boundary in `server.py`. The exception is deliberately re-raised,
@@ -786,6 +888,13 @@ Python 3.11 and 3.12.
 
 ## Roadmap / non-goals
 
+- **Security audit + security-relevant log events** (`security_audit`,
+  `security_events`) shipped in v0.12 - see "Security audit" above. Both
+  are read-only and heuristic: `security_audit` does not (and will not)
+  auto-remediate anything it finds - every finding exists to inform a
+  human/LLM decision, not to be acted on automatically. Widening its check
+  list (e.g. NAT exposure, more RouterOS-version-specific CVE checks) is a
+  future round's decision, not silently expanded here.
 - **Failover write tools** (`set_route_distance`, `enable_route`/
   `disable_route`, `add_netwatch`/`remove_netwatch`) shipped in v0.9 -
   see "Failover control" above. Netwatch up/down-script configuration

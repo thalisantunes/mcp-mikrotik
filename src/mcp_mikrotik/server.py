@@ -8,9 +8,10 @@ set_route_distance, enable_route/disable_route, add_netwatch/remove_netwatch,
 add_static_dns/remove_static_dns, clear_dns_cache, remove_dhcp_lease,
 wake_on_lan, enable_firewall_rule/disable_firewall_rule - see guard.py's
 ALLOWLIST for the full write-tool inventory), plus the read-only
-connection_tracking tool (v0.11). Transport is stdio only - this process is
-meant to run on the operator's own machine, launched by an MCP client (e.g.
-Claude Code) over stdio, with no network exposure at all.
+connection_tracking tool (v0.11) and the read-only security_audit/
+security_events tools (v0.12 - see security.py). Transport is stdio only -
+this process is meant to run on the operator's own machine, launched by an
+MCP client (e.g. Claude Code) over stdio, with no network exposure at all.
 
 TODO(http-transport): if a streamable-http transport is added later, it
 MUST default to binding 127.0.0.1 (never 0.0.0.0) and MUST require a bearer
@@ -29,7 +30,7 @@ from typing import Any, AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
 
-from . import correlation, guard
+from . import correlation, guard, security
 from .client import ClientFactory, ClientPool, MikrotikClient, get_client
 from .config import Settings, load_settings
 from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
@@ -64,6 +65,11 @@ MAX_TRACEROUTE_MAX_HOPS = 10
 # See connection_tracking's own docstring for why a filter is mandatory in
 # the first place.
 MAX_CONNTRACK_LIMIT = 100
+# v0.12: security_events' limit, same cap/default shape as logs' own
+# limit (DEFAULT_LOG_LIMIT/MAX_LOG_LIMIT) - it reads the same /log table,
+# just pre-filtered to security-relevant rows (see security.py).
+DEFAULT_SECURITY_EVENTS_LIMIT = 50
+MAX_SECURITY_EVENTS_LIMIT = 500
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _DEFAULT_LOG_LEVEL = "INFO"
@@ -787,6 +793,78 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             }
             for op in guard.ALLOWLIST.values()
         ]
+
+    # --- v0.12: security audit + security-relevant log events ----------
+
+    @mcp.tool()
+    @_safe
+    def security_audit(device_name: str) -> dict[str, Any]:
+        """Read-only security audit of a device's configuration - gives an
+        LLM caller (or operator) a structured list of findings to review, so
+        it can "look at the security of this router" without an operator
+        manually walking every menu.
+
+        Aggregates several independent, defensive checks - see
+        `src/mcp_mikrotik/security.py` for the full list and reasoning:
+        insecure management services (`/ip/service`: telnet/ftp/www/api
+        enabled, and whether they're open to any address), whether the
+        firewall's input chain ends in a drop/reject rule (heuristic),
+        SNMP community exposure (`/snmp/community`), an open DNS resolver
+        (`/ip/dns` allow-remote-requests), outdated RouterOS
+        (`/system/package/update`), open wireless/wifi networks (no
+        security profile / no passphrase), and a count of users with a
+        write/full policy.
+
+        Each check reads its own menu(s) and skips itself (contributing no
+        findings) if that menu doesn't exist on this device/RouterOS
+        generation - one missing/unsupported menu never fails the whole
+        audit. NEVER a scanner, NEVER definitive - this is a heuristic,
+        best-effort read meant to prompt a human decision, not to replace
+        one; see README's "Security audit" section for the full disclaimer.
+
+        READ-ONLY: does not change anything on the device, and is not gated
+        by MIKROTIK_ALLOW_WRITE.
+
+        NO SECRET IS EVER RETURNED: no finding ever includes a password,
+        passphrase, or SNMP community string - see security.py's module
+        docstring for exactly how each check avoids that.
+
+        Returns `{"findings": [{"severity", "category", "title", "detail",
+        "recommendation"}, ...], "summary": {"high", "medium", "low",
+        "info"}}` - `findings` sorted by severity (high first), `summary`
+        always including all four keys (0 for a severity with no findings).
+        """
+        client = _client(device_name)
+        return security.run_security_audit(client)
+
+    @mcp.tool()
+    @_safe
+    def security_events(
+        device_name: str, limit: int = DEFAULT_SECURITY_EVENTS_LIMIT
+    ) -> list[dict[str, Any]]:
+        """Recent RouterOS log entries filtered down to security-relevant
+        ones - login/logout/authentication-failure events (topic
+        "account"), "critical"/"error" topic entries, and generic
+        "system,info" rows whose message looks like a login/logout - so a
+        caller can correlate access attempts/anomalies without reading the
+        entire (often much larger) unfiltered log via `logs`.
+
+        Filtering happens in Python, same reasoning `logs`' `topics` filter
+        already documents (RouterOS's structured API doesn't expose a
+        query-by-field read here either) - and is applied BEFORE the
+        `limit` cut, so this returns the most recent `limit` MATCHING
+        entries (not the last `limit` raw entries filtered afterward, which
+        would silently drop matches on a busy log).
+
+        `limit` must be positive and is capped at 500 (default 50), the same
+        shape as `logs`' own `limit`.
+
+        READ-ONLY: not gated by MIKROTIK_ALLOW_WRITE.
+        """
+        client = _client(device_name)
+        capped_limit = validate_positive_limit(limit, MAX_SECURITY_EVENTS_LIMIT, "limit")
+        rows = rows_to_list(client.path("log"))
+        return security.filter_security_events(rows, capped_limit)
 
     # --- Write tools ---------------------------------------------------
     # Every write tool must call a dedicated function in guard.py - never

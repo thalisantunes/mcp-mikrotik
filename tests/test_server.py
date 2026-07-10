@@ -79,6 +79,8 @@ EXPECTED_TOOLS = {
     "connection_tracking",
     "enable_firewall_rule",
     "disable_firewall_rule",
+    "security_audit",
+    "security_events",
 }
 
 
@@ -2246,6 +2248,118 @@ async def test_enable_firewall_rule_rejects_empty_comment_before_touching_device
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("enable_firewall_rule", {"device_name": "core-switch", "comment": "", "confirm": True})
     assert "non-empty" in str(exc_info.value)
+
+
+# --- security_audit / security_events (v0.12, read-only) -----------------
+#
+# security.py's own unit tests (tests/test_security.py) cover every
+# individual check and the aggregation/summary/secret-leak behaviour in
+# detail; these are end-to-end smoke tests through the actual MCP tool
+# layer, confirming both tools are wired up, unaffected by the write gate,
+# and validate their inputs the same way `logs` does.
+
+
+@pytest.mark.asyncio
+async def test_security_audit_not_gated_by_read_only(settings: Settings, fake_connection: FakeConnection):
+    """Read-only, unlike every write tool - must work with the default
+    (allow_write=False) settings fixture."""
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("security_audit", {"device_name": "core-switch"})
+    assert "findings" in result
+    assert "summary" in result
+    assert set(result["summary"]) == {"high", "medium", "low", "info"}
+
+
+@pytest.mark.asyncio
+async def test_security_audit_flags_shared_fixtures_open_input_chain(
+    settings: Settings, fake_connection: FakeConnection
+):
+    """The shared `fake_connection` fixture's chain=input rule (see
+    conftest) is action=accept, not drop/reject - security_audit's
+    firewall-input-drop heuristic must flag it."""
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("security_audit", {"device_name": "core-switch"})
+    categories = {f["category"] for f in result["findings"]}
+    assert "firewall" in categories
+
+
+@pytest.mark.asyncio
+async def test_security_audit_findings_are_sorted_by_severity(device: Device):
+    fake = FakeConnection(
+        data={
+            ("ip", "service"): [{"name": "telnet", "disabled": "false", "address": ""}],
+            ("user",): [{"name": "admin", "group": "full"}],
+            ("ip", "firewall", "filter"): [{"chain": "input", "action": "drop", "disabled": "false"}],
+        }
+    )
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("security_audit", {"device_name": "core-switch"})
+    severities = [f["severity"] for f in result["findings"]]
+    assert severities == ["high", "info"]
+    assert result["summary"]["high"] == 1
+    assert result["summary"]["info"] == 1
+
+
+@pytest.mark.asyncio
+async def test_security_audit_never_touches_the_device_when_read_would_fail(device: Device):
+    """Every menu it reads raises - the tool must still return a
+    well-formed, empty result rather than propagating an error."""
+    fake = FakeConnection(
+        raise_for={
+            ("ip", "service"): LibRouterosError("no such command"),
+            ("ip", "firewall", "filter"): LibRouterosError("no such command"),
+            ("snmp", "community"): LibRouterosError("no such command"),
+            ("ip", "dns"): LibRouterosError("no such command"),
+            ("system", "package", "update"): LibRouterosError("no such command"),
+            ("interface", "wireless", "security-profiles"): LibRouterosError("no such command"),
+            ("interface", "wifi", "security"): LibRouterosError("no such command"),
+            ("user",): LibRouterosError("no such command"),
+        }
+    )
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("security_audit", {"device_name": "core-switch"})
+    assert result["findings"] == []
+    assert result["summary"] == {"high": 0, "medium": 0, "low": 0, "info": 0}
+
+
+@pytest.mark.asyncio
+async def test_security_events_not_gated_by_read_only(settings: Settings, device: Device):
+    assert settings.allow_write is False
+    fake = FakeConnection(
+        data={
+            ("log",): [
+                {".id": "*1", "topics": "system,info,account", "message": "user admin logged in via winbox"},
+                {".id": "*2", "topics": "interface,link", "message": "ether1 up"},
+            ]
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("security_events", {"device_name": "core-switch"})
+    assert len(result["result"]) == 1
+    assert result["result"][0]["message"] == "user admin logged in via winbox"
+
+
+@pytest.mark.asyncio
+async def test_security_events_default_limit_and_ordering(device: Device):
+    rows = [
+        {".id": f"*{i}", "topics": "system,info,account", "message": f"login {i}"} for i in range(5)
+    ]
+    fake = FakeConnection(data={("log",): rows})
+    settings = Settings(allow_write=False, devices={device.name: device})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("security_events", {"device_name": "core-switch", "limit": 2})
+    assert [r["message"] for r in result["result"]] == ["login 3", "login 4"]
+
+
+@pytest.mark.asyncio
+async def test_security_events_rejects_non_positive_limit(settings: Settings, fake_connection: FakeConnection):
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("security_events", {"device_name": "core-switch", "limit": 0})
+    assert "positive" in str(exc_info.value).lower()
 
 
 # --- D3: list_write_operations surfaces guard.ALLOWLIST metadata ---------
