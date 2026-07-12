@@ -28,7 +28,7 @@ from functools import partial
 from typing import Any, Protocol, TypeVar
 
 import librouteros
-from librouteros.exceptions import LibRouterosError
+from librouteros.exceptions import LibRouterosError, TrapError
 
 from .config import Device, Settings
 from .exceptions import CircuitOpenError, DeviceCommandError, DeviceConnectionError
@@ -428,12 +428,32 @@ class MikrotikClient:
         this returns promptly. `interface` is expected to already be
         validated. Retried automatically on a transient network error - see
         _run_read.
+
+        Selector parameter: `numbers=<interface>` is PRIMARY, confirmed
+        against real hardware (MikroTik CRS318-16P-2S+, ROS6.49.20,
+        2026-07-12) - the old `interface=<interface>` form this method used
+        to send exclusively is REJECTED there with a `TrapError` ("unknown
+        parameter"), even though it had previously been confirmed working
+        against an OmniTik (ROS6, .243) and a mANTBox (ROS7, .237) - same
+        family of per-device/per-version quirk as `ethernet_monitor` below,
+        which already had to switch to `numbers=` outright for a different
+        menu. Since `interface=` was confirmed working on at least two other
+        devices in the fleet and there's no positive evidence `numbers=` is
+        universal either, this tries `numbers=` first and falls back to
+        `interface=` only if the device raises `TrapError` on it - so any
+        firmware that still only understands the old parameter name keeps
+        working, while the now-primary `numbers=` form covers the CRS318 and
+        (per `ethernet_monitor`'s own history) is the more likely long-term
+        RouterOS convention for this class of `once=` monitor command.
         """
 
         def _do(connection: RouterosConnection) -> dict[str, Any]:
             # See monitor_traffic's _do above: must materialize with list(...)
             # before subscripting - librouteros returns a generator here too.
-            rows = list(connection("/interface/ethernet/poe/monitor", interface=interface, once=""))
+            try:
+                rows = list(connection("/interface/ethernet/poe/monitor", numbers=interface, once=""))
+            except TrapError:
+                rows = list(connection("/interface/ethernet/poe/monitor", interface=interface, once=""))
             return dict(rows[0]) if rows else {}
 
         return self._run_read("interface/ethernet/poe/monitor", _do)

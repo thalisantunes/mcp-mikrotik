@@ -807,11 +807,24 @@ async def test_poe_status_happy_path(settings: Settings, fake_connection: FakeCo
     assert set(rows) == {"ether1", "ether2"}
     assert rows["ether1"]["poe-out"] == "auto-on"
     assert rows["ether1"]["poe-out-status"] == "powered-on"
-    assert rows["ether1"]["voltage"] == "48.0"
-    assert rows["ether1"]["current"] == "150"
-    assert rows["ether1"]["power"] == "7.2"
+    # conftest's poe_monitor_replies deliberately mixes int/string-decimal
+    # types across fields and ports (real CRS318 hardware finding) -
+    # poe_status must normalize all of them via coerce_ros_number, never
+    # pass a raw string through for a field that came back as one.
+    assert rows["ether1"]["voltage"] == 48.0
+    assert isinstance(rows["ether1"]["voltage"], float)
+    assert rows["ether1"]["current"] == 204
+    assert isinstance(rows["ether1"]["current"], int)
+    assert rows["ether1"]["power"] == 4.7
+    assert isinstance(rows["ether1"]["power"], float)
     assert rows["ether2"]["poe-out"] == "off"
     assert rows["ether2"]["poe-out-status"] == "poe-out-off"
+    assert rows["ether2"]["voltage"] == 23.5
+    assert isinstance(rows["ether2"]["voltage"], float)
+    assert rows["ether2"]["current"] == 0
+    assert isinstance(rows["ether2"]["current"], int)
+    assert rows["ether2"]["power"] == 1
+    assert isinstance(rows["ether2"]["power"], int)
 
 
 @pytest.mark.asyncio

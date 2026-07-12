@@ -4,6 +4,7 @@ from datetime import datetime
 
 from mcp_mikrotik.formatting import (
     coerce_ros_bool,
+    coerce_ros_number,
     days_until,
     filter_disabled,
     parse_ros_datetime,
@@ -92,6 +93,76 @@ def test_coerce_ros_bool_is_never_fooled_by_python_bool_string_equality_trap():
     assert coerce_ros_bool(True) is True
     assert coerce_ros_bool(False) is not None
     assert coerce_ros_bool(False) is False
+
+
+# --- coerce_ros_number --------------------------------------------------------
+#
+# Confirmed against real hardware (CRS318-16P-2S+, ROS6.49.20, 2026-07-12):
+# /interface/ethernet/poe/monitor's poe-out-current/poe-out-power/
+# poe-out-voltage fields mix int and string-decimal types - int and string
+# in the SAME reply, and differently across ports of the same device. Same
+# "field type isn't fixed across devices/versions" lesson as coerce_ros_bool
+# above, for numeric fields instead of booleans.
+
+
+def test_coerce_ros_number_passes_through_real_int_and_float():
+    assert coerce_ros_number(204) == 204
+    assert isinstance(coerce_ros_number(204), int)
+    assert coerce_ros_number(4.7) == 4.7
+    assert isinstance(coerce_ros_number(4.7), float)
+    assert coerce_ros_number(0) == 0
+
+
+def test_coerce_ros_number_parses_integer_strings_as_int():
+    assert coerce_ros_number("204") == 204
+    assert isinstance(coerce_ros_number("204"), int)
+    assert coerce_ros_number("0") == 0
+    assert isinstance(coerce_ros_number("0"), int)
+
+
+def test_coerce_ros_number_parses_decimal_strings_as_float():
+    # The exact shape real hardware sent: poe-out-power='4.7',
+    # poe-out-voltage='23.5' - string decimals, never int-parseable.
+    assert coerce_ros_number("4.7") == 4.7
+    assert isinstance(coerce_ros_number("4.7"), float)
+    assert coerce_ros_number("23.5") == 23.5
+    assert isinstance(coerce_ros_number("23.5"), float)
+
+
+def test_coerce_ros_number_strips_whitespace_before_parsing():
+    assert coerce_ros_number("  204  ") == 204
+    assert coerce_ros_number(" 4.7 ") == 4.7
+
+
+def test_coerce_ros_number_none_for_missing_or_unparseable():
+    assert coerce_ros_number(None) is None
+    assert coerce_ros_number("") is None
+    assert coerce_ros_number("   ") is None
+    assert coerce_ros_number("not-a-number") is None
+
+
+def test_coerce_ros_number_none_for_bool_despite_bool_being_an_int_subclass():
+    # bool is a Python int subclass - True/False must NOT pass through as
+    # 1/0 just because `isinstance(True, int)` is True. RouterOS never uses
+    # this field shape for a genuinely boolean-valued field.
+    assert coerce_ros_number(True) is None
+    assert coerce_ros_number(False) is None
+
+
+def test_coerce_ros_number_mixed_types_within_one_reply_all_coerce_correctly():
+    """Pin the exact real-hardware shape: int and string-decimal for the
+    SAME field class within a single monitor reply, and different types for
+    the same field across two ports of the same device - all must resolve
+    to a plain int/float, never a leftover string."""
+    port_a = {"poe-out-current": 204, "poe-out-power": "4.7", "poe-out-voltage": "48.0"}
+    port_b = {"poe-out-current": 0, "poe-out-power": 1, "poe-out-voltage": "23.5"}
+
+    assert coerce_ros_number(port_a["poe-out-current"]) == 204
+    assert coerce_ros_number(port_a["poe-out-power"]) == 4.7
+    assert coerce_ros_number(port_a["poe-out-voltage"]) == 48.0
+    assert coerce_ros_number(port_b["poe-out-current"]) == 0
+    assert coerce_ros_number(port_b["poe-out-power"]) == 1
+    assert coerce_ros_number(port_b["poe-out-voltage"]) == 23.5
 
 
 # --- rows_to_list / filter_disabled ------------------------------------------

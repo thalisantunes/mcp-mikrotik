@@ -76,6 +76,56 @@ def coerce_ros_bool(value: Any) -> bool | None:
     return None
 
 
+def coerce_ros_number(value: Any) -> int | float | None:
+    """Normalize a RouterOS numeric field value to `int | float | None`.
+
+    CONFIRMED AGAINST REAL HARDWARE (CRS318-16P-2S+, ROS6.49.20, 2026-07-12):
+    `/interface/ethernet/poe/monitor`'s `poe-out-current`/`poe-out-power`/
+    `poe-out-voltage` fields do NOT have one consistent type - the SAME
+    monitor reply carried `poe-out-current=204` as a Python `int` alongside
+    `poe-out-power='4.7'` as a `str` on one port, and `poe-out-power=1` as an
+    `int` on another, with `poe-out-voltage='23.5'` as a `str` - int and
+    string-decimal mixed within a single reply AND across ports of the same
+    device. Same class of lesson as `coerce_ros_bool` above (a RouterOS
+    field's type isn't fixed across devices/firmware versions) - any caller
+    that does arithmetic or a numeric comparison (e.g. README's "PoE control"
+    walkthrough: "confirm it's actually drawing power (voltage/current > 0)")
+    needs a value it can rely on being `int`/`float`/`None`, never a string
+    that happens to look numeric.
+
+    Returns:
+      - The value itself, unchanged, for an `int` or `float` (but see the
+        `bool` note below).
+      - `int(value)` or `float(value)` for a string that parses as one -
+        tried as `int` first (e.g. `"204"` -> `204`), then `float` (e.g.
+        `"4.7"` -> `4.7`, `"23.5"` -> `23.5`).
+      - `None` for `None`, an absent field (`.get(...)` already yields
+        `None`), an empty/whitespace-only string, a string that parses as
+        neither, or a `bool` (RouterOS never uses this field shape for a
+        boolean-valued field, and `bool` is a Python `int` subclass, so it
+        would otherwise pass through the `isinstance(value, int)` check
+        below as `True`/`False` rather than the numeric value a caller
+        actually wants).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
 def rows_to_list(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize an iterable of API rows into a plain list.
 

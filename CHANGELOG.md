@@ -3,6 +3,40 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [1.10.1] - 2026-07-12
+
+**PoE fix, found testing against a new switch in the fleet: MikroTik
+CRS318-16P-2S+ (ROS6.49.20, 192.168.21.251).**
+
+- `poe_monitor` (`client.py`, backing `poe_status`): `/interface/ethernet/
+  poe/monitor` used to send the port name as `interface=<name>` exclusively
+  - confirmed working in the past against an OmniTik (ROS6, .243) and a
+  mANTBox (ROS7, .237), but **rejected outright by the CRS318** with a
+  `TrapError` ("unknown parameter"). `numbers=<name>` (and its batch form,
+  `numbers=<name1>,<name2>`) works on the CRS318 and is now sent FIRST;
+  `interface=` is only retried as a fallback if `numbers=` itself traps, so
+  any firmware that still only understands the old parameter name keeps
+  working too. Same family of per-device quirk `ethernet_monitor` already
+  hit for a different menu (v1.7) - see that method's docstring.
+- **New `formatting.coerce_ros_number(value) -> int | float | None`**, the
+  numeric-field counterpart to `coerce_ros_bool`: the CRS318's monitor reply
+  mixed `int` and string-decimal types for the SAME field class within one
+  reply (`poe-out-current=204` as `int` alongside `poe-out-power='4.7'` as
+  `str` on one port, `poe-out-power=1` as `int` on another, with
+  `poe-out-voltage='23.5'` as `str`) - a RouterOS field's type isn't fixed
+  across devices/versions, same lesson `coerce_ros_bool` already documents
+  for booleans. `poe_status`'s `voltage`/`current`/`power` fields are now
+  always normalized through it, never passed through raw - fixes a latent
+  correctness gap in README's PoE power-cycle walkthrough ("confirm it's
+  actually drawing power (voltage/current > 0)"), which silently couldn't
+  have worked reliably against a raw string.
+- Test fakes (`tests/fakes.py`) updated to mirror both findings: a new
+  `poe_monitor_reject_numbers` flag simulates a device that traps on
+  `numbers=` (exercising the fallback path), and `tests/conftest.py`'s
+  shared PoE fixture now mixes `int`/string-decimal types across ports,
+  matching the real CRS318 reply shape, so a regression to raw passthrough
+  would fail the suite instead of passing on uniformly-typed fixture data.
+
 ## [1.10.0] - 2026-07-10
 
 **IPv6 write parity - closes `ROADMAP.md`'s Tier 3 "IPv6 parity" item

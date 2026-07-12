@@ -58,6 +58,7 @@ from .exceptions import DeviceCommandError, MikrotikMCPError, ValidationError
 from .formatting import (
     WIREGUARD_SENSITIVE_FIELDS,
     coerce_ros_bool,
+    coerce_ros_number,
     days_until,
     filter_disabled,
     rows_to_list,
@@ -803,6 +804,15 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         a port whose live monitor call fails (kept resilient rather than
         failing the whole tool for one bad port).
 
+        `voltage`/`current`/`power` are normalized to `int | float | None`
+        via `formatting.coerce_ros_number`, never passed through raw: real
+        hardware (CRS318-16P-2S+, ROS6.49.20) mixes `int` and string-decimal
+        (e.g. `"4.7"`) types for these same three fields within a single
+        monitor reply, and across different ports of the same device - see
+        that helper's docstring. Without this, a caller comparing
+        `voltage > 0` (see README's PoE power-cycle walkthrough) could get a
+        string on one port and a number on another.
+
         Returns an empty list (never an error) for a device with no PoE
         hardware at all - that's a completely normal state, same as
         `wireless_registrations` for a wired-only device.
@@ -821,9 +831,9 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
                 monitor = {}
             if monitor:
                 entry["poe-out-status"] = monitor.get("poe-out-status")
-                entry["voltage"] = monitor.get("poe-out-voltage")
-                entry["current"] = monitor.get("poe-out-current")
-                entry["power"] = monitor.get("poe-out-power")
+                entry["voltage"] = coerce_ros_number(monitor.get("poe-out-voltage"))
+                entry["current"] = coerce_ros_number(monitor.get("poe-out-current"))
+                entry["power"] = coerce_ros_number(monitor.get("poe-out-power"))
             result.append(entry)
         return result
 

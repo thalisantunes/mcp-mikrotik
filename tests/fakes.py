@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from librouteros.exceptions import LibRouterosError
+from librouteros.exceptions import LibRouterosError, TrapError
 
 # v0.13: real RouterOS generates a WireGuard interface's private/public key
 # pair itself on `/interface/wireguard add` - a caller never supplies (or
@@ -172,6 +172,7 @@ class FakeConnection:
         torch_replies: dict[str, list[dict[str, Any]]] | None = None,
         on_call: Callable[[str, dict[str, Any]], None] | None = None,
         raise_for: dict[tuple[str, ...], Exception] | None = None,
+        poe_monitor_reject_numbers: bool = False,
     ):
         self._data: dict[tuple[str, ...], list[dict[str, Any]]] = dict(data or {})
         self._ping_replies = ping_replies if ping_replies is not None else []
@@ -184,6 +185,14 @@ class FakeConnection:
         # the same shape/convention (see client.MikrotikClient.lte_monitor).
         self._monitor_traffic_replies: dict[str, dict[str, Any]] = dict(monitor_traffic_replies or {})
         self._poe_monitor_replies: dict[str, dict[str, Any]] = dict(poe_monitor_replies or {})
+        # v1.10.1: real hardware (CRS318-16P-2S+, ROS6.49.20) rejects
+        # `interface=` for this menu with a TrapError ("unknown parameter")
+        # - client.py's poe_monitor now sends `numbers=` first (see that
+        # method's docstring), which this fake accepts by default (mirrors
+        # current/CRS318 behaviour). Set this True to simulate a device that
+        # still only understands the old `interface=` form, forcing
+        # poe_monitor's fallback path to be exercised.
+        self._poe_monitor_reject_numbers = poe_monitor_reject_numbers
         self._lte_monitor_replies: dict[str, dict[str, Any]] = dict(lte_monitor_replies or {})
         # v1.7: same keyed-by-interface, single-row-generator shape as the
         # three above, for /interface/ethernet/monitor once=yes (see
@@ -220,7 +229,7 @@ class FakeConnection:
         if cmd == "/interface/monitor-traffic":
             return _once_reply_stream(self._monitor_traffic_replies.get(kwargs.get("interface")))
         if cmd == "/interface/ethernet/poe/monitor":
-            return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
+            return self._poe_monitor_reply(kwargs)
         if cmd == "/interface/lte/monitor":
             return _once_reply_stream(self._lte_monitor_replies.get(kwargs.get("interface")))
         if cmd == "/interface/ethernet/monitor":
@@ -251,6 +260,22 @@ class FakeConnection:
             # as the DNS cache flush above.
             return _once_reply_stream(None)
         return []
+
+    def _poe_monitor_reply(self, kwargs: dict[str, Any]):
+        """Handle /interface/ethernet/poe/monitor's `numbers=`-primary,
+        `interface=`-fallback selector - see client.py's poe_monitor and
+        this class's `poe_monitor_reject_numbers` for the hardware finding
+        this mirrors.
+
+        Both the primary and (if reached) fallback attempt are recorded in
+        `self.calls` (appended by `__call__` before this is reached), so a
+        test can assert the exact call sequence a real device would see.
+        """
+        if "numbers" in kwargs:
+            if self._poe_monitor_reject_numbers:
+                raise TrapError("unknown parameter numbers")
+            return _once_reply_stream(self._poe_monitor_replies.get(kwargs["numbers"]))
+        return _once_reply_stream(self._poe_monitor_replies.get(kwargs.get("interface")))
 
     def close(self) -> None:
         self.closed = True

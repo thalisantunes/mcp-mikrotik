@@ -78,16 +78,46 @@ def test_monitor_traffic_returns_empty_dict_when_device_replies_nothing(
 def test_poe_monitor_forwards_structured_params_not_a_command_string(
     client: MikrotikClient, fake_connection: FakeConnection
 ):
+    """`numbers=` is the PRIMARY selector (confirmed against real CRS318-
+    16P-2S+/ROS6.49.20 hardware - see client.MikrotikClient.poe_monitor's
+    docstring) - a plain, un-rejecting fake_connection must be reached with
+    exactly one `numbers=` call, no `interface=` fallback attempt at all."""
     reply = client.poe_monitor("ether1")
     assert reply["poe-out-status"] == "powered-on"
     assert reply["poe-out-voltage"] == "48.0"
-    assert fake_connection.calls == [("/interface/ethernet/poe/monitor", {"interface": "ether1", "once": ""})]
+    assert reply["poe-out-current"] == 204
+    assert fake_connection.calls == [("/interface/ethernet/poe/monitor", {"numbers": "ether1", "once": ""})]
 
 
 def test_poe_monitor_returns_empty_dict_when_device_replies_nothing(
     client: MikrotikClient, fake_connection: FakeConnection
 ):
     assert client.poe_monitor("sfp1") == {}
+
+
+def test_poe_monitor_falls_back_to_interface_param_when_numbers_traps(device: Device):
+    """Defensive fallback for a hypothetical device/firmware that still only
+    understands the OLD `interface=` selector (as OmniTik ROS6 .243 and
+    mANTBox ROS7 .237 were previously confirmed to) and traps on `numbers=`
+    - the opposite quirk from the CRS318 this fix was built for. Both the
+    failed `numbers=` attempt and the recovering `interface=` attempt must
+    reach the device, in that order, and the fallback reply must still come
+    through."""
+    fake = FakeConnection(
+        poe_monitor_replies={
+            "ether1": {"poe-out-status": "powered-on", "poe-out-voltage": "48.0"},
+        },
+        poe_monitor_reject_numbers=True,
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    reply = client.poe_monitor("ether1")
+
+    assert reply == {"poe-out-status": "powered-on", "poe-out-voltage": "48.0"}
+    assert fake.calls == [
+        ("/interface/ethernet/poe/monitor", {"numbers": "ether1", "once": ""}),
+        ("/interface/ethernet/poe/monitor", {"interface": "ether1", "once": ""}),
+    ]
 
 
 # --- v0.7: lte_monitor -------------------------------------------------

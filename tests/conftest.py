@@ -615,18 +615,24 @@ def fake_connection() -> FakeConnection:
                 "tx-packets-per-second": "80",
             },
         },
+        # v1.10.1: mixed int/string-decimal types, matching what real
+        # hardware (CRS318-16P-2S+, ROS6.49.20, 2026-07-12) actually sent -
+        # int and string-decimal for the SAME fields, within one reply and
+        # across ports of the same device. Deliberately not uniform, so a
+        # regression to raw (un-coerced) passthrough in server.py's
+        # poe_status would be caught - see formatting.coerce_ros_number.
         poe_monitor_replies={
             "ether1": {
                 "poe-out-status": "powered-on",
-                "poe-out-voltage": "48.0",
-                "poe-out-current": "150",
-                "poe-out-power": "7.2",
+                "poe-out-voltage": "48.0",  # string decimal
+                "poe-out-current": 204,  # int
+                "poe-out-power": "4.7",  # string decimal
             },
             "ether2": {
                 "poe-out-status": "poe-out-off",
-                "poe-out-voltage": "0",
-                "poe-out-current": "0",
-                "poe-out-power": "0",
+                "poe-out-voltage": "23.5",  # string decimal
+                "poe-out-current": 0,  # int
+                "poe-out-power": 1,  # int
             },
         },
         ethernet_monitor_replies={
