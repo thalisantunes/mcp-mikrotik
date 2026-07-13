@@ -5384,3 +5384,1301 @@ def test_remove_from_ipv6_address_list_propagates_error_when_ipv6_package_disabl
         guard.remove_from_ipv6_address_list(
             client, settings_write_enabled, list_name="blocked-clients-v6", address="2001:db8::60", confirm=True
         )
+
+
+# =============================================================================
+# v1.11: dead-man primitive (arm_dead_man/cancel_dead_man) + wireless RF
+# tuning (set_wireless_channel/set_wireless_tx_power/set_wireless_tuning)
+# =============================================================================
+
+# --- arm_dead_man ------------------------------------------------------------
+
+
+def test_arm_dead_man_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.arm_dead_man(
+            client, settings, revert_commands=['/interface/wireless set [find name="wlan1"]'], minutes=3, confirm=True
+        )
+
+
+def test_arm_dead_man_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.arm_dead_man(
+            guarded_client,
+            settings,
+            revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            minutes=3,
+            confirm=True,
+        )
+
+
+def test_arm_dead_man_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=False,
+    )
+
+    assert preview.applied is False
+    assert preview.after["name"].startswith("deadman-")
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_arm_dead_man_confirm_true_applies(settings_write_enabled: Settings, device: Device):
+    """2026-07-13 hardware finding: the scheduler must be a ONE-SHOT
+    (`interval="00:00:00"`) with an EXPLICIT future `start-date`/
+    `start-time`, computed `minutes` ahead of the device's own
+    `/system/clock` - never an `interval`-only recurring schedule, which
+    would keep RE-FIRING indefinitely (every `interval`) if the on-event
+    ever aborted partway through, instead of failing once and staying
+    inert (see guard._dead_man_deadline's docstring)."""
+    fake = FakeConnection(
+        data={("system", "scheduler"): [], ("system", "clock"): [{"date": "jan/01/2026", "time": "12:00:00"}]}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    name = preview.after["name"]
+    assert name.startswith("deadman-")
+    rows = fake.path("system", "scheduler")._rows
+    assert len(rows) == 1
+    armed = rows[0]
+    assert armed["name"] == name
+    assert armed["start-date"] == "jan/01/2026"
+    assert armed["start-time"] == "12:03:00"
+    assert armed["interval"] == "00:00:00"  # one-shot: never repeats
+    assert armed["policy"] == "read,write,test,policy,reboot"
+    assert armed["on-event"].startswith(f':log warning "mcp-mikrotik dead-man reverting {name}"; ')
+    assert '/interface/wireless set [find name="wlan1"] frequency=5500' in armed["on-event"]
+    assert armed["on-event"].endswith(f'/system scheduler remove [find name="{name}"]')
+    assert preview.warning is not None and name in preview.warning
+    assert "jan/01/2026 12:03:00" in preview.warning
+
+
+def test_arm_dead_man_deadline_rolls_over_midnight_and_month_correctly(
+    settings_write_enabled: Settings, device: Device
+):
+    """THE edge case that originally motivated `interval`-only scheduling
+    (a start-time-based schedule could wait until the SAME clock time the
+    NEXT day) - now handled correctly the other way around: real `datetime`
+    + `timedelta` arithmetic rolls the DATE forward too, so a dead-man
+    armed one minute before midnight fires shortly after midnight the next
+    day/month, never a day early or a day late."""
+    fake = FakeConnection(
+        data={("system", "scheduler"): [], ("system", "clock"): [{"date": "jan/31/2026", "time": "23:59:00"}]}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/ip/route set [find dst-address="0.0.0.0/0"] distance=1'],
+        minutes=3,
+        confirm=True,
+    )
+
+    armed = fake.path("system", "scheduler")._rows[0]
+    assert armed["start-date"] == "feb/01/2026"
+    assert armed["start-time"] == "00:02:00"
+    assert preview.applied is True
+
+
+def test_arm_dead_man_rejects_when_device_clock_has_no_row(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): [], ("system", "clock"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.arm_dead_man(
+            client,
+            settings_write_enabled,
+            revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            minutes=3,
+            confirm=True,
+        )
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_arm_dead_man_rejects_when_device_clock_is_unparseable(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={("system", "scheduler"): [], ("system", "clock"): [{"date": "not-a-date", "time": "not-a-time"}]}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.arm_dead_man(
+            client,
+            settings_write_enabled,
+            revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            minutes=3,
+            confirm=True,
+        )
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_arm_dead_man_generates_a_unique_name_each_call(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    first = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=True,
+    )
+    second = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=True,
+    )
+
+    assert first.after["name"] != second.after["name"]
+    assert len(fake.path("system", "scheduler")._rows) == 2
+
+
+@pytest.mark.parametrize("minutes", [0, -1, 61, 120])
+def test_arm_dead_man_rejects_invalid_minutes_before_touching_device(
+    minutes: int, settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.arm_dead_man(
+            guarded_client,
+            settings_write_enabled,
+            revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            minutes=minutes,
+            confirm=True,
+        )
+
+
+def test_arm_dead_man_rejects_empty_revert_commands_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.arm_dead_man(guarded_client, settings_write_enabled, revert_commands=[], minutes=3, confirm=True)
+
+
+def test_arm_dead_man_rejects_too_many_revert_commands_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    too_many = [f'/ip/route set [find dst-address="10.{i}.0.0/24"] distance=1' for i in range(11)]
+    with pytest.raises(ValidationError):
+        guard.arm_dead_man(guarded_client, settings_write_enabled, revert_commands=too_many, minutes=3, confirm=True)
+
+
+def test_arm_dead_man_rejects_control_characters_in_revert_command_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.arm_dead_man(
+            guarded_client,
+            settings_write_enabled,
+            revert_commands=['/interface/wireless set [find name="wlan1"]\nfrequency=5500'],
+            minutes=3,
+            confirm=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "revert_command",
+    [
+        '/interface/wireless set [find name="wlan1"] comment=$var',
+        '/interface/wireless set [find name="wlan1"] frequency=5500; /system reboot',
+    ],
+)
+def test_arm_dead_man_rejects_unsafe_characters_in_revert_command_before_touching_device(
+    revert_command: str, settings_write_enabled: Settings, device: Device
+):
+    """finding 2(a) of the 2026-07 hardening review."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.arm_dead_man(
+            guarded_client, settings_write_enabled, revert_commands=[revert_command], minutes=3, confirm=True
+        )
+
+
+def test_arm_dead_man_rejects_dangerous_verb_in_revert_command_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 2(d) of the 2026-07 hardening review: revert_commands
+    restores state already read from the device before a risky write - it
+    is not a channel to run arbitrary/dangerous RouterOS commands. A
+    caller-supplied revert command naming a dangerous verb is rejected
+    before the device is ever touched, exactly like every other shape
+    validation in this module."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError, match="reboot"):
+        guard.arm_dead_man(
+            guarded_client, settings_write_enabled, revert_commands=["/system reboot"], minutes=3, confirm=True
+        )
+
+
+def test_arm_dead_man_fire_when_revert_statement_is_unrecognized_does_not_self_remove(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 2(b)/(c) of the 2026-07 hardening review: RouterOS aborts the
+    ENTIRE on-event script at the first statement it can't parse - if a
+    revert command breaks, the scheduler's own trailing self-remove never
+    runs either, leaving a stale scheduler entry behind instead of healing
+    the device. Proven here with a syntactically-plausible, VALID (passes
+    validate_revert_command - no denylisted verb, no unsafe character)
+    revert command for a menu the fake's own statement recognizer doesn't
+    know how to apply (see FakeConnection.fire_scheduler's docstring: it
+    only understands /interface/wireless set and /system scheduler remove
+    shapes) - fire_scheduler must stop at that statement and never reach
+    the self-remove, exactly mirroring what an actual RouterOS parse error
+    would do to any revert command this package can't fully validate
+    client-side (see validate_revert_command's docstring: "NOT a RouterOS
+    script parser/validator")."""
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/ip/route set [find dst-address="0.0.0.0/0"] gateway=10.0.0.1'],
+        minutes=3,
+        confirm=True,
+    )
+    name = preview.after["name"]
+    fake.advance_clock(3)
+
+    fake.fire_scheduler(name)
+
+    # The self-remove statement never ran - the scheduler entry is left
+    # behind exactly as a real device would leave it after an aborted
+    # on-event, instead of silently cleaning up after a broken revert.
+    assert any(row.get("name") == name for row in fake.path("system", "scheduler")._rows)
+
+
+def test_arm_dead_man_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, client: MikrotikClient, settings_write_enabled: Settings
+):
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["arm_dead_man"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "arm_dead_man", patched_op)
+
+    guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=True,
+    )
+
+    assert called["path"] == patched_op.path
+    assert called["fields"]["start-date"] == "jan/01/2026"
+    assert called["fields"]["start-time"] == "12:03:00"
+    assert called["fields"]["interval"] == "00:00:00"
+    assert called["fields"]["policy"] == "read,write,test,policy,reboot"
+    assert called["fields"]["name"].startswith("deadman-")
+
+
+# --- cancel_dead_man ----------------------------------------------------------
+
+
+def test_cancel_dead_man_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.cancel_dead_man(client, settings, name="deadman-abc123", confirm=True)
+
+
+def test_cancel_dead_man_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.cancel_dead_man(guarded_client, settings, name="deadman-abc123", confirm=True)
+
+
+def test_cancel_dead_man_rejects_name_not_matching_dead_man_shape_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    """A caller can never point cancel_dead_man at an arbitrary, unrelated
+    scheduler entry (e.g. an admin's own 'backup-daily' task) - the shape
+    check runs, and rejects it, before the device is ever read."""
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.cancel_dead_man(guarded_client, settings_write_enabled, name="backup-daily", confirm=True)
+
+
+def test_cancel_dead_man_preview_does_not_remove(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("system", "scheduler"): [
+                {".id": "*9", "name": "deadman-abc1230000", "on-event": "", "interval": "00:03:00"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.cancel_dead_man(client, settings_write_enabled, name="deadman-abc1230000", confirm=False)
+
+    assert preview.applied is False
+    assert preview.before["name"] == "deadman-abc1230000"
+    names = {row["name"] for row in fake.path("system", "scheduler")._rows}
+    assert "deadman-abc1230000" in names
+
+
+def test_cancel_dead_man_confirm_true_removes(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={
+            ("system", "scheduler"): [
+                {".id": "*9", "name": "deadman-abc1230000", "on-event": "", "interval": "00:03:00"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.cancel_dead_man(client, settings_write_enabled, name="deadman-abc1230000", confirm=True)
+
+    assert preview.applied is True
+    names = {row["name"] for row in fake.path("system", "scheduler")._rows}
+    assert "deadman-abc1230000" not in names
+
+
+def test_cancel_dead_man_unknown_name_raises_resource_not_found(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError) as exc_info:
+        guard.cancel_dead_man(client, settings_write_enabled, name="deadman-dead0000ff", confirm=True)
+    assert "deadman-dead0000ff" in str(exc_info.value)
+
+
+def test_cancel_dead_man_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("system", "scheduler"): [
+                {".id": "*9", "name": "deadman-abc1230000", "on-event": "", "interval": "00:03:00"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["cancel_dead_man"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "cancel_dead_man", patched_op)
+
+    guard.cancel_dead_man(client, settings_write_enabled, name="deadman-abc1230000", confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {"ids": ("*9",)}}
+
+
+# --- set_wireless_channel ------------------------------------------------------
+
+_WIRELESS_FIXTURE_ROW = {
+    ".id": "*1",
+    "name": "wlan1",
+    "frequency": "5500",
+    "channel-width": "20mhz",
+    "frequency-mode": "regulatory-domain",
+    "tx-power-mode": "default",
+    "tx-power": "20",
+    "adaptive-noise-immunity": "none",
+    "distance": "dynamic",
+}
+
+
+def _wireless_fixture(**overrides) -> FakeConnection:
+    row = dict(_WIRELESS_FIXTURE_ROW)
+    row.update(overrides)
+    return FakeConnection(data={("interface", "wireless"): [row], ("system", "scheduler"): []})
+
+
+def test_set_wireless_channel_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_channel(client, settings, interface_name="wlan1", frequency=5300, confirm=True)
+
+
+def test_set_wireless_channel_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_channel(guarded_client, settings, interface_name="wlan1", frequency=5300, confirm=True)
+
+
+def test_set_wireless_channel_preview_does_not_apply_or_arm(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.dead_man is None
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5500"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.parametrize(
+    "frequency,expect_substring",
+    [
+        (5300, "DFS range"),
+        (5620, "weather-radar"),
+        (5180, None),
+    ],
+)
+def test_set_wireless_channel_preview_reports_dfs_warning(
+    frequency: int, expect_substring: str | None, settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=frequency, confirm=False
+    )
+
+    if expect_substring is None:
+        assert preview.warning is None
+    else:
+        assert preview.warning is not None
+        assert expect_substring in preview.warning
+
+
+def test_set_wireless_channel_preview_reports_instant_switch_in_superchannel_mode(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture(**{"frequency-mode": "superchannel"})
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5620, confirm=False
+    )
+
+    assert preview.warning is not None
+    assert "superchannel" in preview.warning
+    assert "instant" in preview.warning
+
+
+def test_set_wireless_channel_confirm_true_applies_and_arms_dead_man_by_default(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        frequency=5300,
+        channel_width="40mhz-turbo",
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["frequency"] == "5300"
+    assert updated["channel-width"] == "40mhz-turbo"
+
+    assert preview.dead_man is not None
+    dead_man_name = preview.dead_man["name"]
+    assert dead_man_name.startswith("deadman-")
+    assert preview.dead_man["minutes"] == 3
+
+    scheduler_rows = fake.path("system", "scheduler")._rows
+    assert len(scheduler_rows) == 1
+    armed = scheduler_rows[0]
+    assert armed["name"] == dead_man_name
+    # The revert command must capture the interface's PRIOR (before-change)
+    # values, not the new ones.
+    assert "frequency=5500" in armed["on-event"]
+    assert "channel-width=20mhz" in armed["on-event"]
+
+
+def test_set_wireless_channel_arms_dead_man_before_applying_the_write(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    """THE key ordering property: the dead-man must be armed on the device
+    BEFORE the risky write itself is sent - so if the write is the one that
+    breaks reachability, the scheduler is already there to heal it."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    original_update = client.update
+    observed: dict = {}
+
+    def spy_update(*segments: str, **fields):
+        observed["scheduler_rows_at_write_time"] = [dict(row) for row in fake.path("system", "scheduler")._rows]
+        return original_update(*segments, **fields)
+
+    monkeypatch.setattr(client, "update", spy_update)
+
+    guard.set_wireless_channel(client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=True)
+
+    armed_at_write_time = observed["scheduler_rows_at_write_time"]
+    assert len(armed_at_write_time) == 1
+    assert armed_at_write_time[0]["name"].startswith("deadman-")
+
+
+def test_set_wireless_channel_dead_man_reverts_on_fire_when_not_cancelled(
+    settings_write_enabled: Settings, device: Device
+):
+    """The other half of the dead-man contract: if the caller never calls
+    cancel_dead_man, firing (simulated here via FakeConnection.fire_scheduler)
+    restores the interface's prior frequency/channel-width and removes the
+    scheduler entry."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        frequency=5300,
+        channel_width="40mhz-turbo",
+        confirm=True,
+    )
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5300"
+
+    fake.advance_clock(preview.dead_man["minutes"])
+    fake.fire_scheduler(preview.dead_man["name"])
+
+    reverted = fake.path("interface", "wireless")._rows[0]
+    assert reverted["frequency"] == "5500"
+    assert reverted["channel-width"] == "20mhz"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_channel_dead_man_does_not_fire_before_its_deadline(
+    settings_write_enabled: Settings, device: Device
+):
+    """Proof that `_dead_man_deadline` computes a genuinely FUTURE
+    `start-date`/`start-time` (`arm-time + minutes`), not something that
+    could be mistaken for "now" - the property the one-shot,
+    explicit-future-deadline design (2026-07-13 hardware finding, see
+    guard._dead_man_deadline's docstring) depends on. Proven here by NOT
+    advancing the fake's simulated clock: firing must refuse (raise), and
+    the channel change must still be in place - the protection window has
+    not elapsed yet."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=True
+    )
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5300"
+
+    with pytest.raises(AssertionError):
+        fake.fire_scheduler(preview.dead_man["name"])
+
+    # Still armed, still un-reverted - the window has not elapsed yet.
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5300"
+    assert len(fake.path("system", "scheduler")._rows) == 1
+
+    fake.advance_clock(preview.dead_man["minutes"])
+    fake.fire_scheduler(preview.dead_man["name"])
+
+    reverted = fake.path("interface", "wireless")._rows[0]
+    assert reverted["frequency"] == "5500"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_channel_dead_man_cancelled_means_no_revert(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=True
+    )
+    guard.cancel_dead_man(client, settings_write_enabled, name=preview.dead_man["name"], confirm=True)
+
+    assert fake.path("system", "scheduler")._rows == []
+    with pytest.raises(AssertionError):
+        fake.fire_scheduler(preview.dead_man["name"])
+    # The confirmed channel change is untouched by the (now-cancelled) dead-man.
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5300"
+
+
+def test_set_wireless_channel_arm_deadman_false_skips_scheduler(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, arm_deadman=False, confirm=True
+    )
+
+    assert preview.applied is True
+    assert preview.dead_man is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_channel_rejects_missing_frequency_field_to_revert(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={("interface", "wireless"): [{".id": "*1", "name": "wlan2"}], ("system", "scheduler"): []}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.set_wireless_channel(client, settings_write_enabled, interface_name="wlan2", frequency=5300, confirm=True)
+    # Never armed, never wrote the frequency change either.
+    assert fake.path("system", "scheduler")._rows == []
+    assert "frequency" not in fake.path("interface", "wireless")._rows[0]
+
+
+def test_set_wireless_channel_rejects_invalid_frequency_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_channel(
+            guarded_client, settings_write_enabled, interface_name="wlan1", frequency=100, confirm=True
+        )
+
+
+def test_set_wireless_channel_rejects_invalid_channel_width_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_channel(
+            guarded_client,
+            settings_write_enabled,
+            interface_name="wlan1",
+            frequency=5300,
+            channel_width="not-a-width",
+            confirm=True,
+        )
+
+
+def test_set_wireless_channel_rejects_invalid_deadman_minutes_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_channel(
+            guarded_client,
+            settings_write_enabled,
+            interface_name="wlan1",
+            frequency=5300,
+            deadman_minutes=999,
+            confirm=True,
+        )
+
+
+def test_set_wireless_channel_rejects_deadman_minutes_shorter_than_weather_radar_cac(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 3 of the 2026-07 hardening review: the default
+    deadman_minutes=3 (180s) is SHORTER than the ~600s CAC the
+    weather-radar sub-band requires - arming here would let the dead-man
+    revert the channel while it is still mid-CAC, before an operator could
+    ever confirm the link is back up."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ValidationError, match="Channel Availability Check"):
+        guard.set_wireless_channel(client, settings_write_enabled, interface_name="wlan1", frequency=5620, confirm=True)
+    # Never armed, never wrote the frequency change either.
+    assert fake.path("system", "scheduler")._rows == []
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5500"
+
+
+def test_set_wireless_channel_accepts_deadman_minutes_that_covers_weather_radar_cac(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        frequency=5620,
+        deadman_minutes=10,
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    assert preview.dead_man is not None
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5620"
+    assert len(fake.path("system", "scheduler")._rows) == 1
+
+
+def test_set_wireless_channel_non_dfs_frequency_arms_dead_man_without_cac_floor_check(
+    settings_write_enabled: Settings, device: Device
+):
+    """A target frequency that needs no CAC at all (outside every DFS band)
+    imposes no deadman_minutes floor - the default 3 minutes is fine."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5180, confirm=True
+    )
+
+    assert preview.applied is True
+    assert preview.warning is None
+    assert preview.dead_man is not None
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5180"
+
+
+def test_set_wireless_channel_warning_notes_revert_target_also_needs_cac(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 3: when a dead-man is armed, the preview's warning also
+    notes that the REVERT target (the interface's prior, pre-change
+    frequency) can itself be DFS-governed - if the dead-man fires, RouterOS
+    runs a CAC on the way back too. The fixture's prior frequency (5500) is
+    itself in the general DFS range."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=False
+    )
+
+    assert preview.warning is not None
+    assert "revert target" in preview.warning
+    assert "5500MHz" in preview.warning
+
+
+def test_set_wireless_channel_arm_deadman_false_skips_cac_floor_check(settings_write_enabled: Settings, device: Device):
+    """arm_deadman=False means no scheduler at all, so the CAC-floor
+    enforcement (which only matters for a dead-man that could fire
+    mid-CAC) does not apply - a short deadman_minutes against a
+    weather-radar frequency is accepted when no dead-man will be armed."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_channel(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        frequency=5620,
+        arm_deadman=False,
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    assert preview.dead_man is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_channel_rejects_missing_channel_width_field_to_revert(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 5 of the 2026-07 hardening review: channel_width was
+    requested but the interface's current state has no 'channel-width' to
+    revert TO - arming here would produce a PARTIAL revert (frequency
+    restored, channel-width silently left on the new value forever if the
+    dead-man fires). Must refuse the whole arm, not just skip that field."""
+    fake = FakeConnection(
+        data={
+            ("interface", "wireless"): [{".id": "*1", "name": "wlan2", "frequency": "5500"}],
+            ("system", "scheduler"): [],
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.set_wireless_channel(
+            client,
+            settings_write_enabled,
+            interface_name="wlan2",
+            frequency=5300,
+            channel_width="40mhz-turbo",
+            confirm=True,
+        )
+    # Never armed, never wrote the frequency change either - a partial
+    # revert would be worse than no write at all.
+    assert fake.path("system", "scheduler")._rows == []
+    assert fake.path("interface", "wireless")._rows[0]["frequency"] == "5500"
+
+
+def test_set_wireless_channel_unknown_interface_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.set_wireless_channel(
+            client, settings_write_enabled, interface_name="ghost-wlan", frequency=5300, confirm=True
+        )
+
+
+def test_set_wireless_channel_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_wireless_channel"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_wireless_channel", patched_op)
+
+    guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, arm_deadman=False, confirm=True
+    )
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*1", "frequency": "5300"}}
+
+
+# --- set_wireless_tx_power -----------------------------------------------------
+
+
+def test_set_wireless_tx_power_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_tx_power(client, settings, interface_name="wlan1", tx_power=8, confirm=True)
+
+
+def test_set_wireless_tx_power_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_tx_power(guarded_client, settings, interface_name="wlan1", tx_power=8, confirm=True)
+
+
+def test_set_wireless_tx_power_preview_does_not_apply_or_arm(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tx_power(
+        client, settings_write_enabled, interface_name="wlan1", tx_power=8, confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.dead_man is None
+    assert preview.warning is not None and "re-adapt" in preview.warning
+    assert fake.path("interface", "wireless")._rows[0]["tx-power"] == "20"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_tx_power_confirm_true_applies_forces_all_rates_fixed_and_arms_dead_man(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tx_power(
+        client, settings_write_enabled, interface_name="wlan1", tx_power=8, confirm=True
+    )
+
+    assert preview.applied is True
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["tx-power"] == "8"
+    assert updated["tx-power-mode"] == "all-rates-fixed"
+
+    assert preview.dead_man is not None
+    scheduler_rows = fake.path("system", "scheduler")._rows
+    assert len(scheduler_rows) == 1
+    on_event = scheduler_rows[0]["on-event"]
+    assert "tx-power=20" in on_event
+    assert "tx-power-mode=default" in on_event
+
+
+def test_set_wireless_tx_power_dead_man_reverts_both_fields_on_fire(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tx_power(
+        client, settings_write_enabled, interface_name="wlan1", tx_power=8, confirm=True
+    )
+    fake.advance_clock(preview.dead_man["minutes"])
+    fake.fire_scheduler(preview.dead_man["name"])
+
+    reverted = fake.path("interface", "wireless")._rows[0]
+    assert reverted["tx-power"] == "20"
+    assert reverted["tx-power-mode"] == "default"
+
+
+def test_set_wireless_tx_power_arm_deadman_false_skips_scheduler(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tx_power(
+        client, settings_write_enabled, interface_name="wlan1", tx_power=8, arm_deadman=False, confirm=True
+    )
+
+    assert preview.dead_man is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.parametrize("tx_power", [-31, 41, 100])
+def test_set_wireless_tx_power_rejects_invalid_power_before_touching_device(
+    tx_power: int, settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_tx_power(
+            guarded_client, settings_write_enabled, interface_name="wlan1", tx_power=tx_power, confirm=True
+        )
+
+
+def test_set_wireless_tx_power_rejects_missing_fields_to_revert(settings_write_enabled: Settings, device: Device):
+    """finding 4 of the 2026-07 hardening review: previously defaulted to
+    `before.get("tx-power-mode", "default")`/`before.get("tx-power", "0")` -
+    a fabricated fallback that could revert to a power/mode the interface
+    never actually had. Must raise instead, matching
+    set_wireless_channel's fail-safe (never invent a revert target)."""
+    fake = FakeConnection(
+        data={("interface", "wireless"): [{".id": "*1", "name": "wlan2"}], ("system", "scheduler"): []}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.set_wireless_tx_power(client, settings_write_enabled, interface_name="wlan2", tx_power=8, confirm=True)
+    # Never armed, never wrote the tx-power change either.
+    assert fake.path("system", "scheduler")._rows == []
+    assert "tx-power" not in fake.path("interface", "wireless")._rows[0]
+
+
+def test_set_wireless_tx_power_unknown_interface_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.set_wireless_tx_power(
+            client, settings_write_enabled, interface_name="ghost-wlan", tx_power=8, confirm=True
+        )
+
+
+def test_set_wireless_tx_power_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_wireless_tx_power"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_wireless_tx_power", patched_op)
+
+    guard.set_wireless_tx_power(
+        client, settings_write_enabled, interface_name="wlan1", tx_power=8, arm_deadman=False, confirm=True
+    )
+
+    assert called == {
+        "path": patched_op.path,
+        "fields": {".id": "*1", "tx-power-mode": "all-rates-fixed", "tx-power": "8"},
+    }
+
+
+# --- set_wireless_tuning --------------------------------------------------------
+
+
+def test_set_wireless_tuning_blocked_when_write_disabled(client: MikrotikClient, settings: Settings):
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_tuning(
+            client, settings, interface_name="wlan1", adaptive_noise_immunity="ap-and-client-mode", confirm=True
+        )
+
+
+def test_set_wireless_tuning_read_only_gate_applies_before_touching_device(device: Device, settings: Settings):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(WriteDisabledError):
+        guard.set_wireless_tuning(guarded_client, settings, interface_name="wlan1", distance=9, confirm=True)
+
+
+def test_set_wireless_tuning_requires_at_least_one_field(settings_write_enabled: Settings, device: Device):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_tuning(guarded_client, settings_write_enabled, interface_name="wlan1", confirm=True)
+
+
+def test_set_wireless_tuning_preview_does_not_apply(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=9, confirm=False
+    )
+
+    assert preview.applied is False
+    assert fake.path("interface", "wireless")._rows[0]["distance"] == "dynamic"
+
+
+def test_set_wireless_tuning_confirm_true_applies_distance_only(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=9, confirm=True
+    )
+
+    assert preview.applied is True
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["distance"] == "9"
+    assert updated["adaptive-noise-immunity"] == "none"  # unchanged
+
+
+def test_set_wireless_tuning_confirm_true_applies_adaptive_noise_immunity_only(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        adaptive_noise_immunity="ap-and-client-mode",
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["adaptive-noise-immunity"] == "ap-and-client-mode"
+    assert updated["distance"] == "dynamic"  # unchanged
+
+
+def test_set_wireless_tuning_confirm_true_applies_both_fields(settings_write_enabled: Settings, device: Device):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        adaptive_noise_immunity="client-mode",
+        distance="indoors",
+        confirm=True,
+    )
+
+    assert preview.applied is True
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["adaptive-noise-immunity"] == "client-mode"
+    assert updated["distance"] == "indoors"
+
+
+def test_set_wireless_tuning_adaptive_noise_immunity_alone_never_arms_a_dead_man(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client,
+        settings_write_enabled,
+        interface_name="wlan1",
+        adaptive_noise_immunity="ap-and-client-mode",
+        confirm=True,
+    )
+
+    assert preview.dead_man is None
+    assert preview.warning is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.parametrize("distance", ["dynamic", "indoors"])
+def test_set_wireless_tuning_named_distance_modes_never_arm_a_dead_man(
+    distance: str, settings_write_enabled: Settings, device: Device
+):
+    """ "dynamic"/"indoors" are RouterOS's own named, self-managed
+    ACK-timeout modes - unlike a caller-chosen numeric distance (finding 1
+    of the 2026-07 hardening review), they were not the LOCKOUT-RISK case
+    verified live and never arm a dead-man here."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=distance, confirm=True
+    )
+
+    assert preview.dead_man is None
+    assert preview.warning is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_tuning_numeric_distance_is_lockout_risk_and_arms_dead_man_by_default(
+    settings_write_enabled: Settings, device: Device
+):
+    """finding 1 of the 2026-07 hardening review: a NUMERIC distance
+    directly changes the ACK-timeout/TDMA timing (unlike "dynamic"/
+    "indoors") and can silently drop an already-associated link with no
+    protocol-level recovery - CONFIRMED LIVE. Treated as LOCKOUT-RISK
+    exactly like set_wireless_channel/set_wireless_tx_power: arms a
+    dead-man by default whose revert restores the PRIOR distance."""
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=1, confirm=True
+    )
+
+    assert preview.applied is True
+    assert fake.path("interface", "wireless")._rows[0]["distance"] == "1"
+    assert preview.warning is not None and "LOCKOUT-RISK" in preview.warning
+
+    assert preview.dead_man is not None
+    dead_man_name = preview.dead_man["name"]
+    scheduler_rows = fake.path("system", "scheduler")._rows
+    assert len(scheduler_rows) == 1
+    armed = scheduler_rows[0]
+    assert armed["name"] == dead_man_name
+    # The revert command must capture the PRIOR (before-change) distance,
+    # not the new one.
+    assert "distance=dynamic" in armed["on-event"]
+
+
+def test_set_wireless_tuning_numeric_distance_preview_reports_lockout_risk_without_arming(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=1, confirm=False
+    )
+
+    assert preview.applied is False
+    assert preview.dead_man is None
+    assert preview.warning is not None and "LOCKOUT-RISK" in preview.warning
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_tuning_numeric_distance_dead_man_reverts_on_fire_when_not_cancelled(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=1, confirm=True
+    )
+    assert fake.path("interface", "wireless")._rows[0]["distance"] == "1"
+
+    fake.advance_clock(preview.dead_man["minutes"])
+    fake.fire_scheduler(preview.dead_man["name"])
+
+    reverted = fake.path("interface", "wireless")._rows[0]
+    assert reverted["distance"] == "dynamic"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_tuning_numeric_distance_arm_deadman_false_skips_scheduler(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    preview = guard.set_wireless_tuning(
+        client, settings_write_enabled, interface_name="wlan1", distance=1, arm_deadman=False, confirm=True
+    )
+
+    assert preview.applied is True
+    assert preview.dead_man is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+def test_set_wireless_tuning_numeric_distance_rejects_invalid_deadman_minutes_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_tuning(
+            guarded_client,
+            settings_write_enabled,
+            interface_name="wlan1",
+            distance=1,
+            deadman_minutes=999,
+            confirm=True,
+        )
+
+
+def test_set_wireless_tuning_rejects_missing_distance_field_to_revert(settings_write_enabled: Settings, device: Device):
+    fake = FakeConnection(
+        data={("interface", "wireless"): [{".id": "*1", "name": "wlan2"}], ("system", "scheduler"): []}
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(DeviceCommandError):
+        guard.set_wireless_tuning(client, settings_write_enabled, interface_name="wlan2", distance=1, confirm=True)
+    assert fake.path("system", "scheduler")._rows == []
+    assert "distance" not in fake.path("interface", "wireless")._rows[0]
+
+
+def test_set_wireless_tuning_rejects_invalid_adaptive_noise_immunity_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_tuning(
+            guarded_client,
+            settings_write_enabled,
+            interface_name="wlan1",
+            adaptive_noise_immunity="turbo-mode",
+            confirm=True,
+        )
+
+
+def test_set_wireless_tuning_rejects_invalid_distance_before_touching_device(
+    settings_write_enabled: Settings, device: Device
+):
+    guarded_client = MikrotikClient(device, connection=RaisingConnection())
+    with pytest.raises(ValidationError):
+        guard.set_wireless_tuning(
+            guarded_client, settings_write_enabled, interface_name="wlan1", distance=99999, confirm=True
+        )
+
+
+def test_set_wireless_tuning_unknown_interface_raises_resource_not_found(
+    settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+
+    with pytest.raises(ResourceNotFoundError):
+        guard.set_wireless_tuning(client, settings_write_enabled, interface_name="ghost-wlan", distance=9, confirm=True)
+
+
+def test_set_wireless_tuning_dispatches_via_allowlist_action(
+    monkeypatch: pytest.MonkeyPatch, settings_write_enabled: Settings, device: Device
+):
+    fake = _wireless_fixture()
+    client = MikrotikClient(device, connection=fake)
+    called: dict = {}
+
+    def stub_action(*path: str, **fields):
+        called["path"] = path
+        called["fields"] = fields
+
+    monkeypatch.setattr(client, "stub_action", stub_action, raising=False)
+    patched_op = dataclasses.replace(guard.ALLOWLIST["set_wireless_tuning"], action="stub_action")
+    monkeypatch.setitem(guard.ALLOWLIST, "set_wireless_tuning", patched_op)
+
+    guard.set_wireless_tuning(client, settings_write_enabled, interface_name="wlan1", distance=9, confirm=True)
+
+    assert called == {"path": patched_op.path, "fields": {".id": "*1", "distance": "9"}}

@@ -598,6 +598,43 @@ def fake_connection() -> FakeConnection:
                     "disabled": False,
                 }
             ],
+            # v1.11: wireless RF tuning + dead-man - a PtP-shaped
+            # /interface/wireless row (frequency-mode=regulatory-domain, so
+            # set_wireless_channel's DFS preview has something non-trivial to
+            # report by default; a dedicated FakeConnection is used in
+            # test_guard.py/test_server.py for the superchannel/no-DFS case).
+            ("interface", "wireless"): [
+                {
+                    ".id": "*1",
+                    "name": "wlan1",
+                    "mode": "bridge",
+                    "ssid": "ptp-link",
+                    "frequency": "5500",
+                    "channel-width": "20mhz",
+                    "frequency-mode": "regulatory-domain",
+                    "tx-power-mode": "default",
+                    "tx-power": "20",
+                    "adaptive-noise-immunity": "none",
+                    "distance": "dynamic",
+                    "disabled": False,
+                    "running": True,
+                }
+            ],
+            ("interface", "wireless", "registration-table"): [
+                {
+                    ".id": "*1",
+                    "interface": "wlan1",
+                    "mac-address": "AA:BB:CC:DD:EE:90",
+                    "signal-strength": "-47",
+                    "signal-to-noise": "45",
+                    "tx-ccq": "94",
+                    "rx-ccq": "90",
+                    "tx-rate": "300Mbps",
+                    "rx-rate": "300Mbps",
+                    "distance": "8800",
+                    "uptime": "2d3h",
+                }
+            ],
         },
         ping_replies=[
             {"seq": "0", "host": "8.8.8.8", "time": "3ms"},

@@ -23,7 +23,27 @@ Nothing here is a commitment or a schedule. It's a prioritized, honest map of
 what fits the model, what doesn't, and why. Community proposals are welcome —
 see `CONTRIBUTING.md`.
 
-**Recently shipped:** IPv6 write parity — `enable_ipv6_firewall_rule`/
+**Recently shipped:** Wireless RF tuning + the dead-man primitive —
+`set_wireless_channel`/`set_wireless_tx_power`/`set_wireless_tuning`
+(guarded writes) and `get_wireless_link_quality` (read) — landed in
+**v1.11**, alongside `arm_dead_man`/`cancel_dead_man`, a reusable
+anti-lockout primitive (arm a local, self-removing RouterOS scheduler that
+reverts a risky write after N minutes unless cancelled) that
+`set_wireless_channel`/`set_wireless_tx_power` use automatically by
+default. This is the compensating control the "Richer ROS7 Wi-Fi" item
+below named as the reason channel/regulatory-domain changes were excluded
+— see that item's updated note. All four wireless tools target
+`/interface/wireless` specifically (confirmed via real hardware, 2026-07,
+to be what the fleet's ac-chipset PtP radios actually run on ROS 7.21.5 —
+see `docs/api-notes-wireless-rf.md`), not ROS7's newer `/interface/wifi`
+package. Hardware-verified: DFS/Channel-Availability-Check behavior
+(instant under `frequency-mode=superchannel`, ~60s in the general DFS
+range, ~600s in the 5600-5650MHz weather-radar sub-band), a tx-power
+saturation finding on a short link (default/max power measured worse CCQ
+than a lower explicit power), and `adaptive-noise-immunity`/`distance`
+tuning improvements on a real PtP deployment.
+
+Before that: IPv6 write parity — `enable_ipv6_firewall_rule`/
 `disable_ipv6_firewall_rule`, `add_ipv6_route`/`remove_ipv6_route`,
 `add_to_ipv6_address_list`/`remove_from_ipv6_address_list` — landed in
 **v1.10**, closing out Tier 3's "IPv6 parity" item entirely (reads in v1.9,
@@ -128,7 +148,7 @@ over the binary API. Documenting them saves everyone a duplicate issue.
 
 | Not doing | Why |
 |---|---|
-| **Safe Mode** (`/system/safe-mode`) | *(verified)* Not an API command — `/system/safe-mode/print` returns "no such command". RouterOS safe-mode is an interactive terminal feature (Ctrl-X). It needs an SSH/console session, which this project does not open. Other MCPs that offer it drive it over SSH. Worth naming the trade-off honestly: safe-mode is RouterOS's *best* anti-lockout mechanism, and giving it up is a real cost — the API-only compensating control we offer instead is mandatory before/after **preview (dry-run)** on every write. |
+| **Safe Mode** (`/system/safe-mode`) | *(verified)* Not an API command — `/system/safe-mode/print` returns "no such command". RouterOS safe-mode is an interactive terminal feature (Ctrl-X). It needs an SSH/console session, which this project does not open. Other MCPs that offer it drive it over SSH. Worth naming the trade-off honestly: safe-mode is RouterOS's *best* anti-lockout mechanism, and giving it up is a real cost — the API-only compensating control we offer instead is mandatory before/after **preview (dry-run)** on every write, plus (since **v1.11**) the **dead-man** primitive (`arm_dead_man`/`cancel_dead_man`) for LOCKOUT-RISK writes specifically — a local, self-removing RouterOS scheduler that reverts the change after N minutes unless explicitly cancelled. Not identical to Safe Mode (which reverts on session *disconnect*; the dead-man reverts on a *timer*, cancelled explicitly) but the same spirit, achieved API-only. See README's "Dead-man / lockout-proof writes". |
 | **Text config export / diff** (`/export`) | *(verified)* `/export` is accepted over the API but returns **zero** data — it's a CLI-only renderer. A textual export/diff needs SSH. See "API-only config snapshot" below for an in-architecture alternative. |
 | **Device reboot** (`/system/reboot`) | No meaningful before/after preview; a batch reboot has no dry-run or rollback. |
 | **Backup restore** (`/system/backup/load`) | Same risk class as reboot — overwrites the entire running config and reboots. |
@@ -178,12 +198,22 @@ read side exists, but are not yet scoped — see "How items graduate" below.
   IPv4 write-family boundaries (see "Explicitly NOT on the roadmap" above).
 - **Advanced queuing** (`/queue/tree`, PCQ) — extends simple-queue bandwidth to
   real QoS hierarchies. Read first; guarded writes later.
-- **Richer ROS7 Wi-Fi** (`/interface/wifi`) — today only `set_wifi_ssid`.
-  Scope deliberately limited to **security-profile / passphrase** edits (the
-  same pattern `set_wifi_ssid` already proves), **excluding channel and
-  regulatory-domain** changes: those can disconnect an AP reached over its own
-  radio — a real remote-lockout vector for the WISP CPEs this project courts.
-  Also carries the same wifi-generation complexity the codebase already handles
+- **Richer ROS7 Wi-Fi** (`/interface/wifi` specifically) — today only
+  `set_wifi_ssid` writes here. **UPDATE (v1.11):** the reason channel/
+  regulatory-domain changes were excluded — "those can disconnect an AP
+  reached over its own radio, a real remote-lockout vector" — now has a
+  compensating control: the dead-man primitive (`arm_dead_man`/
+  `cancel_dead_man`, see "Recently shipped" above), which
+  `set_wireless_channel`/`set_wireless_tx_power` already use by default on
+  `/interface/wireless` (the legacy menu, confirmed to be what this
+  project's own PtP fleet actually runs). Porting channel/tx-power/tuning
+  writes to `/interface/wifi` itself — a genuinely different field shape
+  (`channel.frequency`/`channel.width` nested properties, no
+  `tx-power-mode` equivalent at all — see `docs/api-notes-wireless-rf.md`)
+  — is no longer excluded on lockout-risk grounds, just not yet scoped/
+  hardware-verified. Security-profile/passphrase edits (`set_wifi_ssid`'s
+  existing pattern) remain the only `/interface/wifi` write shipped. Still
+  carries the same wifi-generation complexity the codebase already handles
   (`/interface/wifi` vs `/interface/wireless` on ROS6 vs `/interface/wifi/
   configuration`, plus `wifiwave2` on ROS7 before 7.13).
 - **CAPsMAN / centralized Wi-Fi** (`/caps-man` on ROS6, CAPsMAN under

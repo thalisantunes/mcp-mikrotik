@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import functools
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from . import audit
@@ -47,9 +49,16 @@ from .exceptions import (
     ValidationError,
     WriteDisabledError,
 )
-from .formatting import WIREGUARD_SENSITIVE_FIELDS, coerce_ros_bool, strip_sensitive_fields
+from .formatting import (
+    WIREGUARD_SENSITIVE_FIELDS,
+    coerce_ros_bool,
+    format_ros_date_time,
+    parse_ros_datetime,
+    strip_sensitive_fields,
+)
 from .validation import (
     is_literal_ip_address,
+    validate_adaptive_noise_immunity,
     validate_address_list_name,
     validate_allowed_address_list,
     validate_backup_name,
@@ -57,6 +66,8 @@ from .validation import (
     validate_byte_count,
     validate_comment,
     validate_container_identifier,
+    validate_dead_man_minutes,
+    validate_dead_man_name,
     validate_dns_name,
     validate_dns_record_type,
     validate_dst_address,
@@ -81,12 +92,17 @@ from .validation import (
     validate_ppp_secret_password,
     validate_ppp_service,
     validate_rate_pair,
+    validate_revert_commands,
     validate_route_distance,
     validate_route_gateway,
     validate_target,
     validate_timeout,
     validate_vlan_id,
     validate_wireguard_key,
+    validate_wireless_channel_width,
+    validate_wireless_distance,
+    validate_wireless_frequency,
+    validate_wireless_tx_power,
 )
 
 
@@ -598,6 +614,73 @@ ALLOWLIST: dict[str, WriteOperation] = {
             "remove_from_address_list for IPv6."
         ),
     ),
+    # v1.11: wireless RF tuning + the dead-man primitive. Both
+    # set_wireless_channel and set_wireless_tx_power are the exact class of
+    # write ROADMAP.md's "Richer ROS7 Wi-Fi" item previously excluded by name
+    # ("excluding channel and regulatory-domain changes: those can disconnect
+    # an AP reached over its own radio - a real remote-lockout vector") -
+    # what changes in v1.11 is that arm_dead_man/cancel_dead_man below give
+    # this package an actual, verified compensating control for exactly that
+    # risk (see guard.py's module note above arm_dead_man, and
+    # docs/api-notes-wireless-rf.md), so the two writes are shipped WITH that
+    # control wired in by default rather than staying excluded indefinitely.
+    # All three wireless entries target `/interface/wireless` specifically -
+    # confirmed against real hardware today (DISC Lite5 ac, LHG XL 5 ac;
+    # IPQ4019; ROS 7.21.5) to be what these devices actually run; ROS7's
+    # newer /interface/wifi package uses different field names entirely and
+    # is out of scope this round (see docs/api-notes-wireless-rf.md).
+    "set_wireless_channel": WriteOperation(
+        name="set_wireless_channel",
+        path=("interface", "wireless"),
+        action="update",
+        description=(
+            "Set a /interface/wireless interface's frequency (and optionally channel-width). LOCKOUT-RISK "
+            "on a management-path PtP link - arms a dead-man revert by default (see arm_dead_man)."
+        ),
+    ),
+    "set_wireless_tx_power": WriteOperation(
+        name="set_wireless_tx_power",
+        path=("interface", "wireless"),
+        action="update",
+        description=(
+            "Set a /interface/wireless interface's tx-power (dBm), forcing tx-power-mode=all-rates-fixed. "
+            "LOCKOUT-RISK on a management-path PtP link - arms a dead-man revert by default (see arm_dead_man)."
+        ),
+    ),
+    "set_wireless_tuning": WriteOperation(
+        name="set_wireless_tuning",
+        path=("interface", "wireless"),
+        action="update",
+        description=(
+            "Set a /interface/wireless interface's adaptive-noise-immunity and/or distance. "
+            "adaptive-noise-immunity alone is reception-only tuning, never arms a dead-man. A NUMERIC distance "
+            "is LOCKOUT-RISK (directly sets ACK-timeout/TDMA timing) - arms a dead-man revert by default, same "
+            "as set_wireless_channel/set_wireless_tx_power."
+        ),
+    ),
+    # arm_dead_man/cancel_dead_man are the reusable dead-man primitive itself
+    # - see arm_dead_man's docstring below for the full design. Deliberately
+    # NOT wireless-specific: both target /system/scheduler, usable by any
+    # future lockout-risk write (a route, a bridge port, ...), not just the
+    # two wireless writes above that happen to use it first.
+    "arm_dead_man": WriteOperation(
+        name="arm_dead_man",
+        path=("system", "scheduler"),
+        action="add",
+        description=(
+            "Arm a local, self-removing RouterOS scheduler that reverts a change after N minutes unless "
+            "cancelled first (cancel_dead_man) - the anti-lockout primitive behind every LOCKOUT-RISK write."
+        ),
+    ),
+    "cancel_dead_man": WriteOperation(
+        name="cancel_dead_man",
+        path=("system", "scheduler"),
+        action="remove",
+        description=(
+            "Cancel a dead-man scheduler armed by arm_dead_man, once the change it guards is confirmed good. "
+            "Can only ever target a scheduler this package itself armed (name shape 'deadman-<hex>')."
+        ),
+    ),
     # --- Deliberately NOT added yet - each needs extra policy beyond the
     # standard guard before it would be safe to expose:
     #   * reboot ("system/reboot"): no before/after preview is meaningful for
@@ -645,6 +728,16 @@ class WritePreview:
     # v0.9, and most of v0.9's own writes too) - existing callers/tests that
     # construct or compare a WritePreview without `warning` are unaffected.
     warning: str | None = None
+    # v1.11: set only by a LOCKOUT-RISK write that armed a dead-man revert
+    # as part of THIS applied call (see arm_dead_man/_apply_with_dead_man
+    # below) - {"name": ..., "minutes": ...}, the exact arguments a caller
+    # needs to call cancel_dead_man once they've confirmed the change is
+    # good. None for every write that doesn't arm one (every write before
+    # v1.11, `set_wireless_tuning`, any v1.11 wireless write called with
+    # `arm_deadman=False`, and every write that only PREVIEWED - arming a
+    # real scheduler during a confirm=False preview would violate the "a
+    # preview never touches the device" invariant, see the module docstring).
+    dead_man: dict[str, Any] | None = None
 
 
 def _require_allowed(settings: Settings, operation_name: str) -> WriteOperation:
@@ -3597,4 +3690,763 @@ def set_ntp_servers(client: MikrotikClient, settings: Settings, servers: list[st
     write(*op.path, **fields)
     return WritePreview(
         operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+# --- v1.11: the dead-man primitive ------------------------------------------
+#
+# THE differentiator this release adds (see README's "Dead-man / lockout-
+# proof writes" section): a reusable, generic anti-lockout mechanism for ANY
+# risky remote write, not just wireless. Validated today against the
+# highest-risk case in this project's own fleet - an 8.8km PtP link that is
+# the SOLE management path to the far-end device. Pattern: before a risky
+# write, arm a scheduler LOCAL to the target device that reverts the change
+# and self-removes after N minutes. If the write breaks reachability, the
+# device heals itself with zero further action from the operator - the
+# on-event script runs entirely on-device, independent of whether the API
+# session (or anything else) can still reach it afterward. If the write is
+# good, cancel_dead_man removes the scheduler before it ever fires.
+#
+# Deliberately two flat primitives (arm/cancel), not a single "do a risky
+# write" black box: arm_dead_man/cancel_dead_man each go through the exact
+# same allowlist+confirm+audit machinery as every other guarded write here,
+# are individually callable (standalone MCP tools - see server.py), and are
+# composed into set_wireless_channel/set_wireless_tx_power below (this
+# round's two LOCKOUT-RISK wireless writes) via the private
+# _arm_wireless_revert helper - never a new generic "run this write with a
+# dead-man" entry point that would weaken the module's core invariant (no
+# generic command path, see module docstring).
+
+_DEAD_MAN_NAME_PREFIX = "deadman-"
+
+# Explicit /system/scheduler `policy` for every dead-man this package arms -
+# finding 6 of the 2026-07 hardening review. RouterOS's own default policy
+# on a freshly-added scheduler entry happens to be permissive enough to run
+# this on-event (verified live), but relying on a device-side DEFAULT for
+# the one scheduler entry whose entire job is to self-heal a lockout is
+# fragile: a device with a hardened/non-default scheduler policy could
+# silently arm a dead-man that can never actually run its revert. Setting
+# `policy=` explicitly removes that dependency. `reboot` is included even
+# though no dead-man revert command reboots anything today (arm_dead_man's
+# own denylist - see validate_revert_command - forbids that) because
+# RouterOS requires the `reboot` policy bit for some `/system` sub-menu
+# writes unrelated to an actual reboot; `policy`/`test` are required to
+# manage `/system/scheduler` itself (the on-event's own self-remove
+# statement); `read`/`write` cover the actual revert commands.
+_DEAD_MAN_SCHEDULER_POLICY = "read,write,test,policy,reboot"
+
+
+def _dead_man_deadline(client: MikrotikClient, minutes: int) -> tuple[str, str]:
+    """Read the TARGET DEVICE's own `/system/clock` and compute a one-shot
+    `/system/scheduler` `start-date`/`start-time` pair `minutes` in the
+    future.
+
+    2026-07-13 hardware finding that forced this design (verified live
+    against ROS 7.21.5, re-verified filtering the device's own log
+    `topics`): an `interval`-only `/system scheduler add` (no `start-date`/
+    `start-time`) does NOT fire immediately on arm - an earlier read of this
+    finding mistook the API's own audit-log entry for the scheduler being
+    CREATED (`topics=system,info`, which echoes the new on-event's text) for
+    an actual on-event RUN; the real fire event (`topics=script,warning`,
+    the `:log warning` this package's own on-event always emits first) only
+    happened at creation+interval, exactly once, as expected. The REAL
+    problem `interval`-only has is non-repetition, not immediacy: if the
+    on-event ever aborts partway through (see `_build_dead_man_script`'s
+    module note / the 2026-07 hardening review's finding 2 - RouterOS
+    aborts an on-event script entirely at its first unparseable statement,
+    so a broken revert command means the trailing self-remove never runs
+    either), an `interval`-only schedule is still ARMED and RECURRING - it
+    fires the same broken on-event again every `interval` thereafter,
+    indefinitely, until someone removes it by hand. A ONE-SHOT schedule
+    (`interval="00:00:00"`, RouterOS's own "run once, don't repeat" shape)
+    with an EXPLICIT, already-in-the-future `start-date`/`start-time` fires
+    exactly once no matter what happens inside the on-event - a broken
+    revert fails once and stays failed-but-inert, never retried
+    automatically. This combines with `validate_revert_command`'s hardening
+    (finding 2) as defense in depth: the one-shot shape bounds the damage
+    of a revert command that gets past validation but still breaks at
+    RouterOS's own script-parse stage.
+
+    Reads the DEVICE's own clock (`/system/clock`), never this host's: the
+    two can disagree (drift, time zone), and it is the device's own clock
+    the scheduler evaluates `start-date`/`start-time` against. Also
+    midnight/month/year-rollover safe - real `datetime` + `timedelta`
+    arithmetic (`formatting.parse_ros_datetime`/`format_ros_date_time`)
+    handles every rollover correctly, with an explicit `start-date` removing
+    any ambiguity about which day a `start-time`-only schedule would apply
+    to.
+
+    Raises `DeviceCommandError` if `/system/clock` can't be read, returns no
+    row, or its `date`/`time` can't be parsed - arm_dead_man must never
+    guess a deadline from a clock it couldn't actually read.
+    """
+    rows = client.path("system", "clock")
+    if not rows:
+        raise DeviceCommandError(
+            client.device.name,
+            "system/clock",
+            "cannot arm a dead-man: /system/clock returned no row to compute the fire deadline from.",
+        )
+    row = rows[0]
+    now = parse_ros_datetime(f"{row.get('date', '')} {row.get('time', '')}")
+    if now is None:
+        raise DeviceCommandError(
+            client.device.name,
+            "system/clock",
+            f"cannot arm a dead-man: could not parse this device's clock (date={row.get('date')!r}, "
+            f"time={row.get('time')!r}).",
+        )
+    deadline = now + timedelta(minutes=minutes)
+    return format_ros_date_time(deadline)
+
+
+def _build_dead_man_script(name: str, revert_commands: list[str]) -> str:
+    """Build the RouterOS script an armed dead-man scheduler runs when it
+    fires: log a warning (so the revert is visible in `logs`/
+    `security_events`), run every validated `revert_commands` statement in
+    order, then remove ITS OWN scheduler entry by name - self-cleaning, so a
+    fired dead-man never leaves a stale scheduler entry behind to collide
+    with a future `arm_dead_man` call.
+
+    `name` is always this package's own "deadman-<hex>" shape
+    (`validate_dead_man_name`'s charset - digits/lower-case-hex only, no
+    quote or control character possible), so embedding it directly inside a
+    double-quoted RouterOS script string here is safe. `revert_commands` are
+    joined with "; " - RouterOS script statement separator, exactly as in
+    the hardware-verified command this mirrors.
+    """
+    body = "; ".join(revert_commands)
+    return (
+        f':log warning "mcp-mikrotik dead-man reverting {name}"; {body}; /system scheduler remove [find name="{name}"]'
+    )
+
+
+@_audited("arm_dead_man")
+def arm_dead_man(
+    client: MikrotikClient, settings: Settings, revert_commands: list[str], minutes: int, confirm: bool
+) -> WritePreview:
+    """Arm a local, self-removing RouterOS scheduler that reverts a change
+    after `minutes` unless cancelled first (`cancel_dead_man`) - see the
+    module note above for the full design and README's "Dead-man..."
+    section for the story behind it.
+
+    `revert_commands` (validated by `validate_revert_commands`/
+    `validate_revert_command`) is any non-empty list of RouterOS script
+    statements that restore a known-good prior state ALREADY READ from the
+    device - NOT wireless-specific: a route, a bridge port, a firewall
+    rule, anything. This round's two callers (`set_wireless_channel`/
+    `set_wireless_tx_power`, via the private `_arm_wireless_revert` helper)
+    build theirs from the interface's own BEFORE row, already read and
+    already validated from the device - never from raw, uninspected caller
+    text. A future risky write in another domain can call this primitive
+    directly with its own revert commands. `revert_commands` is deliberately
+    NOT a generic command-execution channel: `validate_revert_command`
+    rejects a fixed denylist of dangerous verbs (`/system reboot`,
+    `/system backup load`, `/user`, `/system reset-configuration`,
+    `/system routerboard`) - this primitive restores state, it does not run
+    arbitrary RouterOS commands.
+
+    `name` is generated HERE - always "deadman-<10 lower-case hex chars>",
+    NEVER caller-supplied - and returned in the applied preview's
+    `after["name"]` (and set_wireless_channel/set_wireless_tx_power's own
+    `WritePreview.dead_man["name"]` when armed internally) as the handle
+    `cancel_dead_man` needs afterward.
+
+    The scheduler this arms fires exactly ONCE, `minutes` (1-60) after being
+    armed - computed as an explicit future `start-date`/`start-time` from
+    the TARGET DEVICE's own `/system/clock` (`_dead_man_deadline`), with
+    `interval="00:00:00"` (RouterOS's own "don't repeat" shape). See
+    `_dead_man_deadline`'s docstring for why this is a one-shot,
+    explicit-future-deadline schedule and not an `interval`-only recurring
+    one: the risk an `interval`-only schedule doesn't cover is a revert
+    command that breaks partway through (RouterOS aborts an on-event at its
+    first unparseable statement, so the trailing self-remove never runs
+    either) - `interval`-only would then keep RE-FIRING the same broken
+    on-event every `interval`, indefinitely; one-shot fires exactly once no
+    matter what happens inside it.
+
+    Like every guarded write, `confirm=False` returns a preview of the exact
+    scheduler (name/start-date/start-time/on-event) that would be armed,
+    without touching the device; only `confirm=True` actually arms it. Both
+    branches read the device's `/system/clock` first (to compute the real
+    deadline the preview reports) - this is the one read `arm_dead_man`
+    performs even on a `confirm=False` preview.
+    """
+    op = _require_allowed(settings, "arm_dead_man")
+
+    validated_minutes = validate_dead_man_minutes(minutes)
+    validated_commands = validate_revert_commands(revert_commands)
+
+    start_date, start_time = _dead_man_deadline(client, validated_minutes)
+
+    name = f"{_DEAD_MAN_NAME_PREFIX}{uuid.uuid4().hex[:10]}"
+    payload: dict[str, Any] = {
+        "name": name,
+        "start-date": start_date,
+        "start-time": start_time,
+        "interval": "00:00:00",
+        "policy": _DEAD_MAN_SCHEDULER_POLICY,
+        "on-event": _build_dead_man_script(name, validated_commands),
+    }
+
+    before: dict[str, Any] = {}
+    after = dict(payload)
+    warning = (
+        f"Dead-man armed as {name!r}: fires ONCE at {start_date} {start_time} (this device's own clock) unless "
+        "cancelled (cancel_dead_man) first, then runs the revert script and removes this scheduler entry."
+    )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    write = getattr(client, op.action)
+    write(*op.path, **payload)
+    return WritePreview(
+        operation=op.name, device=client.device.name, before=before, after=after, applied=True, warning=warning
+    )
+
+
+@_audited("cancel_dead_man")
+def cancel_dead_man(client: MikrotikClient, settings: Settings, name: str, confirm: bool) -> WritePreview:
+    """Cancel a dead-man scheduler armed by `arm_dead_man`, once the change
+    it guards has been confirmed good - removes it from
+    `/system/scheduler` before it can fire and revert.
+
+    `name` MUST match the "deadman-<hex>" shape `arm_dead_man` itself always
+    generates (`validate_dead_man_name`) - by construction, before the
+    device is ever read, this can never be pointed at an arbitrary,
+    unrelated scheduler entry (e.g. an admin's own "backup-daily" task).
+
+    Raises `ResourceNotFoundError` if no scheduler entry with that name
+    exists. That can mean a mistyped `name`, but just as plausibly that the
+    dead-man ALREADY FIRED and self-removed (see `_build_dead_man_script`)
+    because it wasn't cancelled in time, or that it was already cancelled by
+    an earlier call - the error message says so, rather than implying a
+    plain "not found" bug. Never creates anything.
+    """
+    op = _require_allowed(settings, "cancel_dead_man")
+
+    validated_name = validate_dead_man_name(name)
+
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", validated_name)
+    if row is None:
+        raise ResourceNotFoundError(
+            client.device.name,
+            "Dead-man scheduler (not found - already fired and self-removed, already cancelled, or never armed)",
+            validated_name,
+        )
+
+    before = dict(row)
+    after: dict[str, Any] = {}
+
+    if not confirm:
+        return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=False)
+
+    write = getattr(client, op.action)
+    write(*op.path, ids=(row.get(".id"),))
+    return WritePreview(operation=op.name, device=client.device.name, before=before, after=after, applied=True)
+
+
+# --- v1.11: wireless RF tuning (/interface/wireless) ------------------------
+#
+# Read the module note above the set_wireless_channel/set_wireless_tx_power/
+# set_wireless_tuning ALLOWLIST entries first: these three target
+# `/interface/wireless` specifically (confirmed against real hardware today
+# to be what's actually running - see docs/api-notes-wireless-rf.md), not
+# ROS7's newer `/interface/wifi` package.
+
+
+def _resolve_wireless_interface(client: MikrotikClient, operation_name: str, interface_name: str) -> dict[str, Any]:
+    """Shared row lookup for the three /interface/wireless write tools
+    below: `interface_name` must already exist - never created."""
+    op = ALLOWLIST[operation_name]
+    rows = client.path(*op.path)
+    row = _find_row_by_field(rows, "name", interface_name)
+    if row is None:
+        raise ResourceNotFoundError(client.device.name, "Wireless interface", interface_name)
+    return row
+
+
+def _arm_wireless_revert(
+    client: MikrotikClient,
+    settings: Settings,
+    interface_name: str,
+    revert_fields: dict[str, str],
+    minutes: int,
+) -> dict[str, Any]:
+    """Shared by set_wireless_channel/set_wireless_tx_power: arms a dead-man
+    (`arm_dead_man`) whose revert command restores `revert_fields` (already
+    read from this interface's own BEFORE row) onto `/interface/wireless`,
+    resolved by `interface_name` via RouterOS script's own `find name=...` -
+    this package's usual stable-identifier convention (never a raw `.id` -
+    see the module docstring). Returns the `{"name", "minutes"}` dict
+    `WritePreview.dead_man` carries.
+
+    `interface_name` is safe to embed directly inside the script's
+    double-quoted string here: by the time this is called it has already
+    been matched against a real device row by `_resolve_wireless_interface`,
+    and every `/interface/wireless` row's `name` field on a real device is
+    itself constrained to RouterOS's own interface-name charset - no quote
+    or control character is possible.
+
+    finding 7 (2026-07 hardening review): `" ".join(f"{field}={value}")`
+    below does NOT quote `value` - safe today because every `revert_fields`
+    value this module ever passes in (frequency, channel-width, tx-power,
+    tx-power-mode, distance) is a plain RouterOS enum/number with no space
+    or special character. If a FUTURE caller ever reuses this helper for a
+    field whose value can contain a space or RouterOS script metacharacter
+    (e.g. an SSID or a comment), this line would need
+    `f'{field}="{value}"'`-style quoting (and `value` would then need the
+    same character-safety treatment `validate_revert_command` gives a whole
+    revert command) - it does not today, so it is deliberately not added
+    speculatively.
+    """
+    assignments = " ".join(f"{field}={value}" for field, value in revert_fields.items())
+    revert_command = f'/interface/wireless set [find name="{interface_name}"] {assignments}'
+    armed = arm_dead_man(client, settings, revert_commands=[revert_command], minutes=minutes, confirm=True)
+    return {"name": armed.after["name"], "minutes": minutes}
+
+
+# DFS (Dynamic Frequency Selection) Channel Availability Check bands -
+# CONFIRMED AGAINST REAL HARDWARE TODAY (DISC Lite5 ac / LHG XL 5 ac,
+# IPQ4019, ROS 7.21.5, nv2 PtP, 2026-07-13): with frequency-mode=superchannel,
+# there is NO DFS/CAC at all - a channel switch is instant, verified live.
+# Outside superchannel (frequency-mode=regulatory-domain or
+# manual-txpower), RouterOS imposes a Channel Availability Check before
+# using a DFS-governed channel: ~60s for most of the 5250-5725MHz DFS range,
+# but ~600s (10 minutes) specifically for the 5600-5650MHz weather-radar
+# sub-band - matches RouterOS's own `skip-dfs-channels=10min-cac` naming for
+# that exact sub-band (help.mikrotik.com "Wireless Interface"). See
+# docs/api-notes-wireless-rf.md for the full write-up.
+_DFS_RANGE_MHZ = (5250, 5725)
+_DFS_WEATHER_RADAR_RANGE_MHZ = (5600, 5650)
+_DFS_CAC_SECONDS = 60
+_DFS_WEATHER_RADAR_CAC_SECONDS = 600
+
+
+def _dfs_preview_warning(frequency: int, frequency_mode: str | None) -> str | None:
+    """Build set_wireless_channel's preview `warning`: whether the target
+    `frequency` needs a DFS Channel Availability Check under the device's
+    CURRENT `frequency_mode` (read from its BEFORE row, not assumed), and if
+    so, the estimated wait - see the module note above `_DFS_RANGE_MHZ` for
+    the hardware-verified source of these numbers. Returns None only when
+    the switch is expected to be instant (superchannel, or a non-DFS
+    frequency) - set_wireless_channel ALWAYS calls this and reports the
+    result, so a caller can never be surprised by a multi-minute stall with
+    no explanation.
+    """
+    if (frequency_mode or "").strip().lower() == "superchannel":
+        return "frequency-mode=superchannel on this interface: no DFS/CAC, channel switch is instant (verified)."
+
+    if _DFS_WEATHER_RADAR_RANGE_MHZ[0] <= frequency <= _DFS_WEATHER_RADAR_RANGE_MHZ[1]:
+        return (
+            f"{frequency}MHz is in the DFS weather-radar sub-band ({_DFS_WEATHER_RADAR_RANGE_MHZ[0]}-"
+            f"{_DFS_WEATHER_RADAR_RANGE_MHZ[1]}MHz): RouterOS runs a Channel Availability Check before using it - "
+            f"expect roughly {_DFS_WEATHER_RADAR_CAC_SECONDS}s (~{_DFS_WEATHER_RADAR_CAC_SECONDS // 60}min) with "
+            "no traffic on this interface, not a failure."
+        )
+    if _DFS_RANGE_MHZ[0] <= frequency <= _DFS_RANGE_MHZ[1]:
+        return (
+            f"{frequency}MHz is in the DFS range ({_DFS_RANGE_MHZ[0]}-{_DFS_RANGE_MHZ[1]}MHz): RouterOS runs a "
+            f"Channel Availability Check before using it - expect roughly {_DFS_CAC_SECONDS}s with no traffic on "
+            "this interface, not a failure."
+        )
+    return None
+
+
+def _dfs_cac_seconds(frequency: int, frequency_mode: str | None) -> int:
+    """Same DFS/CAC classification as `_dfs_preview_warning`, but returning
+    the estimated Channel Availability Check wait in SECONDS (0 = instant/
+    no CAC at all) instead of prose.
+
+    finding 3 of the 2026-07 hardening review: `set_wireless_channel`'s
+    `deadman_minutes` (default 3min = 180s) can be SHORTER than the CAC the
+    tool's own preview warns about (up to 600s for the weather-radar
+    sub-band) - a dead-man armed for less than the CAC it itself waits
+    through would revert the channel change WHILE THE INTERFACE IS STILL
+    MID-CAC, before an operator could ever confirm the link is actually
+    back up. `set_wireless_channel` uses this to enforce a floor on
+    `deadman_minutes` before arming (see that function's body), and also to
+    warn when the dead-man's OWN revert target is itself DFS-governed (the
+    revert would then need its own CAC too).
+    """
+    if (frequency_mode or "").strip().lower() == "superchannel":
+        return 0
+    if _DFS_WEATHER_RADAR_RANGE_MHZ[0] <= frequency <= _DFS_WEATHER_RADAR_RANGE_MHZ[1]:
+        return _DFS_WEATHER_RADAR_CAC_SECONDS
+    if _DFS_RANGE_MHZ[0] <= frequency <= _DFS_RANGE_MHZ[1]:
+        return _DFS_CAC_SECONDS
+    return 0
+
+
+_WIRELESS_DEADMAN_DEFAULT_MINUTES = 3
+
+
+@_audited("set_wireless_channel")
+def set_wireless_channel(
+    client: MikrotikClient,
+    settings: Settings,
+    interface_name: str,
+    frequency: int,
+    confirm: bool,
+    channel_width: str | None = None,
+    arm_deadman: bool = True,
+    deadman_minutes: int = _WIRELESS_DEADMAN_DEFAULT_MINUTES,
+) -> WritePreview:
+    """Set a /interface/wireless interface's frequency (and optionally
+    channel-width). LOCKOUT-RISK: on a PtP link that is itself the
+    management path to the far-end device, a bad frequency can cut the only
+    route back to it.
+
+    By default (`arm_deadman=True`, the safe default), a `confirm=True`
+    apply FIRST arms a dead-man (`arm_dead_man`) whose revert command
+    restores this interface's CURRENT frequency/channel-width (read here,
+    before anything changes) - see README's "Dead-man..." section. Pass
+    `arm_deadman=False` only when this specific interface is known NOT to be
+    a management path (e.g. a lab AP) and the extra scheduler isn't wanted.
+    `deadman_minutes` (1-60, default 3 - the exact window verified live
+    today) controls how long the device waits before self-healing; ignored
+    when `arm_deadman=False`.
+
+    The returned preview's `warning` ALWAYS reports whether the target
+    `frequency` needs a DFS Channel Availability Check under this
+    interface's CURRENT `frequency-mode` (read from the device, never
+    assumed) - see `_dfs_preview_warning`. When a dead-man is armed, the
+    returned `dead_man` field carries `{"name", "minutes"}`: pass `name` to
+    `cancel_dead_man` once the new channel is confirmed good, or the device
+    reverts on its own.
+
+    When arming, refuses (`ValidationError`) if `deadman_minutes` is
+    SHORTER than the CAC the target `frequency` itself requires (e.g. the
+    default 3min against the weather-radar sub-band's ~10min CAC) - a
+    window that short could revert the change while the interface is still
+    mid-CAC, before you could ever confirm the link is back up; raise
+    `deadman_minutes` or pass `arm_deadman=False` if you accept the risk.
+    Also refuses (before writing anything) if `channel_width` was given but
+    this interface's current state has no `channel-width` to revert TO -
+    arming would otherwise produce a PARTIAL revert (frequency restored,
+    channel-width silently left on the new value).
+
+    Errors if `interface_name` doesn't exist on `/interface/wireless` -
+    never creates one. See the module note above this tool's ALLOWLIST
+    entry for why this targets `/interface/wireless` only (not ROS7's newer
+    `/interface/wifi`).
+    """
+    op = _require_allowed(settings, "set_wireless_channel")
+
+    validated_frequency = validate_wireless_frequency(frequency)
+    validated_width = validate_wireless_channel_width(channel_width) if channel_width is not None else None
+    if arm_deadman:
+        validate_dead_man_minutes(deadman_minutes)
+
+    row = _resolve_wireless_interface(client, "set_wireless_channel", interface_name)
+    before = dict(row)
+
+    fields: dict[str, Any] = {".id": row.get(".id"), "frequency": str(validated_frequency)}
+    after = dict(before)
+    after["frequency"] = str(validated_frequency)
+    if validated_width is not None:
+        fields["channel-width"] = validated_width
+        after["channel-width"] = validated_width
+
+    warning = _dfs_preview_warning(validated_frequency, before.get("frequency-mode"))
+    if warning is not None and arm_deadman:
+        # finding 3: the dead-man's own revert target (the interface's
+        # CURRENT, pre-change frequency) can itself be DFS-governed - if the
+        # dead-man fires, RouterOS will run a CAC on the way BACK too. Only
+        # surfaced when the target change already warranted a warning (a
+        # non-DFS target frequency has nothing dead-man-related to add
+        # here), and only when a dead-man will actually be armed.
+        try:
+            revert_cac_seconds = _dfs_cac_seconds(int(before["frequency"]), before.get("frequency-mode"))
+        except (KeyError, TypeError, ValueError):
+            revert_cac_seconds = 0
+        if revert_cac_seconds > 0:
+            warning += (
+                f" If the dead-man fires, its revert target ({before.get('frequency')}MHz) is itself "
+                f"DFS-governed: expect roughly another {revert_cac_seconds}s CAC before the interface is "
+                "reachable again."
+            )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    dead_man: dict[str, Any] | None = None
+    if arm_deadman:
+        # finding 3: refuse to arm a dead-man whose window is shorter than
+        # the CAC the target frequency itself requires - see
+        # _dfs_cac_seconds' docstring for why that would let the revert fire
+        # while the interface is still mid-CAC, before an operator could
+        # ever confirm the link is back up.
+        required_cac_seconds = _dfs_cac_seconds(validated_frequency, before.get("frequency-mode"))
+        if required_cac_seconds > deadman_minutes * 60:
+            required_minutes = -(-required_cac_seconds // 60)  # ceil
+            raise ValidationError(
+                f"deadman_minutes={deadman_minutes} (~{deadman_minutes * 60}s) is shorter than the "
+                f"~{required_cac_seconds}s DFS Channel Availability Check {validated_frequency}MHz needs under "
+                "this interface's current frequency-mode: the dead-man could revert the channel change while "
+                f"it is still mid-CAC, before you can confirm the link is actually back up. Pass "
+                f"deadman_minutes>={required_minutes}, or arm_deadman=False if you accept this risk."
+            )
+
+        if "frequency" not in before:
+            # Defensive/unreachable on a real device (a registered
+            # /interface/wireless row always carries `frequency`) - never
+            # arm a dead-man with nothing to revert.
+            raise DeviceCommandError(
+                client.device.name,
+                "/".join(op.path),
+                "cannot arm a dead-man revert: this interface's current state has no 'frequency' field to restore.",
+            )
+        revert_fields: dict[str, str] = {"frequency": str(before["frequency"])}
+        if validated_width is not None:
+            if "channel-width" not in before:
+                # finding 5: channel_width was requested but there is
+                # nothing to revert it TO - arming here would revert
+                # frequency but silently leave channel-width on the NEW
+                # value forever if the dead-man ever fires. Refuse the
+                # whole arm rather than produce a partial, misleading
+                # revert.
+                raise DeviceCommandError(
+                    client.device.name,
+                    "/".join(op.path),
+                    "cannot arm a dead-man revert: channel_width was requested but this interface's current "
+                    "state has no 'channel-width' field to restore (a partial revert would leave channel-width "
+                    "on the new value forever if the dead-man fires).",
+                )
+            revert_fields["channel-width"] = str(before["channel-width"])
+        dead_man = _arm_wireless_revert(client, settings, interface_name, revert_fields, deadman_minutes)
+
+    write = getattr(client, op.action)
+    write(*op.path, **fields)
+    return WritePreview(
+        operation=op.name,
+        device=client.device.name,
+        before=before,
+        after=after,
+        applied=True,
+        warning=warning,
+        dead_man=dead_man,
+    )
+
+
+_WIRELESS_TX_POWER_MODE = "all-rates-fixed"
+
+
+@_audited("set_wireless_tx_power")
+def set_wireless_tx_power(
+    client: MikrotikClient,
+    settings: Settings,
+    interface_name: str,
+    tx_power: int,
+    confirm: bool,
+    arm_deadman: bool = True,
+    deadman_minutes: int = _WIRELESS_DEADMAN_DEFAULT_MINUTES,
+) -> WritePreview:
+    """Set a /interface/wireless interface's tx-power (dBm), forcing
+    tx-power-mode=all-rates-fixed.
+
+    CONFIRMED AGAINST REAL HARDWARE TODAY (DISC Lite5 ac / LHG XL 5 ac,
+    IPQ4019, ROS 7.21.5): on a short link, the default (maximum) tx-power
+    SATURATED the receiver (-27dBm measured) and PRODUCED A WORSE CCQ than a
+    lower power - reducing to ~8dBm brought the measured signal to -47dBm
+    and CCQ from 34 to 94. There is no single "right" power for every link -
+    it depends on distance/antenna gain/regulatory limits - this tool
+    applies whatever `tx_power` the caller supplies; use
+    `get_wireless_link_quality` before/after to judge the effect on a given
+    link.
+
+    LOCKOUT-RISK for the same reason as `set_wireless_channel` (a bad power
+    on a management-path PtP link can drop the link entirely) - same
+    `arm_deadman`/`deadman_minutes` dead-man behavior, defaulting to armed.
+    The dead-man's revert restores BOTH `tx-power-mode` and `tx-power` to
+    their prior values - forcing `tx-power-mode=all-rates-fixed` changes the
+    mode too, not just the power level, so both must be restored together.
+    Refuses to arm (`DeviceCommandError`) rather than fabricate a fallback
+    if the interface's current state is missing either field - never
+    reverts to a guessed "0dBm"/"default".
+
+    The returned preview's `warning` always notes the transient effect this
+    change causes: CCQ/rate briefly re-adapt over the next few seconds after
+    a power change - a temporary CCQ/rate dip right after applying is
+    EXPECTED, not a sign the change failed.
+
+    Errors if `interface_name` doesn't exist on `/interface/wireless` -
+    never creates one.
+    """
+    op = _require_allowed(settings, "set_wireless_tx_power")
+
+    validated_power = validate_wireless_tx_power(tx_power)
+    if arm_deadman:
+        validate_dead_man_minutes(deadman_minutes)
+
+    row = _resolve_wireless_interface(client, "set_wireless_tx_power", interface_name)
+    before = dict(row)
+
+    fields: dict[str, Any] = {
+        ".id": row.get(".id"),
+        "tx-power-mode": _WIRELESS_TX_POWER_MODE,
+        "tx-power": str(validated_power),
+    }
+    after = dict(before)
+    after["tx-power-mode"] = _WIRELESS_TX_POWER_MODE
+    after["tx-power"] = str(validated_power)
+
+    warning = (
+        "tx-power changes trigger rate re-adaptation: expect a few seconds of transiently low CCQ/rate right "
+        "after this applies - not a failure. Re-check with get_wireless_link_quality after ~10-30s."
+    )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    dead_man: dict[str, Any] | None = None
+    if arm_deadman:
+        # finding 4: never fabricate a revert target for a field the
+        # BEFORE row doesn't actually carry - matches set_wireless_channel's
+        # fail-safe (raise, don't default to 0dBm/"default"). A fabricated
+        # "0"/"default" fallback here could revert to a power/mode the
+        # interface never actually had.
+        missing = [field for field in ("tx-power-mode", "tx-power") if field not in before]
+        if missing:
+            raise DeviceCommandError(
+                client.device.name,
+                "/".join(op.path),
+                f"cannot arm a dead-man revert: this interface's current state has no {missing!r} field(s) to restore.",
+            )
+        revert_fields = {
+            "tx-power-mode": str(before["tx-power-mode"]),
+            "tx-power": str(before["tx-power"]),
+        }
+        dead_man = _arm_wireless_revert(client, settings, interface_name, revert_fields, deadman_minutes)
+
+    write = getattr(client, op.action)
+    write(*op.path, **fields)
+    return WritePreview(
+        operation=op.name,
+        device=client.device.name,
+        before=before,
+        after=after,
+        applied=True,
+        warning=warning,
+        dead_man=dead_man,
+    )
+
+
+@_audited("set_wireless_tuning")
+def set_wireless_tuning(
+    client: MikrotikClient,
+    settings: Settings,
+    interface_name: str,
+    confirm: bool,
+    adaptive_noise_immunity: str | None = None,
+    distance: int | str | None = None,
+    arm_deadman: bool = True,
+    deadman_minutes: int = _WIRELESS_DEADMAN_DEFAULT_MINUTES,
+) -> WritePreview:
+    """Set a /interface/wireless interface's `adaptive-noise-immunity`
+    and/or `distance`.
+
+    At least one of `adaptive_noise_immunity`/`distance` must be given.
+
+    `adaptive_noise_immunity`: "none"/"client-mode"/"ap-and-client-mode".
+    CONFIRMED SAFE against real hardware today (does not drop an
+    already-associated link) - CONFIRMED TODAY: with good signal but poor
+    CCQ (interference, not distance), "ap-and-client-mode" measurably
+    helped. Given alone (no `distance`), this NEVER arms a dead-man.
+
+    `distance`: "dynamic" (RouterOS auto-detects the ACK timeout),
+    "indoors", or an integer number of km. CONFIRMED TODAY: for a long
+    verified PtP link, an explicit distance (e.g. 9 for a ~9km link) gave a
+    better ACK timeout than leaving it on "dynamic". finding 1 of the
+    2026-07 hardening review: unlike "dynamic"/"indoors" (RouterOS's own
+    named, self-managed ACK-timeout modes), a NUMERIC `distance` directly
+    sets the nv2 ACK-timeout/TDMA slot timing - CONFIRMED LIVE this can
+    silently drop an already-associated link if the value undershoots the
+    real link length (e.g. `distance=1` on a 9km link), with no protocol-
+    level recovery of its own. A numeric `distance` is therefore
+    LOCKOUT-RISK exactly like `set_wireless_channel`/`set_wireless_tx_power`
+    and arms a dead-man by default (`arm_deadman=True`, `deadman_minutes`
+    1-60, default 3) whose revert restores this interface's CURRENT
+    `distance` (read here, before anything changes). Pass
+    `arm_deadman=False` only when this interface is known NOT to be a
+    management path. The preview's `warning` reports "LOCKOUT-RISK" whenever
+    `distance` is numeric.
+
+    Errors if `interface_name` doesn't exist on `/interface/wireless` -
+    never creates one.
+    """
+    op = _require_allowed(settings, "set_wireless_tuning")
+
+    if adaptive_noise_immunity is None and distance is None:
+        raise ValidationError("At least one of adaptive_noise_immunity/distance must be given.")
+
+    validated_ani = (
+        validate_adaptive_noise_immunity(adaptive_noise_immunity) if adaptive_noise_immunity is not None else None
+    )
+    validated_distance = validate_wireless_distance(distance) if distance is not None else None
+
+    # A numeric distance (km) is the LOCKOUT-RISK case - see the docstring
+    # above. "dynamic"/"indoors" are RouterOS's own named/self-managed
+    # modes, not an arbitrary caller-chosen timing value, and were not the
+    # case verified live - they never arm a dead-man here.
+    is_lockout_risk = isinstance(distance, int) and not isinstance(distance, bool)
+    if is_lockout_risk and arm_deadman:
+        validate_dead_man_minutes(deadman_minutes)
+
+    row = _resolve_wireless_interface(client, "set_wireless_tuning", interface_name)
+    before = dict(row)
+
+    fields: dict[str, Any] = {".id": row.get(".id")}
+    after = dict(before)
+    if validated_ani is not None:
+        fields["adaptive-noise-immunity"] = validated_ani
+        after["adaptive-noise-immunity"] = validated_ani
+    if validated_distance is not None:
+        fields["distance"] = validated_distance
+        after["distance"] = validated_distance
+
+    warning = (
+        "distance is a numeric km value: this directly changes the ACK-timeout/TDMA timing and can drop an "
+        "already-associated link on a mismatch (e.g. too short for the real link length) - LOCKOUT-RISK."
+        if is_lockout_risk
+        else None
+    )
+
+    if not confirm:
+        return WritePreview(
+            operation=op.name, device=client.device.name, before=before, after=after, applied=False, warning=warning
+        )
+
+    dead_man: dict[str, Any] | None = None
+    if is_lockout_risk and arm_deadman:
+        if "distance" not in before:
+            # Defensive/unreachable on a real device (a registered
+            # /interface/wireless row always carries `distance`) - never
+            # arm a dead-man with nothing to revert.
+            raise DeviceCommandError(
+                client.device.name,
+                "/".join(op.path),
+                "cannot arm a dead-man revert: this interface's current state has no 'distance' field to restore.",
+            )
+        revert_fields = {"distance": str(before["distance"])}
+        dead_man = _arm_wireless_revert(client, settings, interface_name, revert_fields, deadman_minutes)
+
+    write = getattr(client, op.action)
+    write(*op.path, **fields)
+    return WritePreview(
+        operation=op.name,
+        device=client.device.name,
+        before=before,
+        after=after,
+        applied=True,
+        warning=warning,
+        dead_man=dead_man,
     )

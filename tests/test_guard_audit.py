@@ -1331,3 +1331,153 @@ def test_remove_ppp_secret_blocked_when_write_disabled_journals_outcome_error(
     assert len(events) == 1
     assert events[0]["outcome"] == "error"
     assert events[0]["operation"] == "remove_ppp_secret"
+
+
+# --- v1.11: dead-man arm/cancel are individually audited --------------------
+#
+# "The disparo (firing) itself" is not something audit.py can observe - it
+# happens autonomously on-device, independent of any MCP tool call - so the
+# audit trail for a FIRED dead-man is the `:log warning` statement its own
+# on-event script always runs first (see guard._build_dead_man_script),
+# surfaced later via this package's own `logs`/`security_events` read tools.
+# What audit.py DOES journal, and what these tests cover, is the arm and the
+# cancel - each its own ALLOWLIST operation, each producing exactly one
+# journal entry per call, same as every other guarded write.
+
+
+def test_arm_dead_man_preview_journals_outcome_preview(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=False,
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "preview"
+    assert events[0]["tool"] == "arm_dead_man"
+    assert events[0]["operation"] == "arm_dead_man"
+    assert events[0]["action"] == "add"
+    assert events[0]["summary"]["after"]["name"].startswith("deadman-")
+
+
+def test_arm_dead_man_confirmed_call_journals_outcome_applied(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    guard.arm_dead_man(
+        client,
+        settings_write_enabled,
+        revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+        minutes=3,
+        confirm=True,
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "applied"
+    assert events[0]["summary"]["warning"] is not None
+
+
+def test_arm_dead_man_blocked_when_write_disabled_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings: Settings
+):
+    with pytest.raises(WriteDisabledError):
+        guard.arm_dead_man(
+            client,
+            settings,
+            revert_commands=['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            minutes=3,
+            confirm=True,
+        )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "arm_dead_man"
+
+
+def test_cancel_dead_man_confirmed_call_journals_outcome_applied(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("system", "scheduler"): [
+                {".id": "*9", "name": "deadman-abc1230000", "on-event": "", "interval": "00:03:00"}
+            ]
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    guard.cancel_dead_man(client, settings_write_enabled, name="deadman-abc1230000", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "applied"
+    assert events[0]["tool"] == "cancel_dead_man"
+    assert events[0]["operation"] == "cancel_dead_man"
+    assert events[0]["action"] == "remove"
+
+
+def test_cancel_dead_man_not_found_journals_outcome_error(
+    audit_log: Path, client: MikrotikClient, settings_write_enabled: Settings
+):
+    with pytest.raises(ResourceNotFoundError):
+        guard.cancel_dead_man(client, settings_write_enabled, name="deadman-dead0000ff", confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "error"
+    assert events[0]["operation"] == "cancel_dead_man"
+
+
+def test_set_wireless_channel_applied_journals_both_the_write_and_the_dead_man_arm(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    """A LOCKOUT-RISK wireless write that arms a dead-man produces TWO
+    journal entries for one confirmed call: one for set_wireless_channel
+    itself, one for the nested arm_dead_man call - each independently
+    auditable, exactly as if arm_dead_man had been called on its own."""
+    fake = FakeConnection(
+        data={
+            ("interface", "wireless"): [
+                {".id": "*1", "name": "wlan1", "frequency": "5500", "frequency-mode": "regulatory-domain"}
+            ],
+            ("system", "scheduler"): [],
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    guard.set_wireless_channel(client, settings_write_enabled, interface_name="wlan1", frequency=5300, confirm=True)
+
+    events = _events(audit_log)
+    assert len(events) == 2
+    operations = {event["operation"] for event in events}
+    assert operations == {"set_wireless_channel", "arm_dead_man"}
+    for event in events:
+        assert event["outcome"] == "applied"
+
+
+def test_set_wireless_channel_arm_deadman_false_journals_only_the_write(
+    audit_log: Path, settings_write_enabled: Settings, device: Device
+):
+    fake = FakeConnection(
+        data={
+            ("interface", "wireless"): [
+                {".id": "*1", "name": "wlan1", "frequency": "5500", "frequency-mode": "regulatory-domain"}
+            ],
+            ("system", "scheduler"): [],
+        }
+    )
+    client = MikrotikClient(device, connection=fake)
+
+    guard.set_wireless_channel(
+        client, settings_write_enabled, interface_name="wlan1", frequency=5300, arm_deadman=False, confirm=True
+    )
+
+    events = _events(audit_log)
+    assert len(events) == 1
+    assert events[0]["operation"] == "set_wireless_channel"

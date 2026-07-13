@@ -34,28 +34,36 @@ each of those is avoided here.
 
 ## Status
 
-**1.10.0.** Every planned tool round through Tier 2 has shipped, plus
-Tier 3's IPv6 parity item in full - reads (v1.9) and writes (v1.10) alike:
-the full read-tool inventory (interfaces, VLANs, routing IPv4 **and IPv6**,
-DHCP servers/leases/networks, wireless, VPN/WireGuard/PPP, containers,
-LTE/5G, USB, hotspot, live traffic, backups, firewall filter/NAT/mangle IPv4
-**and IPv6**, bridge ports & VLAN filtering, SFP/optical monitor,
-certificates, users/RADIUS, NTP/clock, a heuristic security audit), guarded
-writes across identity/interfaces/wifi/bandwidth/DHCP/address-lists (IPv4
-**and IPv6**)/PoE/containers/failover-routing (IPv4 **and IPv6**)/Netwatch/
-DNS/Wake-on-LAN/firewall-rule-toggle (filter/NAT/mangle, IPv4 **and
-IPv6**)/firewall-rule-reorder/WireGuard/hotspot-vouchers/backup/VLANs/
-PPP-PPPoE-secrets/NTP-servers, and the production-hardening layers this
-needs to run unattended against a real fleet - audit journal, correlation
-IDs, read retry, circuit breaker. See `CHANGELOG.md` for the full
-version-by-version history, and `ROADMAP.md` for what's next (and what's
-deliberately out of scope, and why).
+**1.11.0.** Every planned tool round through Tier 2 has shipped, plus
+Tier 3's IPv6 parity item in full (reads in v1.9, writes in v1.10), plus
+this round's headline feature: the **dead-man / lockout-proof write**
+primitive (`arm_dead_man`/`cancel_dead_man`) and the wireless RF tuning
+tools it unlocks (`set_wireless_channel`/`set_wireless_tx_power`/
+`set_wireless_tuning`/`get_wireless_link_quality`) - see "Dead-man /
+lockout-proof writes" and "Wireless RF tuning" below. The full read-tool
+inventory (interfaces, VLANs, routing IPv4 **and IPv6**, DHCP servers/
+leases/networks, wireless (raw + normalized link-quality), VPN/WireGuard/
+PPP, containers, LTE/5G, USB, hotspot, live traffic, backups, firewall
+filter/NAT/mangle IPv4 **and IPv6**, bridge ports & VLAN filtering,
+SFP/optical monitor, certificates, users/RADIUS, NTP/clock, a heuristic
+security audit), guarded writes across identity/interfaces/wifi/wireless-RF-
+tuning/dead-man/bandwidth/DHCP/address-lists (IPv4 **and IPv6**)/PoE/
+containers/failover-routing (IPv4 **and IPv6**)/Netwatch/DNS/Wake-on-LAN/
+firewall-rule-toggle (filter/NAT/mangle, IPv4 **and IPv6**)/firewall-rule-
+reorder/WireGuard/hotspot-vouchers/backup/VLANs/PPP-PPPoE-secrets/
+NTP-servers, and the production-hardening layers this needs to run
+unattended against a real fleet - audit journal, correlation IDs, read
+retry, circuit breaker. See `CHANGELOG.md` for the full version-by-version
+history, and `ROADMAP.md` for what's next (and what's deliberately out of
+scope, and why).
 
-The full pytest suite currently has 1597 tests (108 tools), all passing against
-an in-memory fake device layer (`pytest -q`), at 100% line coverage (CI enforces
-a 95% floor) - see "Development & CI" below. Many tools are additionally
-smoke-tested against real ROS6/ROS7 hardware before release (the v1.10 IPv6
-writes are the exception - see `CHANGELOG.md`'s v1.10 entry).
+The full pytest suite currently has 1794 tests (114 tools), all passing
+against an in-memory fake device layer (`pytest -q`), at 100% line coverage
+(CI enforces a 95% floor) - see "Development & CI" below. Many tools are
+additionally smoke-tested against real ROS6/ROS7 hardware before release
+(the v1.10 IPv6 writes are an exception - see `CHANGELOG.md`'s v1.10 entry;
+v1.11's wireless RF tools were hardware-verified, see `CHANGELOG.md`'s
+v1.11 entry and `docs/api-notes-wireless-rf.md`).
 
 ## Installation
 
@@ -254,6 +262,7 @@ representative exchanges:
 | `ipv6_firewall_filter` | List IPv6 firewall filter rules (`/ipv6/firewall/filter`): chain, action, etc. Mirrors `firewall_filter` for IPv6. Read-only - does not add/modify/remove rules. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
 | `ipv6_neighbors` | List the IPv6 neighbor discovery table (`/ipv6/neighbor`): address, mac-address, interface, status, dynamic. Mirrors `arp_table` for IPv6. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
 | `ipv6_firewall_address_lists` | List IPv6 firewall address-list entries (`/ipv6/firewall/address-list`): list, address, dynamic, disabled. Mirrors `address_lists` for IPv6. Empty list (not an error) if the `ipv6` package is disabled. See "IPv6 read parity (v1.9)" below. |
+| `get_wireless_link_quality` | PtP/PtMP link-quality diagnosis: the same registration-table `wireless_registrations` reads, normalized per peer into `signal_strength`/`signal_to_noise`/`tx_ccq`/`rx_ccq`/`tx_rate`/`rx_rate`/`distance`/`uptime`. Optional `interface` filter. A field the current generation's registration-table doesn't publish (e.g. ROS7's newer `/interface/wifi`) comes back `None`, never fabricated. See "Wireless RF tuning + dead-man" below. |
 
 ### Write (guarded)
 
@@ -311,6 +320,11 @@ model" below for the full guard mechanism.
 | `remove_ipv6_route` | Remove a static IPv6 route, resolved by `dst_address` (narrowed by optional `gateway`). **Refuses outright (raises an error, removes nothing) if the resolved route is dynamic** (`dynamic=true`). `warning` is non-null (not blocking) when removing a static default route (`::/0`). Mirrors `remove_route` on `/ipv6/route`. |
 | `add_to_ipv6_address_list` | Add an IPv6 `address`/subnet to a named IPv6 firewall `list_name` (`/ipv6/firewall/address-list`). **Only manages the list.** Refuses to create a duplicate `list_name`+`address` pair. `address` must be IPv6. Mirrors `add_to_address_list`. |
 | `remove_from_ipv6_address_list` | Remove the `list_name`+`address` entry from an IPv6 firewall address-list. Same "list only" caveat as `add_to_ipv6_address_list`. |
+| `set_wireless_channel` | Set a `/interface/wireless` interface's `frequency` (+ optional `channel_width`). **LOCKOUT-RISK** on a management-path PtP link - arms a dead-man revert by default (`arm_deadman=True`). Preview's `warning` always reports whether the target frequency needs a DFS Channel Availability Check. See "Wireless RF tuning + dead-man" below. |
+| `set_wireless_tx_power` | Set a `/interface/wireless` interface's `tx_power` (dBm), forcing `tx-power-mode=all-rates-fixed`. **LOCKOUT-RISK** - same dead-man default as `set_wireless_channel`. Default (max) power can saturate a short link's receiver and *worsen* CCQ - see "Wireless RF tuning + dead-man" below. |
+| `set_wireless_tuning` | Set a `/interface/wireless` interface's `adaptive_noise_immunity` and/or `distance`. `adaptive_noise_immunity` alone is reception-only tuning, never arms a dead-man. A **numeric** `distance` is **LOCKOUT-RISK** (directly sets ACK-timeout/TDMA timing) - arms a dead-man revert by default, same as `set_wireless_channel`/`set_wireless_tx_power`. |
+| `arm_dead_man` | Arm a local, self-removing RouterOS scheduler that reverts `revert_commands` after `minutes` unless cancelled first. **NOT wireless-specific** - the reusable anti-lockout primitive behind every LOCKOUT-RISK write. See "Dead-man / lockout-proof writes" below. |
+| `cancel_dead_man` | Cancel a dead-man scheduler armed by `arm_dead_man`, once the change it guards is confirmed good. Can only ever target a scheduler this package itself armed (name shape `deadman-<hex>`). |
 
 Not yet exposed, deliberately: device reboot, backup RESTORE (`/system/backup/load`
 - same risk class as reboot), and creating/generally modifying a firewall
@@ -625,6 +639,151 @@ default-route `warning` their IPv4 counterparts carry, checked against
 **Hardware caveat**: not verified against real hardware - exercised only
 against this project's fake RouterOS connection (`tests/fakes.py`), unlike
 v1.9's reads (verified on both real ROS6 and ROS7). See `CHANGELOG.md`.
+
+### Dead-man / lockout-proof writes (v1.11)
+
+**No other MikroTik MCP server has this.** It is this project's answer to a
+problem every one of them shares: a write to a device reached over its own
+radio link can cut the path back to that device, permanently, with no
+remote recovery. `ROADMAP.md`'s "Explicitly NOT on the roadmap" table
+already names RouterOS's *own* best anti-lockout mechanism - Safe Mode - as
+something this API-only, SSH-free project cannot use (it's a CLI-only,
+interactive feature). The dead-man is the in-architecture answer: build the
+equivalent of Safe Mode's "abandon changes if I disappear" guarantee purely
+over the RouterOS API, using RouterOS's own scheduler as the timer.
+
+**The pattern**, verified live against the single highest-risk case in this
+project's own fleet - an 8.8km PtP radio link that is the *only*
+management path to the far-end device:
+
+1. **Before** a risky write, arm a scheduler **local to the target device**
+   that reverts the change and removes itself once it fires - a ONE-SHOT
+   schedule at an explicit future clock time, not a recurring `interval`:
+   ```
+   /system scheduler add name=<name> start-date=<date> start-time=<time> \
+     interval=00:00:00 policy=read,write,test,policy,reboot \
+     on-event=":log warning DEADMAN; <revert-commands>; \
+                /system scheduler remove [find name=\"<name>\"]"
+   ```
+   `<date>`/`<time>` are computed as `arm-time + N minutes`, read from the
+   TARGET DEVICE's own `/system/clock` - see "Design note" below for why
+   this replaced an earlier `interval`-only design.
+2. Apply the risky write.
+3. **If the write breaks reachability**, the device heals itself once the
+   deadline is reached - the on-event script runs entirely on-device,
+   independent of whether the API session (or anything else) can still
+   reach it afterward. Zero further action needed from the operator.
+4. **If the write is good**, cancel the scheduler before it fires
+   (`cancel_dead_man`) - the change stays.
+
+Two reusable primitives in `guard.py`, each going through the exact same
+allowlist + read-only gate + confirm/preview + audit machinery as every
+other guarded write here:
+
+- **`arm_dead_man(device_name, revert_commands, minutes=3, confirm=false)`**
+  - `revert_commands` is any non-empty list (max 10) of RouterOS script
+    statements that restore a known-good prior state. `name` is *always*
+    generated here (`"deadman-<hex>"`, never caller-supplied) and returned
+    as the handle `cancel_dead_man` needs. `minutes` is capped 1-60.
+    `revert_commands` is a **structurally-restricted channel, not a
+    generic command-execution one**: every item must match
+    `` /<path> set [find <field>="<value>"] <field>=<value> ... `` - the
+    exact "restore one row's fields" shape every internal caller already
+    produces. `set` is the only verb ever accepted (never `remove`/`add`/
+    `reboot`/anything else); `[find <field>="<value>"]` (a single selector
+    with a *balanced* quote/bracket) is mandatory, never a bare `.id`. This
+    is a positive allowlist, not a denylist (an earlier denylist-of-verbs
+    version let `/ip/route remove [find ...]`-style commands and an
+    unbalanced-quote parse-abort vector through - see
+    `docs/api-notes-wireless-rf.md` for the full account) - plus a fixed
+    set of script-structure-breaking characters (`$ ; \` \ { }` - not `"`/
+    `[`/`]`, which the `[find name="X"]` idiom itself needs) and a
+    redundant verb denylist as extra defense-in-depth layers underneath.
+- **`cancel_dead_man(device_name, name, confirm=false)`** - removes the
+  scheduler before it fires. `name` **must** match the `"deadman-<hex>"`
+  shape `arm_dead_man` itself generates - by construction, before the
+  device is ever read, this can never be pointed at an unrelated scheduler
+  entry (e.g. an admin's own `"backup-daily"` task).
+
+**Not wireless-specific.** `set_wireless_channel`/`set_wireless_tx_power`
+(below) are this round's two callers - each arms a dead-man automatically
+by default (`arm_deadman=true`) whose revert restores the interface's prior
+frequency/channel-width or tx-power/tx-power-mode, read *before* anything
+changes - but the primitive itself is generic: a future risky write in
+another domain (a route, a bridge port, a firewall rule) can call
+`arm_dead_man` directly with its own revert commands.
+
+**Auditing.** `arm_dead_man`/`cancel_dead_man` are each independently
+audited exactly like any other guarded write (see "Production hardening"
+below) - a confirmed `set_wireless_channel` call that arms a dead-man
+produces **two** journal entries (one for the channel change, one for the
+arm), not one. The dead-man **firing** on-device is not something this
+package's own JSON audit journal can observe (it happens autonomously,
+outside any MCP tool call) - that is exactly what the on-event script's own
+`:log warning` statement is for: it lands in RouterOS's own `/log`,
+readable afterward via this package's `logs`/`security_events` tools.
+
+**Design note - one-shot (`interval=00:00:00`) with an explicit future
+`start-date`/`start-time`, not an `interval`-only recurring schedule.**
+Verified live (and re-verified after an initial mistake - see
+`docs/api-notes-wireless-rf.md` for the full account): an `interval`-only
+schedule does **not** fire immediately on arm, it fires once per interval
+starting at arm-time+interval, as expected. The real reason one-shot still
+matters: RouterOS aborts an on-event script entirely at its first
+unparseable statement, so a broken revert command means the trailing
+`/system scheduler remove` never runs either. An `interval`-only schedule
+in that situation stays armed and **keeps re-firing the same broken
+on-event every interval, indefinitely**, until removed by hand; a one-shot
+schedule fires exactly once no matter what happens inside it. The deadline
+itself is computed with real `datetime`+`timedelta` arithmetic against the
+TARGET DEVICE's own clock, so it is midnight/month/year-rollover safe.
+See `docs/api-notes-wireless-rf.md` for the full write-up and the
+real-hardware readings behind every number in this section.
+
+### Wireless RF tuning (v1.11)
+
+Three guarded writes on `/interface/wireless` (RouterOS's legacy wireless
+menu - see "Which menu, and why" in `docs/api-notes-wireless-rf.md` for why
+this round targets it and not ROS7's newer `/interface/wifi`), plus one
+read (`get_wireless_link_quality`, in the read-only table above) - built to
+diagnose and tune a PtP/PtMP link, not just an access point's SSID
+(`set_wifi_ssid`, unchanged, still the only `/interface/wifi` write tool):
+
+- **`set_wireless_channel(interface_name, frequency, channel_width=None, ...)`**
+  - **LOCKOUT-RISK**: arms a dead-man by default (see above). The preview's
+    `warning` always reports whether the target frequency needs a DFS
+    Channel Availability Check under the interface's *current*
+    `frequency-mode`, read from the device: instant with
+    `frequency-mode=superchannel` (verified - no DFS/CAC at all), ~60s for
+    most of the DFS range (5250-5725MHz), ~600s for the 5600-5650MHz
+    weather-radar sub-band specifically.
+- **`set_wireless_tx_power(interface_name, tx_power, ...)`** - forces
+  `tx-power-mode=all-rates-fixed`. **LOCKOUT-RISK**, same dead-man default.
+  **Verified today**: on a short link, the *default* (maximum) tx-power
+  saturated the receiver (-27dBm measured) and produced a *worse* CCQ (34)
+  than a lower power (~8dBm gave -47dBm and CCQ 94). There is no single
+  "right" power - use `get_wireless_link_quality` before/after to judge the
+  effect on a given link. A brief CCQ/rate dip right after applying is
+  expected (rate re-adaptation), not a failure.
+- **`set_wireless_tuning(interface_name, adaptive_noise_immunity=None, distance=None, arm_deadman=True, deadman_minutes=3, ...)`**
+  - `adaptive_noise_immunity` alone is reception-only tuning, confirmed safe
+    (does not drop an already-associated link) - **never** arms a dead-man.
+    Verified today: `"ap-and-client-mode"` measurably helps when signal is
+    good but CCQ is poor (interference, not distance).
+  - A **numeric** `distance` (unlike the named `"dynamic"`/`"indoors"`
+    modes) directly sets the ACK-timeout/TDMA timing - **LOCKOUT-RISK**,
+    confirmed this can silently drop an already-associated link on a
+    mismatch. Arms a dead-man by default, same mechanism as
+    `set_wireless_channel`/`set_wireless_tx_power`. Verified today: an
+    explicit `distance` (e.g. `9` for a ~9km link) beats `"dynamic"` for ACK
+    timeout on a long PtP link.
+
+All three: errors if `interface_name` doesn't exist on `/interface/wireless`
+- never creates one. `get_wireless_link_quality` normalizes the same
+registration-table `wireless_registrations` already reads into
+`signal_strength`/`signal_to_noise`/`tx_ccq`/`rx_ccq`/`tx_rate`/`rx_rate`/
+`distance`/`uptime` per peer - the numbers that actually diagnose a PtP
+link, rather than a raw, generation-dependent row shape.
 
 ### VPN & routing diagnostics (v0.8)
 
@@ -1446,6 +1605,18 @@ Three independent controls apply to every write tool, all centralized in
    `confirm: bool` parameter. With `confirm=False` (the default), the tool
    computes and returns what would change - a `before`/`after` structure -
    without applying anything. Only `confirm=True` applies the change.
+
+Since v1.11, a fourth control applies specifically to **LOCKOUT-RISK**
+writes (today: `set_wireless_channel`/`set_wireless_tx_power`, and
+`set_wireless_tuning` when given a numeric `distance` - a bad frequency/
+power/ACK-timeout on a management-path radio link can cut the only route
+back to the device): **the dead-man**. A `confirm=True` apply arms a local,
+self-removing RouterOS scheduler *before* the write, which reverts it
+automatically once its deadline is reached unless explicitly cancelled
+(`cancel_dead_man`) - see "Dead-man / lockout-proof writes" below for the
+full mechanism. This is this project's in-architecture answer to giving up
+RouterOS's own Safe Mode (see "Explicitly NOT on the roadmap" in
+`ROADMAP.md`) in exchange for staying API-only.
 
 ### ROS7 wifi: `configuration`-based SSID
 

@@ -7,6 +7,7 @@ from mcp_mikrotik.formatting import (
     coerce_ros_number,
     days_until,
     filter_disabled,
+    normalize_wireless_registration,
     parse_ros_datetime,
     ros_bool,
     rows_to_list,
@@ -292,3 +293,65 @@ def test_days_until_negative_for_past_date():
 
 def test_days_until_none_when_unparseable():
     assert days_until("not-a-date") is None
+
+
+# --- normalize_wireless_registration (v1.11) ----------------------------------
+
+
+def test_normalize_wireless_registration_maps_full_wireless_row():
+    row = {
+        "interface": "wlan1",
+        "mac-address": "AA:BB:CC:DD:EE:90",
+        "signal-strength": "-47",
+        "signal-to-noise": "45",
+        "tx-ccq": "94",
+        "rx-ccq": "90",
+        "tx-rate": "300Mbps",
+        "rx-rate": "300Mbps",
+        "distance": "8800",
+        "uptime": "2d3h",
+    }
+    assert normalize_wireless_registration(row) == {
+        "interface": "wlan1",
+        "mac_address": "AA:BB:CC:DD:EE:90",
+        "signal_strength": -47,
+        "signal_to_noise": 45,
+        "tx_ccq": 94,
+        "rx_ccq": 90,
+        "tx_rate": "300Mbps",
+        "rx_rate": "300Mbps",
+        "distance": "8800",
+        "uptime": "2d3h",
+    }
+
+
+def test_normalize_wireless_registration_falls_back_to_wifi_signal_field():
+    """ROS7's newer /interface/wifi/registration-table names the signal
+    field `signal`, not `signal-strength`."""
+    row = {"interface": "wifi1", "mac-address": "AA:BB:CC:DD:EE:01", "signal": "-55", "uptime": "1h"}
+    normalized = normalize_wireless_registration(row)
+    assert normalized["signal_strength"] == -55
+    assert normalized["signal_to_noise"] is None
+    assert normalized["tx_ccq"] is None
+    assert normalized["rx_ccq"] is None
+    assert normalized["distance"] is None
+
+
+def test_normalize_wireless_registration_prefers_signal_strength_over_signal():
+    row = {"signal-strength": "-40", "signal": "-99"}
+    assert normalize_wireless_registration(row)["signal_strength"] == -40
+
+
+def test_normalize_wireless_registration_missing_fields_are_none():
+    assert normalize_wireless_registration({}) == {
+        "interface": None,
+        "mac_address": None,
+        "signal_strength": None,
+        "signal_to_noise": None,
+        "tx_ccq": None,
+        "rx_ccq": None,
+        "tx_rate": None,
+        "rx_rate": None,
+        "distance": None,
+        "uptime": None,
+    }

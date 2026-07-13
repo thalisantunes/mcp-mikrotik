@@ -9,10 +9,14 @@ objects look like - see client.py's module docstring.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 from librouteros.exceptions import LibRouterosError, TrapError
+
+from mcp_mikrotik.formatting import format_ros_date_time, parse_ros_datetime
 
 # v0.13: real RouterOS generates a WireGuard interface's private/public key
 # pair itself on `/interface/wireguard add` - a caller never supplies (or
@@ -132,6 +136,33 @@ class FakePath:
         self._rows.insert(dest_idx, row)
 
 
+# v1.11: the exact family of statement shapes guard._build_dead_man_script
+# ever emits into a `/system/scheduler` row's `on-event` - see
+# FakeConnection.fire_scheduler below. Not a general RouterOS script parser;
+# scoped only to what this package's own dead-man ever produces.
+_DEAD_MAN_LOG_WARNING_RE = re.compile(r'^:log warning "[^"]*"$')
+_DEAD_MAN_REVERT_SET_RE = re.compile(r'^/interface/wireless set \[find name="([^"]+)"\] (.+)$')
+_DEAD_MAN_REMOVE_SCHEDULER_RE = re.compile(r'^/system scheduler remove \[find name="([^"]+)"\]$')
+
+# 2026-07 hardening review: the fake's own simulated "device clock", the
+# same shape `/system/clock` returns on a real device (see
+# tests/conftest.py's shared fixture) and what `guard._dead_man_deadline`
+# reads to compute a dead-man's one-shot `start-date`/`start-time`. Injected
+# via `FakeConnection.__init__`'s `setdefault` below so every FakeConnection
+# has a working clock unless a test explicitly overrides ("system", "clock")
+# itself (including to `[]`, to simulate a device with no clock menu at
+# all) - only tests that specifically care about clock/deadline math need to
+# set this up themselves.
+_DEFAULT_SYSTEM_CLOCK_ROW: dict[str, Any] = {
+    "time": "12:00:00",
+    "date": "jan/01/2026",
+    "time-zone-name": "UTC",
+    "time-zone-autodetect": False,
+    "gmt-offset": "+00:00",
+    "dst-active": False,
+}
+
+
 def _once_reply_stream(reply: dict[str, Any] | None):
     """Mirror librouteros' actual return type for a `once=` monitor-style
     command (/interface/monitor-traffic, /interface/ethernet/poe/monitor,
@@ -175,6 +206,15 @@ class FakeConnection:
         poe_monitor_reject_numbers: bool = False,
     ):
         self._data: dict[tuple[str, ...], list[dict[str, Any]]] = dict(data or {})
+        # 2026-07 hardening review: every FakeConnection gets a working
+        # `/system/clock` unless the caller explicitly configured
+        # ("system", "clock") itself (setdefault only acts when the key is
+        # ABSENT - an explicit `[]` for "no clock menu" is preserved as-is).
+        # guard.arm_dead_man now reads this to compute a one-shot dead-man
+        # deadline (see `_dead_man_deadline`) even on a `confirm=False`
+        # preview - most tests don't care about the exact clock value, so
+        # this default means they don't have to set one up.
+        self._data.setdefault(("system", "clock"), [dict(_DEFAULT_SYSTEM_CLOCK_ROW)])
         self._ping_replies = ping_replies if ping_replies is not None else []
         self._traceroute_replies = traceroute_replies if traceroute_replies is not None else []
         # Keyed by interface name (the "interface" kwarg each command is
@@ -279,6 +319,119 @@ class FakeConnection:
 
     def close(self) -> None:
         self.closed = True
+
+    def _current_clock(self):
+        """This fake's simulated "now" - the same `("system", "clock")` row
+        `guard._dead_man_deadline` reads on a real device (see
+        `_DEFAULT_SYSTEM_CLOCK_ROW`'s module note). Raises AssertionError if
+        it can't be parsed - a test double whose own clock fixture is
+        unparseable is a test bug, not something to silently paper over.
+        """
+        clock_rows = self._data.get(("system", "clock")) or [dict(_DEFAULT_SYSTEM_CLOCK_ROW)]
+        row = clock_rows[0]
+        now = parse_ros_datetime(f"{row.get('date', '')} {row.get('time', '')}")
+        if now is None:
+            raise AssertionError(f"fake clock unparseable: date={row.get('date')!r} time={row.get('time')!r}")
+        return now
+
+    def advance_clock(self, minutes: int) -> None:
+        """Test helper: move this fake's simulated `("system", "clock")`
+        "now" forward by `minutes`, mirroring real time passing. Used to
+        prove `fire_scheduler` refuses to fire a dead-man before its
+        computed `start-date`/`start-time` deadline (2026-07-13 hardware
+        finding - see `guard._dead_man_deadline`'s docstring): call this
+        with (at least) the armed `minutes` before `fire_scheduler`, or
+        firing raises `AssertionError` instead of applying the revert.
+        """
+        later = self._current_clock() + timedelta(minutes=minutes)
+        date_str, time_str = format_ros_date_time(later)
+        clock_rows = self._data.setdefault(("system", "clock"), [dict(_DEFAULT_SYSTEM_CLOCK_ROW)])
+        if not clock_rows:
+            clock_rows.append(dict(_DEFAULT_SYSTEM_CLOCK_ROW))
+        clock_rows[0]["date"] = date_str
+        clock_rows[0]["time"] = time_str
+
+    def fire_scheduler(self, name: str) -> None:
+        """Test-only simulation of a dead-man scheduler actually FIRING (the
+        "caller never called cancel_dead_man in time" half of the dead-man
+        contract - see guard.arm_dead_man's docstring). Runs the on-event
+        script's statements against this fake's own `_data`, then removes
+        the scheduler row itself - mirroring
+        `/system scheduler remove [find name=...]`'s self-cleanup.
+
+        2026-07-13 hardware finding (see `guard._dead_man_deadline`'s
+        docstring): a dead-man fires at a computed future `start-date`/
+        `start-time` - `minutes` after being armed, on the DEVICE's own
+        clock, never on this host's. This fake mirrors that - it refuses to
+        fire (raises `AssertionError`) unless this fake's own simulated
+        clock (`_current_clock`) has reached or passed the scheduler row's
+        `start-date`/`start-time`. Call `advance_clock(minutes)` first to
+        simulate the window actually elapsing.
+
+        Also mirrors RouterOS's on-event ABORT-ON-FIRST-PARSE-ERROR
+        behavior (2026-07 hardening review, finding 2): this is NOT a
+        general RouterOS script interpreter, it only recognizes the exact
+        statement shapes `guard._build_dead_man_script` ever emits
+        (`:log warning "..."` - no fake side-effect needed;
+        `/interface/wireless set [find name="X"] field=value ...` - applied
+        to the matching `("interface", "wireless")` row;
+        `/system scheduler remove [find name="X"]` - removes that scheduler
+        row). The FIRST statement that matches none of those shapes STOPS
+        the loop entirely - no further statements run, including a
+        trailing self-remove - exactly like a real device aborts the whole
+        on-event script at its first unparseable statement, instead of
+        skipping just that one statement and continuing.
+
+        Raises AssertionError if no scheduler named `name` is armed, so a
+        test calling this on the wrong/already-fired name fails loudly
+        instead of silently doing nothing.
+        """
+        scheduler_rows = self._data.get(("system", "scheduler"), [])
+        row = next((r for r in scheduler_rows if r.get("name") == name), None)
+        if row is None:
+            raise AssertionError(f"fire_scheduler: no scheduler named {name!r} is currently armed")
+
+        now = self._current_clock()
+        deadline = parse_ros_datetime(f"{row.get('start-date', '')} {row.get('start-time', '')}")
+        if deadline is None:
+            raise AssertionError(
+                f"fire_scheduler: scheduler {name!r} has an unparseable start-date/start-time "
+                f"({row.get('start-date')!r}/{row.get('start-time')!r})"
+            )
+        if now < deadline:
+            raise AssertionError(
+                f"fire_scheduler: {name!r} has not reached its start-date/start-time yet (fake clock is {now}, "
+                f"deadline is {deadline}) - call advance_clock() first to simulate this."
+            )
+
+        for statement in str(row.get("on-event", "")).split("; "):
+            statement = statement.strip()
+            if _DEAD_MAN_LOG_WARNING_RE.match(statement):
+                continue
+            set_match = _DEAD_MAN_REVERT_SET_RE.match(statement)
+            if set_match:
+                target_name, assignments = set_match.groups()
+                fields = dict(pair.split("=", 1) for pair in assignments.split(" ") if "=" in pair)
+                for target_row in self._data.get(("interface", "wireless"), []):
+                    if target_row.get("name") == target_name:
+                        target_row.update(fields)
+                continue
+            remove_match = _DEAD_MAN_REMOVE_SCHEDULER_RE.match(statement)
+            if remove_match:
+                sched_name = remove_match.group(1)
+                self._data[("system", "scheduler")] = [
+                    r for r in self._data.get(("system", "scheduler"), []) if r.get("name") != sched_name
+                ]
+                continue
+            # RouterOS aborts the ENTIRE on-event script at the first
+            # statement it can't parse - mirrored here by simply stopping:
+            # nothing after this statement runs, including the self-remove.
+            # See this method's docstring / finding 2 of the 2026-07
+            # hardening review for why this matters: if the revert write is
+            # what's needed to restore reachability, an aborted on-event
+            # means the device never heals, and the stale scheduler entry
+            # is left behind instead of self-cleaning.
+            return
 
 
 class RaisingConnection:

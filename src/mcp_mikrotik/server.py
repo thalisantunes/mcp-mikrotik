@@ -28,7 +28,14 @@ ipv6_firewall_filter, ipv6_neighbors, ipv6_firewall_address_lists - IPv6
 READ parity (ROADMAP.md's Tier 3). (v1.10) six more guarded write tools -
 enable_ipv6_firewall_rule/disable_ipv6_firewall_rule, add_ipv6_route/
 remove_ipv6_route, add_to_ipv6_address_list/remove_from_ipv6_address_list -
-IPv6 WRITE parity, closing out the IPv6 parity item entirely.
+IPv6 WRITE parity, closing out the IPv6 parity item entirely. (v1.11) one
+more read-only tool - get_wireless_link_quality (CCQ/SNR/rate/distance
+normalized from the same registration-table wireless_registrations already
+reads) - plus five more guarded write tools: set_wireless_channel/
+set_wireless_tx_power/set_wireless_tuning (RF tuning on
+`/interface/wireless`) and the reusable dead-man primitive itself,
+arm_dead_man/cancel_dead_man - see guard.py's module note above their
+ALLOWLIST entries and README's "Dead-man / lockout-proof writes" section.
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -61,6 +68,7 @@ from .formatting import (
     coerce_ros_number,
     days_until,
     filter_disabled,
+    normalize_wireless_registration,
     rows_to_list,
     split_address_port,
     strip_sensitive_fields,
@@ -135,6 +143,27 @@ _CERTIFICATE_REDACTED_FIELDS = frozenset({"private-key"})
 # output" rule as `_PPP_SECRET_REDACTED_FIELDS`/`_WIREGUARD_REDACTED_FIELDS`
 # above.
 _RADIUS_REDACTED_FIELDS = frozenset({"secret"})
+
+
+def _wireless_registration_rows(client: MikrotikClient) -> list[dict[str, Any]]:
+    """Shared by `wireless_registrations` and `get_wireless_link_quality`
+    (v1.11): read `/interface/wifi/registration-table` (ROS7) falling back
+    to `/interface/wireless/registration-table` (ROS6), returning RAW rows -
+    an empty list (not an error) if neither path answers (a wired-only
+    device, or the relevant package not installed). Factored out so
+    `get_wireless_link_quality`'s normalization (formatting.
+    normalize_wireless_registration) reuses this exact fallback instead of
+    duplicating it.
+    """
+    for segments in (
+        ("interface", "wifi", "registration-table"),
+        ("interface", "wireless", "registration-table"),
+    ):
+        try:
+            return rows_to_list(client.path(*segments))
+        except DeviceCommandError:
+            continue
+    return []
 
 
 def build_server(settings: Settings | None = None, client_factory: ClientFactory = get_client) -> FastMCP:
@@ -337,17 +366,50 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         - rather than raising - for a device with no wireless radio at all
         (or the relevant package not installed), since that is a completely
         normal, expected state for a wired-only device.
+
+        RAW rows, as RouterOS returns them - see `get_wireless_link_quality`
+        (v1.11) for the same registration-table data normalized into a fixed
+        CCQ/rate/distance shape for PtP/PtMP diagnosis.
         """
         client = _client(device_name)
-        for segments in (
-            ("interface", "wifi", "registration-table"),
-            ("interface", "wireless", "registration-table"),
-        ):
-            try:
-                return rows_to_list(client.path(*segments))
-            except DeviceCommandError:
-                continue
-        return []
+        return _wireless_registration_rows(client)
+
+    @mcp.tool()
+    @_safe
+    def get_wireless_link_quality(device_name: str, interface: str | None = None) -> list[dict[str, Any]]:
+        """PtP/PtMP link-quality diagnosis: the same registration-table data
+        `wireless_registrations` reads, normalized per peer into `interface`,
+        `mac_address`, `signal_strength`, `signal_to_noise`, `tx_ccq`,
+        `rx_ccq`, `tx_rate`, `rx_rate`, `distance`, `uptime` (see
+        `formatting.normalize_wireless_registration`).
+
+        This is the read to run before AND after `set_wireless_channel`/
+        `set_wireless_tx_power`/`set_wireless_tuning` to judge whether an RF
+        change actually helped - CCQ (Client Connection Quality) and
+        signal-to-noise are the two numbers that matter most for a PtP link;
+        `tx_rate`/`rx_rate` dropping right after a channel/power change is
+        expected for a few seconds while rates re-adapt, not a failure (see
+        `set_wireless_tx_power`'s docstring).
+
+        Optional `interface` filters to peers associated on that one local
+        interface (validated for shape like every other `interface_name`
+        parameter in this package).
+
+        Field availability genuinely differs by generation: ROS7's newer
+        `/interface/wifi/registration-table` does not publish
+        `signal-to-noise`/`tx-ccq`/`rx-ccq`/`distance` at all (per MikroTik's
+        own docs) - those fields come back `None` rather than fabricated.
+        `/interface/wireless` (confirmed against real hardware today - see
+        docs/api-notes-wireless-rf.md) publishes all of them. Empty list
+        (not an error) for a device with no wireless radio, same convention
+        as `wireless_registrations`.
+        """
+        client = _client(device_name)
+        rows = _wireless_registration_rows(client)
+        if interface is not None:
+            validated_interface = validate_interface_name(interface)
+            rows = [row for row in rows if row.get("interface") == validated_interface]
+        return [normalize_wireless_registration(row) for row in rows]
 
     @mcp.tool()
     @_safe
@@ -2984,6 +3046,233 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         preview = guard.remove_from_ipv6_address_list(
             client, settings, list_name=list_name, address=address, confirm=confirm
         )
+        return asdict(preview)
+
+    # --- v1.11: wireless RF tuning + the dead-man primitive -----------------
+    #
+    # set_wireless_channel/set_wireless_tx_power are LOCKOUT-RISK writes (see
+    # guard.py's module note above their ALLOWLIST entries) - by default they
+    # arm a dead-man (guard.arm_dead_man) before applying, so a bad channel/
+    # power on a management-path PtP link self-heals instead of stranding the
+    # device. arm_dead_man/cancel_dead_man are also exposed standalone here,
+    # since the primitive is reusable for ANY future risky write, not just
+    # these two - see README's "Dead-man / lockout-proof writes" section.
+
+    @mcp.tool()
+    @_safe
+    def set_wireless_channel(
+        device_name: str,
+        interface_name: str,
+        frequency: int,
+        channel_width: str | None = None,
+        arm_deadman: bool = True,
+        deadman_minutes: int = 3,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Set a `/interface/wireless` interface's `frequency` (MHz) and
+        optionally `channel_width`.
+
+        LOCKOUT-RISK on a PtP link that is itself the management path to the
+        far end: a bad frequency (or a DFS Channel Availability Check stall)
+        can cut the only route back to the device. By default
+        (`arm_deadman=True`), a `confirm=True` apply FIRST arms a dead-man
+        (`arm_dead_man`) that restores the interface's prior frequency/
+        channel-width after `deadman_minutes` (1-60, default 3) unless
+        cancelled - call `cancel_dead_man(device_name, dead_man["name"])`
+        once the new channel is confirmed good. Set `arm_deadman=False` only
+        for an interface known NOT to be a management path.
+
+        The returned preview's `warning` ALWAYS reports whether `frequency`
+        needs a DFS Channel Availability Check under this interface's
+        CURRENT `frequency-mode` (superchannel: none, instant; otherwise
+        ~60s in the general DFS range 5250-5725MHz, ~600s in the
+        5600-5650MHz weather-radar sub-band - verified against real
+        hardware). See docs/api-notes-wireless-rf.md.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the DFS warning,
+        without arming anything) without changing anything; call again with
+        confirm=True to actually apply it. Errors if `interface_name`
+        doesn't exist on `/interface/wireless` - never creates one. This
+        targets `/interface/wireless` only - see guard.py's module note for
+        why ROS7's newer `/interface/wifi` package is out of scope this
+        round.
+        """
+        client = _client(device_name)
+        preview = guard.set_wireless_channel(
+            client,
+            settings,
+            interface_name=interface_name,
+            frequency=frequency,
+            channel_width=channel_width,
+            arm_deadman=arm_deadman,
+            deadman_minutes=deadman_minutes,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def set_wireless_tx_power(
+        device_name: str,
+        interface_name: str,
+        tx_power: int,
+        arm_deadman: bool = True,
+        deadman_minutes: int = 3,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Set a `/interface/wireless` interface's `tx_power` (dBm),
+        forcing `tx-power-mode=all-rates-fixed`.
+
+        CONFIRMED AGAINST REAL HARDWARE TODAY: on a short link, the default
+        (maximum) tx-power SATURATES the receiver and PRODUCES A WORSE CCQ
+        than a lower power (measured: -27dBm/CCQ 34 at default, -47dBm/CCQ
+        94 at ~8dBm). There is no single "right" power for every link - use
+        `get_wireless_link_quality` before/after to judge the effect.
+
+        LOCKOUT-RISK for the same reason as `set_wireless_channel` - same
+        `arm_deadman`/`deadman_minutes` dead-man behavior (default armed),
+        restoring BOTH `tx-power-mode` and `tx-power` on revert.
+
+        The returned preview's `warning` always notes that CCQ/rate briefly
+        re-adapt (a few seconds) right after a power change - expected, not
+        a failure.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview without changing anything;
+        call again with confirm=True to actually apply it. Errors if
+        `interface_name` doesn't exist on `/interface/wireless` - never
+        creates one.
+        """
+        client = _client(device_name)
+        preview = guard.set_wireless_tx_power(
+            client,
+            settings,
+            interface_name=interface_name,
+            tx_power=tx_power,
+            arm_deadman=arm_deadman,
+            deadman_minutes=deadman_minutes,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def set_wireless_tuning(
+        device_name: str,
+        interface_name: str,
+        adaptive_noise_immunity: str | None = None,
+        distance: int | str | None = None,
+        arm_deadman: bool = True,
+        deadman_minutes: int = 3,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Set a `/interface/wireless` interface's `adaptive_noise_immunity`
+        ("none"/"client-mode"/"ap-and-client-mode") and/or `distance`
+        ("dynamic"/"indoors"/an integer number of km). At least one must be
+        given.
+
+        `adaptive_noise_immunity` alone is reception-only tuning - CONFIRMED
+        SAFE against real hardware today (does not drop an already-
+        associated link), never arms a dead-man. CONFIRMED TODAY: with good
+        signal but poor CCQ (interference, not distance),
+        `adaptive_noise_immunity="ap-and-client-mode"` measurably helped.
+
+        A NUMERIC `distance` (unlike the named "dynamic"/"indoors" modes)
+        directly changes the ACK-timeout/TDMA timing - LOCKOUT-RISK,
+        CONFIRMED LIVE it can silently drop an already-associated link on a
+        mismatch (e.g. too short for the real link length). By default
+        (`arm_deadman=True`), a numeric `distance` arms a dead-man
+        (`arm_dead_man`) that restores the interface's prior `distance`
+        after `deadman_minutes` (1-60, default 3) unless cancelled - same
+        mechanism as `set_wireless_channel`/`set_wireless_tx_power`. For a
+        long verified PtP link, an explicit `distance` (e.g. 9 for ~9km)
+        gave a better ACK timeout than leaving it on "dynamic".
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to get a before/after preview (including the LOCKOUT-RISK
+        warning for a numeric distance, without arming anything) without
+        changing anything; call again with confirm=True to actually apply
+        it. Errors if `interface_name` doesn't exist on `/interface/wireless`
+        - never creates one.
+        """
+        client = _client(device_name)
+        preview = guard.set_wireless_tuning(
+            client,
+            settings,
+            interface_name=interface_name,
+            adaptive_noise_immunity=adaptive_noise_immunity,
+            distance=distance,
+            arm_deadman=arm_deadman,
+            deadman_minutes=deadman_minutes,
+            confirm=confirm,
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def arm_dead_man(
+        device_name: str, revert_commands: list[str], minutes: int = 3, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Arm a local, self-removing RouterOS scheduler on `device_name`
+        that reverts a change after `minutes` (1-60) unless cancelled first
+        (`cancel_dead_man`) - the anti-lockout primitive behind every
+        LOCKOUT-RISK write in this package (`set_wireless_channel`/
+        `set_wireless_tx_power` use it automatically by default). See
+        README's "Dead-man / lockout-proof writes" section for the full
+        design and the real-hardware incident that validated it.
+
+        NOT wireless-specific: `revert_commands` is any non-empty list (max
+        10 items) of RouterOS script statements that restore a known-good
+        prior state - a route, a bridge port, a firewall rule, anything -
+        run in order when the dead-man fires, after logging a warning
+        (visible in `logs`/`security_events`) and before the scheduler
+        removes itself. Build each command from state you already read from
+        the device, not free-form text.
+
+        The returned preview's `after["name"]` (also `after` more broadly)
+        is the exact scheduler that would be armed (or was armed, if
+        `confirm=True`) - pass that `name` to `cancel_dead_man` once the
+        change it guards is confirmed good.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview the exact scheduler that would be armed without
+        touching the device; call again with confirm=True to actually arm
+        it.
+        """
+        client = _client(device_name)
+        preview = guard.arm_dead_man(
+            client, settings, revert_commands=revert_commands, minutes=minutes, confirm=confirm
+        )
+        return asdict(preview)
+
+    @mcp.tool()
+    @_safe
+    def cancel_dead_man(device_name: str, name: str, confirm: bool = False) -> dict[str, Any]:
+        """Cancel a dead-man scheduler armed by `arm_dead_man` (or
+        automatically by `set_wireless_channel`/`set_wireless_tx_power`),
+        once the change it guards is confirmed good - removes it from
+        `/system/scheduler` before it can fire and revert.
+
+        `name` MUST be the exact "deadman-<hex>" handle `arm_dead_man`
+        returned (`after["name"]`, or a wireless write's `dead_man["name"]`)
+        - by construction this can never target an unrelated scheduler
+        entry (e.g. an admin's own "backup-daily" task).
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with MIKROTIK_ALLOW_WRITE=true. Call with confirm=False (the
+        default) to preview what would be cancelled; call again with
+        confirm=True to actually cancel it. Errors clearly if `name` doesn't
+        match an armed scheduler - which can mean it already fired and
+        self-removed (it wasn't cancelled in time), or was already
+        cancelled.
+        """
+        client = _client(device_name)
+        preview = guard.cancel_dead_man(client, settings, name=name, confirm=confirm)
         return asdict(preview)
 
     return mcp

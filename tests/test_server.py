@@ -128,6 +128,12 @@ EXPECTED_TOOLS = {
     "remove_ipv6_route",
     "add_to_ipv6_address_list",
     "remove_from_ipv6_address_list",
+    "get_wireless_link_quality",
+    "set_wireless_channel",
+    "set_wireless_tx_power",
+    "set_wireless_tuning",
+    "arm_dead_man",
+    "cancel_dead_man",
 }
 
 
@@ -353,6 +359,363 @@ async def test_wireless_registrations_returns_empty_when_no_radio(settings: Sett
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("wireless_registrations", {"device_name": "core-switch"})
     assert result["result"] == []
+
+
+# --- get_wireless_link_quality (v1.11) ---------------------------------------
+
+
+def _link_quality_fake() -> FakeConnection:
+    return FakeConnection(
+        raise_for={("interface", "wifi", "registration-table"): LibRouterosError("no such command")},
+        data={
+            ("interface", "wireless", "registration-table"): [
+                {
+                    "interface": "wlan1",
+                    "mac-address": "AA:BB:CC:DD:EE:90",
+                    "signal-strength": "-47",
+                    "signal-to-noise": "45",
+                    "tx-ccq": "94",
+                    "rx-ccq": "90",
+                    "tx-rate": "300Mbps",
+                    "rx-rate": "300Mbps",
+                    "distance": "8800",
+                    "uptime": "2d3h",
+                },
+                {
+                    "interface": "wlan2",
+                    "mac-address": "AA:BB:CC:DD:EE:91",
+                    "signal-strength": "-70",
+                    "uptime": "5m",
+                },
+            ]
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_wireless_link_quality_normalizes_ccq_snr_rate_distance(settings: Settings):
+    fake = _link_quality_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("get_wireless_link_quality", {"device_name": "core-switch"})
+    rows = result["result"]
+    assert len(rows) == 2
+    wlan1 = next(row for row in rows if row["interface"] == "wlan1")
+    assert wlan1 == {
+        "interface": "wlan1",
+        "mac_address": "AA:BB:CC:DD:EE:90",
+        "signal_strength": -47,
+        "signal_to_noise": 45,
+        "tx_ccq": 94,
+        "rx_ccq": 90,
+        "tx_rate": "300Mbps",
+        "rx_rate": "300Mbps",
+        "distance": "8800",
+        "uptime": "2d3h",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_wireless_link_quality_omits_fields_absent_on_this_generation(settings: Settings):
+    """ROS7's newer /interface/wifi registration-table doesn't publish
+    signal-to-noise/tx-ccq/rx-ccq/distance at all - normalized fields must
+    come back None, never fabricated."""
+    fake = _link_quality_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("get_wireless_link_quality", {"device_name": "core-switch"})
+    wlan2 = next(row for row in result["result"] if row["interface"] == "wlan2")
+    assert wlan2["signal_to_noise"] is None
+    assert wlan2["tx_ccq"] is None
+    assert wlan2["rx_ccq"] is None
+    assert wlan2["distance"] is None
+    assert wlan2["signal_strength"] == -70
+
+
+@pytest.mark.asyncio
+async def test_get_wireless_link_quality_filters_by_interface(settings: Settings):
+    fake = _link_quality_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool(
+        "get_wireless_link_quality", {"device_name": "core-switch", "interface": "wlan1"}
+    )
+    assert {row["interface"] for row in result["result"]} == {"wlan1"}
+
+
+@pytest.mark.asyncio
+async def test_get_wireless_link_quality_returns_empty_when_no_radio(settings: Settings):
+    fake = FakeConnection(
+        raise_for={
+            ("interface", "wifi", "registration-table"): LibRouterosError("no such command"),
+            ("interface", "wireless", "registration-table"): LibRouterosError("no such command"),
+        }
+    )
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("get_wireless_link_quality", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_wireless_link_quality_rejects_invalid_interface_shape(settings: Settings):
+    fake = _link_quality_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("get_wireless_link_quality", {"device_name": "core-switch", "interface": "bad name!"})
+    assert "interface" in str(exc_info.value).lower()
+
+
+# --- v1.11: wireless RF tuning + dead-man (server-level) ---------------------
+
+
+def _wireless_write_fake() -> FakeConnection:
+    return FakeConnection(
+        data={
+            ("interface", "wireless"): [
+                {
+                    ".id": "*1",
+                    "name": "wlan1",
+                    "frequency": "5500",
+                    "channel-width": "20mhz",
+                    "frequency-mode": "regulatory-domain",
+                    "tx-power-mode": "default",
+                    "tx-power": "20",
+                    "adaptive-noise-immunity": "none",
+                    "distance": "dynamic",
+                }
+            ],
+            ("system", "scheduler"): [],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_channel_blocked_read_only_by_default(settings: Settings):
+    fake = _wireless_write_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_channel",
+            {"device_name": "core-switch", "interface_name": "wlan1", "frequency": 5300, "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_channel_preview_then_confirm_arms_dead_man(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_wireless_channel",
+        {"device_name": "core-switch", "interface_name": "wlan1", "frequency": 5300, "confirm": False},
+    )
+    assert preview["applied"] is False
+    assert preview["dead_man"] is None
+    assert preview["warning"] is not None and "DFS" in preview["warning"]
+
+    _content, applied = await mcp.call_tool(
+        "set_wireless_channel",
+        {"device_name": "core-switch", "interface_name": "wlan1", "frequency": 5300, "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert applied["dead_man"]["name"].startswith("deadman-")
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["frequency"] == "5300"
+    assert len(fake.path("system", "scheduler")._rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_channel_arm_deadman_false(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, applied = await mcp.call_tool(
+        "set_wireless_channel",
+        {
+            "device_name": "core-switch",
+            "interface_name": "wlan1",
+            "frequency": 5300,
+            "arm_deadman": False,
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    assert applied["dead_man"] is None
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_channel_unknown_interface_raises_clear_error(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_channel",
+            {"device_name": "core-switch", "interface_name": "ghost-wlan", "frequency": 5300, "confirm": True},
+        )
+    assert "not found" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tx_power_blocked_read_only_by_default(settings: Settings):
+    fake = _wireless_write_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_tx_power",
+            {"device_name": "core-switch", "interface_name": "wlan1", "tx_power": 8, "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tx_power_preview_then_confirm_arms_dead_man(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_wireless_tx_power",
+        {"device_name": "core-switch", "interface_name": "wlan1", "tx_power": 8, "confirm": False},
+    )
+    assert preview["applied"] is False
+
+    _content, applied = await mcp.call_tool(
+        "set_wireless_tx_power",
+        {"device_name": "core-switch", "interface_name": "wlan1", "tx_power": 8, "confirm": True},
+    )
+    assert applied["applied"] is True
+    assert applied["dead_man"]["name"].startswith("deadman-")
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["tx-power"] == "8"
+    assert updated["tx-power-mode"] == "all-rates-fixed"
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tx_power_rejects_out_of_range_power(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_tx_power",
+            {"device_name": "core-switch", "interface_name": "wlan1", "tx_power": 999, "confirm": True},
+        )
+    assert "tx_power" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tuning_blocked_read_only_by_default(settings: Settings):
+    fake = _wireless_write_fake()
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_tuning",
+            {"device_name": "core-switch", "interface_name": "wlan1", "distance": 9, "confirm": True},
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tuning_preview_then_confirm_never_arms_dead_man(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, preview = await mcp.call_tool(
+        "set_wireless_tuning",
+        {
+            "device_name": "core-switch",
+            "interface_name": "wlan1",
+            "adaptive_noise_immunity": "ap-and-client-mode",
+            "confirm": False,
+        },
+    )
+    assert preview["applied"] is False
+
+    _content, applied = await mcp.call_tool(
+        "set_wireless_tuning",
+        {
+            "device_name": "core-switch",
+            "interface_name": "wlan1",
+            "adaptive_noise_immunity": "ap-and-client-mode",
+            "confirm": True,
+        },
+    )
+    assert applied["applied"] is True
+    assert applied["dead_man"] is None
+    updated = fake.path("interface", "wireless")._rows[0]
+    assert updated["adaptive-noise-immunity"] == "ap-and-client-mode"
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_set_wireless_tuning_requires_at_least_one_field(device: Device):
+    fake = _wireless_write_fake()
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "set_wireless_tuning",
+            {"device_name": "core-switch", "interface_name": "wlan1", "confirm": True},
+        )
+    assert "at least one" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_arm_dead_man_blocked_read_only_by_default(settings: Settings):
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool(
+            "arm_dead_man",
+            {
+                "device_name": "core-switch",
+                "revert_commands": ['/interface/wireless set [find name="wlan1"] frequency=5500'],
+                "minutes": 3,
+                "confirm": True,
+            },
+        )
+    assert "read-only" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_arm_dead_man_then_cancel_dead_man_round_trip(device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): []})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+
+    _content, armed = await mcp.call_tool(
+        "arm_dead_man",
+        {
+            "device_name": "core-switch",
+            "revert_commands": ['/interface/wireless set [find name="wlan1"] frequency=5500'],
+            "minutes": 3,
+            "confirm": True,
+        },
+    )
+    assert armed["applied"] is True
+    name = armed["after"]["name"]
+    assert len(fake.path("system", "scheduler")._rows) == 1
+
+    _content, cancelled = await mcp.call_tool(
+        "cancel_dead_man", {"device_name": "core-switch", "name": name, "confirm": True}
+    )
+    assert cancelled["applied"] is True
+    assert fake.path("system", "scheduler")._rows == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_dead_man_rejects_name_not_matching_dead_man_shape(device: Device):
+    fake = FakeConnection(data={("system", "scheduler"): [{".id": "*1", "name": "backup-daily"}]})
+    write_settings = Settings(allow_write=True, devices={device.name: device})
+    mcp = build_server(settings=write_settings, client_factory=_factory(fake))
+    with pytest.raises(ToolError) as exc_info:
+        await mcp.call_tool("cancel_dead_man", {"device_name": "core-switch", "name": "backup-daily", "confirm": True})
+    assert "deadman-" in str(exc_info.value)
+    # Never touched the unrelated scheduler entry.
+    assert fake.path("system", "scheduler")._rows == [{".id": "*1", "name": "backup-daily"}]
 
 
 # --- VPN & routing diagnostics (v0.8, read-only) -----------------------------

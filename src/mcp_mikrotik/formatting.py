@@ -286,6 +286,37 @@ def parse_ros_datetime(value: Any) -> datetime | None:
     return None
 
 
+_MONTH_NAMES_BY_NUMBER = {number: name for name, number in _MONTH_ABBREVIATIONS.items()}
+
+
+def format_ros_date_time(value: datetime) -> tuple[str, str]:
+    """Inverse of `parse_ros_datetime`'s RouterOS-abbreviation shape: format
+    a naive `datetime` into RouterOS's own `date` ("jan/01/2026")/`time`
+    ("12:00:00") field pair - e.g. for `/system/scheduler`'s `start-date`/
+    `start-time` (see `guard.arm_dead_man`, which computes a one-shot
+    fire deadline this way rather than trusting RouterOS's own
+    interval-only default - see that function's docstring for the
+    2026-07-13 hardware finding that forced this).
+
+    Always the English abbreviation form (matching `_MONTH_ABBREVIATIONS`),
+    regardless of process locale - same reasoning as `parse_ros_datetime`'s
+    module note: RouterOS itself always renders/accepts this form in
+    English, independent of the device's own locale.
+
+    CONFIRMED AGAINST REAL HARDWARE (ROS 7.21.5, 2026-07-13): the
+    `mmm/dd/yyyy` shape this produces (e.g. `jul/13/2026`) is RouterOS's
+    canonical INPUT format for `start-date` - `guard.arm_dead_man` wrote
+    exactly that value and the device computed the correct one-shot
+    `next-run` (`2026-07-13 14:45:14`) from it. Accepted as input
+    independent of whatever date format the device's own `/system/clock`
+    happens to *display* (locale/format settings affect display, not what
+    `/system/scheduler add start-date=...` accepts).
+    """
+    date_str = f"{_MONTH_NAMES_BY_NUMBER[value.month]}/{value.day:02d}/{value.year:04d}"
+    time_str = f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+    return date_str, time_str
+
+
 def days_until(value: Any, now: datetime | None = None) -> int | None:
     """`(parsed_datetime - now).days` for a RouterOS datetime-shaped field,
     or `None` if `value` can't be parsed (see `parse_ros_datetime`).
@@ -300,3 +331,51 @@ def days_until(value: Any, now: datetime | None = None) -> int | None:
     if parsed is None:
         return None
     return (parsed - (now if now is not None else datetime.now())).days
+
+
+# v1.11: normalized PtP/PtMP link-quality fields, shared by server.py's
+# `get_wireless_link_quality` read tool. `wireless_registrations` (v0.5)
+# already reads `/interface/wifi/registration-table` (ROS7) falling back to
+# `/interface/wireless/registration-table` (ROS6) and returns the RAW row;
+# this function is the "normalization focused on CCQ/rate/distance" this
+# extends it with - `get_wireless_link_quality` calls the SAME underlying
+# rows (via server.py's shared `_wireless_registration_rows` helper) and maps
+# each one through this, rather than duplicating the ROS7/ROS6 fallback.
+#
+# Field availability genuinely differs by generation - CONFIRMED against
+# both real hardware (today, `/interface/wireless`: DISC Lite5 ac / LHG XL 5
+# ac, IPQ4019, ROS 7.21.5) and MikroTik's own documentation (ROS7's newer
+# `/interface/wifi/registration-table` publishes `signal`/`tx-rate`/
+# `rx-rate`/`uptime` but NOT `signal-to-noise`/`tx-ccq`/`rx-ccq`/`distance`
+# at all). This NEVER fabricates a missing field - every normalized value is
+# `None` when the source row simply doesn't carry it, exactly like every
+# other "field may not exist on every generation" read tool in this package
+# (e.g. `ntp_client`).
+def normalize_wireless_registration(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one `/interface/wireless` or `/interface/wifi`
+    registration-table row into the fixed CCQ/rate/distance shape
+    `get_wireless_link_quality` reports: `interface`, `mac_address`,
+    `signal_strength`, `signal_to_noise`, `tx_ccq`, `rx_ccq`, `tx_rate`,
+    `rx_rate`, `distance`, `uptime`.
+
+    `signal_strength` reads either RouterOS field name a registration-table
+    row may carry it under - `/interface/wireless`'s `signal-strength` (the
+    legacy, hardware-verified field) or `/interface/wifi`'s `signal` (per
+    MikroTik's own docs) - preferring `signal-strength` when both happen to
+    be present. Numeric fields are coerced with `coerce_ros_number` (never
+    passed through as a raw string RouterOS might send as either an int or a
+    numeric string - same lesson `coerce_ros_number` documents for PoE).
+    """
+    signal = row.get("signal-strength", row.get("signal"))
+    return {
+        "interface": row.get("interface"),
+        "mac_address": row.get("mac-address"),
+        "signal_strength": coerce_ros_number(signal),
+        "signal_to_noise": coerce_ros_number(row.get("signal-to-noise")),
+        "tx_ccq": coerce_ros_number(row.get("tx-ccq")),
+        "rx_ccq": coerce_ros_number(row.get("rx-ccq")),
+        "tx_rate": row.get("tx-rate"),
+        "rx_rate": row.get("rx-rate"),
+        "distance": row.get("distance"),
+        "uptime": row.get("uptime"),
+    }

@@ -1106,3 +1106,423 @@ def validate_ipv6_target(target: str) -> str:
         return target
 
     raise ValidationError(f"Target {target!r} is not a valid IPv6 address or subnet.")
+
+
+# --- v1.11: wireless RF tuning + dead-man (lockout-proof writes) -----------
+#
+# `set_wireless_channel`/`set_wireless_tx_power`/`set_wireless_tuning`
+# (guard.py) write RouterOS's legacy `/interface/wireless` menu - confirmed
+# against real hardware today (DISC Lite5 ac, LHG XL 5 ac; IPQ4019;
+# ROS 7.21.5; nv2 PtP) to be what these devices actually expose (their
+# `tx-power-mode`/`frequency-mode`/full registration-table CCQ/SNR/distance
+# fields only exist on this legacy menu - RouterOS 7's newer `/interface/wifi`
+# package uses a different, incompatible shape - `channel.frequency`/
+# `channel.width`, no `tx-power-mode` at all - and is NOT covered by this
+# round; see docs/api-notes-wireless-rf.md). Every range/enum below is
+# shape-only (same spirit as every other validator in this module - see the
+# module docstring): it rejects obviously-wrong input before ever touching a
+# device, it does not attempt to model exactly which channel/power a given
+# card+regulatory-domain combination actually supports - RouterOS itself is
+# the final authority on that.
+
+# RouterOS `/interface/wireless`'s `frequency` field, in MHz. One broad range
+# spanning the 2.4GHz band through the 5GHz band plus RouterOS's own
+# "superchannel" extension (Atheros cards report usable center frequencies
+# from about 2192MHz up to 6100MHz - see
+# https://wiki.mikrotik.com/Manual:Wireless_Advanced_Channels). Deliberately
+# not split into separate 2.4GHz/5GHz sub-ranges (unlike e.g. `_VLAN_ID_MIN`/
+# `_VLAN_ID_MAX`'s single tight range) - a single broad band is simpler and
+# still rejects obvious nonsense (e.g. a MHz value that's actually a channel
+# number), while leaving RouterOS itself to reject a frequency an actual
+# card/regulatory-domain doesn't support.
+_WIRELESS_FREQUENCY_MIN = 2192
+_WIRELESS_FREQUENCY_MAX = 6100
+
+
+def validate_wireless_frequency(value: int) -> int:
+    """Validate a RouterOS `/interface/wireless` `frequency` (MHz), used by
+    `set_wireless_channel`. Must be an integer in `_WIRELESS_FREQUENCY_MIN`-
+    `_WIRELESS_FREQUENCY_MAX` (2192-6100 MHz - see that constant's comment).
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"frequency must be an integer (MHz), got {value!r}.")
+    if not (_WIRELESS_FREQUENCY_MIN <= value <= _WIRELESS_FREQUENCY_MAX):
+        raise ValidationError(
+            f"frequency {value!r} is out of range (expected {_WIRELESS_FREQUENCY_MIN}-{_WIRELESS_FREQUENCY_MAX} MHz)."
+        )
+    return value
+
+
+# RouterOS `/interface/wireless`'s `channel-width` field: the fixed set of
+# values RouterOS itself accepts (help.mikrotik.com "Wireless Interface" -
+# the 20/40/.../160MHz "extension channel" suffixes encode which side(s) the
+# secondary channel(s) sit on - "Ce"/"eC" etc. - RouterOS's own notation, not
+# invented here). Case-insensitive on input, normalized to lower-case (every
+# value RouterOS itself sends/accepts is lower-case).
+_WIRELESS_CHANNEL_WIDTHS = (
+    "5mhz",
+    "10mhz",
+    "20mhz",
+    "40mhz-turbo",
+    "20/40mhz-xx",
+    "20/40mhz-ec",
+    "20/40mhz-ce",
+    "20/40/80mhz-xxxx",
+    "20/40/80mhz-eeec",
+    "20/40/80mhz-eece",
+    "20/40/80mhz-ecee",
+    "20/40/80mhz-ceee",
+    "20/40/80/160mhz-xxxxxxxx",
+    "20/40/80/160mhz-eeeeeeec",
+    "20/40/80/160mhz-eeeeecee",
+    "20/40/80/160mhz-eeeeceee",
+    "20/40/80/160mhz-eeeceeee",
+    "20/40/80/160mhz-eeceeeee",
+    "20/40/80/160mhz-eceeeeee",
+    "20/40/80/160mhz-ceeeeeee",
+)
+
+
+def validate_wireless_channel_width(value: str) -> str:
+    """Validate a RouterOS `/interface/wireless` `channel-width`, used by
+    `set_wireless_channel`. Must be one of RouterOS's own fixed set of
+    values (see `_WIRELESS_CHANNEL_WIDTHS`). Case-insensitive on input,
+    normalized to lower-case on return.
+
+    Returns the normalized value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("channel_width must be a non-empty string.")
+    normalized = value.strip().lower()
+    if normalized not in _WIRELESS_CHANNEL_WIDTHS:
+        raise ValidationError(
+            f"channel_width {value!r} is not a valid RouterOS channel-width "
+            f"(expected one of {_WIRELESS_CHANNEL_WIDTHS})."
+        )
+    return normalized
+
+
+# RouterOS `/interface/wireless`'s `tx-power` field: documented range -30..40
+# (dBm) - see help.mikrotik.com "Wireless Interface". The actual usable range
+# for a given card/regulatory-domain is narrower; RouterOS itself enforces
+# that at write time.
+_WIRELESS_TX_POWER_MIN = -30
+_WIRELESS_TX_POWER_MAX = 40
+
+
+def validate_wireless_tx_power(value: int) -> int:
+    """Validate a RouterOS `/interface/wireless` `tx-power` (dBm), used by
+    `set_wireless_tx_power`. Must be an integer in `_WIRELESS_TX_POWER_MIN`-
+    `_WIRELESS_TX_POWER_MAX` (-30..40 dBm, RouterOS's own documented range).
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"tx_power must be an integer (dBm), got {value!r}.")
+    if not (_WIRELESS_TX_POWER_MIN <= value <= _WIRELESS_TX_POWER_MAX):
+        raise ValidationError(
+            f"tx_power {value!r} is out of range (expected {_WIRELESS_TX_POWER_MIN}..{_WIRELESS_TX_POWER_MAX} dBm)."
+        )
+    return value
+
+
+_ADAPTIVE_NOISE_IMMUNITY_VALUES = ("none", "client-mode", "ap-and-client-mode")
+
+
+def validate_adaptive_noise_immunity(value: str) -> str:
+    """Validate a RouterOS `/interface/wireless` `adaptive-noise-immunity`,
+    used by `set_wireless_tuning`. Must be one of "none", "client-mode",
+    "ap-and-client-mode" (RouterOS's own fixed set - Atheros chipsets only,
+    but this is a shape check, not a hardware-capability check).
+
+    Returns the (stripped, lower-cased) value on success, raises
+    ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("adaptive_noise_immunity must be a non-empty string.")
+    normalized = value.strip().lower()
+    if normalized not in _ADAPTIVE_NOISE_IMMUNITY_VALUES:
+        raise ValidationError(
+            f"adaptive_noise_immunity {value!r} is not valid (expected one of {_ADAPTIVE_NOISE_IMMUNITY_VALUES})."
+        )
+    return normalized
+
+
+_WIRELESS_DISTANCE_WORDS = ("dynamic", "indoors")
+_WIRELESS_DISTANCE_MIN = 1
+_WIRELESS_DISTANCE_MAX = 1000
+
+
+def validate_wireless_distance(value: int | str) -> str:
+    """Validate a RouterOS `/interface/wireless` `distance`, used by
+    `set_wireless_tuning`. Either the literal string "dynamic" or "indoors"
+    (RouterOS's own two named ACK-timeout modes), or an integer 1-1000 (km) -
+    RouterOS computes the ACK timeout from it
+    (`((distance * 1000) + 299) / 300` microseconds); this is a sanity cap on
+    the input shape, not a claim that every value in range is achievable on a
+    real link.
+
+    Returns a string ready to send to RouterOS (the word unchanged, or
+    `str(value)` for a number) on success, raises ValidationError otherwise.
+    """
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _WIRELESS_DISTANCE_WORDS:
+            return normalized
+        raise ValidationError(
+            f"distance {value!r} is not valid (expected {_WIRELESS_DISTANCE_WORDS!r} or an integer number of km)."
+        )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(
+            f"distance must be an integer (km) or one of {_WIRELESS_DISTANCE_WORDS!r}, got {value!r}."
+        )
+    if not (_WIRELESS_DISTANCE_MIN <= value <= _WIRELESS_DISTANCE_MAX):
+        raise ValidationError(
+            f"distance {value!r} is out of range (expected {_WIRELESS_DISTANCE_MIN}-{_WIRELESS_DISTANCE_MAX} km)."
+        )
+    return str(value)
+
+
+# --- v1.11: dead-man (arm_dead_man/cancel_dead_man) ------------------------
+#
+# The dead-man primitive is deliberately NOT wireless-specific (see
+# guard.py's module note on arm_dead_man/cancel_dead_man) - it is a reusable
+# safety net for ANY lockout-risk write. `minutes` and `name` below are its
+# only two caller-facing shapes; `revert_commands` (validated per-item by
+# `validate_revert_command`) is the RouterOS script guard.py's own callers
+# (currently `set_wireless_channel`/`set_wireless_tx_power`) build FROM
+# already-read, already-validated device state - never raw free text typed
+# by an end user - but is still shape-checked here for defense in depth.
+
+_DEAD_MAN_MINUTES_MIN = 1
+# 60 minutes is a deliberately generous upper bound for a "how long until
+# this device heals itself" window - long enough to cover a slow manual
+# verification, short enough that an operator who walks away from a botched
+# change is never locked out for more than an hour. Not RouterOS-enforced;
+# this package's own safety cap.
+_DEAD_MAN_MINUTES_MAX = 60
+
+
+def validate_dead_man_minutes(value: int) -> int:
+    """Validate `arm_dead_man`'s `minutes` (how long until the armed
+    scheduler fires and reverts, if not cancelled first). Must be an integer
+    1-60 - see `_DEAD_MAN_MINUTES_MAX`'s comment for the rationale.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError(f"minutes must be an integer, got {value!r}.")
+    if not (_DEAD_MAN_MINUTES_MIN <= value <= _DEAD_MAN_MINUTES_MAX):
+        raise ValidationError(
+            f"minutes {value!r} is out of range (expected {_DEAD_MAN_MINUTES_MIN}-{_DEAD_MAN_MINUTES_MAX})."
+        )
+    return value
+
+
+# Every dead-man scheduler this package ever creates is named
+# "deadman-<10 lower-case hex chars>" by arm_dead_man itself (guard.py) -
+# never a caller-supplied name. This validator's charset is deliberately
+# narrow (not the general `_LIST_NAME`/`_INTERFACE_NAME` charset) specifically
+# so `cancel_dead_man` can NEVER be pointed at an arbitrary, unrelated
+# `/system/scheduler` entry (e.g. an admin's own "backup-daily" task) -
+# a caller-supplied `name` that doesn't match this shape is rejected before
+# the device is ever read, let alone written to.
+_DEAD_MAN_NAME = re.compile(r"^deadman-[0-9a-f]{1,32}$")
+
+
+def validate_dead_man_name(value: str) -> str:
+    """Validate `cancel_dead_man`'s `name`: must match the fixed
+    "deadman-<hex>" shape `arm_dead_man` itself always generates (see
+    `_DEAD_MAN_NAME`'s comment for why this is deliberately narrow - a safety
+    boundary, not just a format check).
+
+    Returns the (stripped) value on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("name must be a non-empty string.")
+    value = value.strip()
+    if not _DEAD_MAN_NAME.match(value):
+        raise ValidationError(
+            f"name {value!r} is not a dead-man scheduler name "
+            '(expected the shape "deadman-<hex>", as returned by arm_dead_man - '
+            "cancel_dead_man can only ever target a scheduler this package itself armed)."
+        )
+    return value
+
+
+_MAX_REVERT_COMMAND_LENGTH = 500
+_MAX_REVERT_COMMANDS = 10
+
+# finding 2(a) of the 2026-07 hardening review: characters that could let a
+# revert command break out of the fixed script structure
+# guard._build_dead_man_script embeds it in, or smuggle a SECOND statement
+# past the per-item validation/denylist below (e.g. `;` inside one list
+# item, defeating both the max-10-items cap and the verb denylist scan).
+# Blocked: `$` (RouterOS script variable substitution), `;` (statement
+# separator - guard._build_dead_man_script itself is the only place that
+# should ever join multiple statements, via "; ".join(revert_commands), not
+# a single caller-supplied item), backtick, `\` (escape sequences), `{`/`}`
+# (RouterOS script block/loop syntax - not needed by a simple `set`
+# statement).
+#
+# Deliberately NOT blocked: `"` and `[`/`]`. RouterOS script's own
+# `[find name="X"]` idiom - this package's established, documented,
+# EVERYWHERE-used convention for addressing a row by stable name instead of
+# a raw `.id` (see guard.py's module docstring) - requires exactly these
+# three characters. `_arm_wireless_revert` (guard.py) itself builds every
+# internal revert command with this idiom
+# (`/interface/wireless set [find name="{interface_name}"] ...`); blocking
+# `"`/`[`/`]` here would make set_wireless_channel/set_wireless_tx_power's
+# own dead-man arming fail validation on every call. The verb denylist
+# below is the intended defense against a `[...]`-wrapped dangerous nested
+# command (e.g. `comment=[/system reboot]`), rather than banning the
+# bracket/quote syntax outright.
+_REVERT_COMMAND_UNSAFE_CHARS = re.compile(r"[$;{}\\`]")
+
+# finding 2(d), HARDENED after an opus re-review (2026-07-13): a denylist of
+# dangerous verbs does not actually uphold this package's "no generic
+# command path" invariant for a standalone MCP tool with caller-supplied
+# `revert_commands` - anything NOT on the denylist still passed, and each
+# of these is a genuine, distinct lockout vector, not a theoretical one:
+#   `/ip/address remove [find ...]`        - removes a management IP
+#   `/ip/route remove [find ...]`          - removes a route (e.g. the only
+#                                             route back across an 8.8km PtP
+#                                             link)
+#   `/ip/firewall/filter remove [find ...]` - drops firewall state entirely
+# A denylist also cannot catch a malformed-but-safe-charset string like
+# `/interface/wireless set [find name="x` (unbalanced quote/bracket) -
+# RouterOS aborts the WHOLE on-event script at that kind of parse error
+# (see guard.py's module note above arm_dead_man / finding 2 of the
+# original 2026-07 hardening review), so a broken "set" that still passes a
+# denylist scan can silently defeat the dead-man's own self-remove too -
+# a false sense of safety net.
+#
+# Replaced below (`_REVERT_COMMAND_SET_FIND_RE`) with a POSITIVE structural
+# allowlist instead of an enumerated-verb denylist: every `revert_commands`
+# item MUST be exactly the "restore one row's fields" shape every internal
+# caller (`guard._arm_wireless_revert` - confirmed the only builder of
+# `revert_commands` in this codebase, and it ALWAYS uses this exact shape)
+# already produces:
+#   /<path> set [find <field>="<value>"] <field>=<value> [<field>=<value> ...]
+# `set` is the only verb ever accepted - never `remove`/`add`/`reboot`/
+# anything else. `[find <field>="<value>"]` (a single selector, BALANCED
+# quote and bracket) is mandatory - never a bare `.id`, matching this
+# package's stable-identifier convention everywhere else (see guard.py's
+# module docstring). At least one `field=value` assignment is required - a
+# `set` with nothing to set restores nothing. Anything not matching this
+# exact shape is rejected: the 3 destructive commands above (wrong verb,
+# and `[find]` with no selector field/value), the unbalanced-quote parse-
+# abort vector (the quoted selector value has no matching closing `"]`), a
+# bare `/system reboot` (no `set`/`[find ...]` at all), and a dangerous verb
+# smuggled inside a field VALUE (e.g. `comment=[/system reboot]` - the
+# value charset below excludes `[`/`]`/spaces, so nested command
+# substitution inside a value cannot match either) are all rejected
+# structurally, not because a maintainer enumerated them in advance.
+#
+# LIMITATION (documented, not fixed speculatively - this package is
+# deliberately restrictive by design): a revert that needs to RECREATE a
+# removed resource (`add`, not `set`) cannot be expressed via
+# `revert_commands` today. No current caller needs this - see ROADMAP.md.
+_REVERT_COMMAND_SET_FIND_RE = re.compile(
+    r"^/[A-Za-z][A-Za-z0-9_-]*(?:[ /][A-Za-z][A-Za-z0-9_-]*)*"
+    r'\s+set\s+\[find\s+[A-Za-z][A-Za-z0-9_-]*="[A-Za-z0-9 _.:/-]*"\]'
+    r"(?:\s+[A-Za-z][A-Za-z0-9_-]*=[A-Za-z0-9_./:-]+)+$"
+)
+
+# Kept as an additional, cheap, redundant layer alongside the structural
+# allowlist above (belt-and-suspenders, not the primary control anymore) -
+# a case-insensitive substring match so a denied verb smuggled inside a
+# `[...]` nested expression is still caught even if the structural allowlist
+# above were ever loosened by a future change.
+_REVERT_COMMAND_DENIED_VERBS = (
+    "/system reboot",
+    "/system backup load",
+    "/user",
+    "/system reset-configuration",
+    "/system routerboard",
+)
+
+
+def validate_revert_command(value: str) -> str:
+    """Validate one item of `arm_dead_man`'s `revert_commands` list: a single
+    RouterOS script statement restoring already-read, known-good state.
+
+    `revert_commands` is a structurally-restricted channel, not a generic
+    command-execution one: every item MUST match
+    `/<path> set [find <field>="<value>"] <field>=<value> [...]`
+    (`_REVERT_COMMAND_SET_FIND_RE`) - the `set`-one-row-by-`[find ...]`-
+    selector shape every internal caller (`guard._arm_wireless_revert`)
+    already produces. `remove`/`add`/`reboot`/any other verb, a bare path
+    with no `set [find ...]`, or an unbalanced quote/bracket (which would
+    otherwise abort RouterOS's on-event script mid-way - see guard.py's
+    module note above `arm_dead_man`) are all rejected by this shape check
+    alone, structurally rather than by an enumerated denylist. See
+    `_REVERT_COMMAND_SET_FIND_RE`'s comment for the full rationale
+    (including the specific destructive commands - `/ip/address remove`,
+    `/ip/route remove`, `/ip/firewall/filter remove` - a denylist-only
+    approach let through).
+
+    Also rejects: control characters (including newlines - same
+    `_COMMENT_UNSAFE` class every other free-text validator in this module
+    rejects, so one revert step can't smuggle a hidden second statement via
+    an embedded newline); a fixed set of script-structure-breaking
+    characters (`_REVERT_COMMAND_UNSAFE_CHARS`); a fixed denylist of
+    dangerous verbs (`_REVERT_COMMAND_DENIED_VERBS`, now a redundant extra
+    layer under the shape check above); a sane length cap.
+
+    This is NOT a RouterOS script parser/validator - it cannot confirm the
+    command is syntactically valid RouterOS script beyond the fixed shape
+    above (see guard.py's module note: full syntax can only be confirmed
+    when the scheduler actually fires). It only rejects the same class of
+    obviously-wrong or obviously-dangerous input every other validator in
+    this module rejects before ever touching a device.
+
+    Returns `value` unchanged on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("Each revert command must be a non-empty string.")
+    if len(value) > _MAX_REVERT_COMMAND_LENGTH:
+        raise ValidationError(f"Revert command is too long (max {_MAX_REVERT_COMMAND_LENGTH} characters).")
+    if _COMMENT_UNSAFE.search(value):
+        raise ValidationError("Revert command contains control characters, which are not allowed.")
+    match = _REVERT_COMMAND_UNSAFE_CHARS.search(value)
+    if match:
+        raise ValidationError(
+            f"Revert command contains {match.group()!r}, which is not allowed (could break out of the "
+            "dead-man script template or smuggle a second statement into one revert_commands item)."
+        )
+    if not _REVERT_COMMAND_SET_FIND_RE.match(value):
+        raise ValidationError(
+            f"Revert command {value!r} does not match the required "
+            "'/<path> set [find <field>=\"<value>\"] <field>=<value> ...' shape: revert_commands restores state "
+            "already read from the device before a risky write - only a `set` on one row selected by "
+            "`[find ...]` (with a balanced quote/bracket) is allowed, never `remove`/`add`/any other verb or "
+            "command."
+        )
+    lowered = value.lower()
+    for verb in _REVERT_COMMAND_DENIED_VERBS:
+        if verb in lowered:
+            raise ValidationError(
+                f"Revert command must not contain {verb!r}: revert_commands restores state already read from "
+                "the device before a risky write - it is not a channel for arbitrary or dangerous RouterOS "
+                "commands (reboot, backup restore, user management, factory reset, routerboard firmware)."
+            )
+    return value
+
+
+def validate_revert_commands(value: list[str]) -> list[str]:
+    """Validate `arm_dead_man`'s `revert_commands` list as a whole: must be a
+    non-empty list (an unarmed dead-man that reverts nothing defeats the
+    point), each item validated by `validate_revert_command`, capped at
+    `_MAX_REVERT_COMMANDS` items (a revert script restores state, it does not
+    need to be an arbitrarily long program).
+
+    Returns the validated list on success, raises ValidationError otherwise.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValidationError("revert_commands must be a non-empty list of RouterOS script statements.")
+    if len(value) > _MAX_REVERT_COMMANDS:
+        raise ValidationError(f"revert_commands has too many items (max {_MAX_REVERT_COMMANDS}).")
+    return [validate_revert_command(item) for item in value]

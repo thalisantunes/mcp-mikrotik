@@ -4,6 +4,7 @@ import pytest
 
 from mcp_mikrotik.exceptions import ValidationError
 from mcp_mikrotik.validation import (
+    validate_adaptive_noise_immunity,
     validate_address_list_name,
     validate_allowed_address_list,
     validate_backup_name,
@@ -13,6 +14,8 @@ from mcp_mikrotik.validation import (
     validate_conntrack_dst_port,
     validate_conntrack_protocol,
     validate_container_identifier,
+    validate_dead_man_minutes,
+    validate_dead_man_name,
     validate_dns_name,
     validate_dns_record_type,
     validate_dst_address,
@@ -37,12 +40,18 @@ from mcp_mikrotik.validation import (
     validate_ppp_secret_password,
     validate_ppp_service,
     validate_rate_pair,
+    validate_revert_command,
+    validate_revert_commands,
     validate_route_distance,
     validate_route_gateway,
     validate_target,
     validate_timeout,
     validate_vlan_id,
     validate_wireguard_key,
+    validate_wireless_channel_width,
+    validate_wireless_distance,
+    validate_wireless_frequency,
+    validate_wireless_tx_power,
 )
 
 
@@ -1063,3 +1072,308 @@ def test_validate_ipv6_target_rejects_non_string():
 def test_validate_ipv6_target_rejects_too_long():
     with pytest.raises(ValidationError, match="too long"):
         validate_ipv6_target("1" * 254)
+
+
+# --- v1.11: wireless RF tuning + dead-man -----------------------------------
+
+
+@pytest.mark.parametrize("frequency", [2192, 2412, 5180, 5500, 5725, 6100])
+def test_validate_wireless_frequency_accepts_valid(frequency: int):
+    assert validate_wireless_frequency(frequency) == frequency
+
+
+@pytest.mark.parametrize("frequency", [2191, 6101, 0, -1, 100000])
+def test_validate_wireless_frequency_rejects_out_of_range(frequency: int):
+    with pytest.raises(ValidationError):
+        validate_wireless_frequency(frequency)
+
+
+@pytest.mark.parametrize("frequency", ["5500", 5500.5, None, True, False])
+def test_validate_wireless_frequency_rejects_non_int(frequency):
+    with pytest.raises(ValidationError):
+        validate_wireless_frequency(frequency)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "width",
+    [
+        "20mhz",
+        "5MHZ",
+        "40mhz-turbo",
+        "20/40mhz-Ce",
+        "20/40/80mhz-XXXX",
+        "20/40/80/160mhz-Ceeeeeee",
+    ],
+)
+def test_validate_wireless_channel_width_accepts_valid_case_insensitive(width: str):
+    assert validate_wireless_channel_width(width) == width.strip().lower()
+
+
+@pytest.mark.parametrize("width", ["", "   ", "80mhz", "not-a-width", "20/40mhz"])
+def test_validate_wireless_channel_width_rejects_invalid(width: str):
+    with pytest.raises(ValidationError):
+        validate_wireless_channel_width(width)
+
+
+def test_validate_wireless_channel_width_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_wireless_channel_width(None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("power", [-30, -8, 0, 8, 20, 40])
+def test_validate_wireless_tx_power_accepts_valid(power: int):
+    assert validate_wireless_tx_power(power) == power
+
+
+@pytest.mark.parametrize("power", [-31, 41, -100, 100])
+def test_validate_wireless_tx_power_rejects_out_of_range(power: int):
+    with pytest.raises(ValidationError):
+        validate_wireless_tx_power(power)
+
+
+@pytest.mark.parametrize("power", ["8", 8.5, None, True])
+def test_validate_wireless_tx_power_rejects_non_int(power):
+    with pytest.raises(ValidationError):
+        validate_wireless_tx_power(power)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["none", "CLIENT-MODE", "ap-and-client-mode"])
+def test_validate_adaptive_noise_immunity_accepts_valid_case_insensitive(value: str):
+    assert validate_adaptive_noise_immunity(value) == value.strip().lower()
+
+
+@pytest.mark.parametrize("value", ["", "   ", "turbo-mode"])
+def test_validate_adaptive_noise_immunity_rejects_invalid(value: str):
+    with pytest.raises(ValidationError):
+        validate_adaptive_noise_immunity(value)
+
+
+def test_validate_adaptive_noise_immunity_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_adaptive_noise_immunity(None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("dynamic", "dynamic"), ("INDOORS", "indoors"), (1, "1"), (9, "9"), (1000, "1000")],
+)
+def test_validate_wireless_distance_accepts_valid(value, expected: str):
+    assert validate_wireless_distance(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "far-away", 0, -1, 1001, 999999])
+def test_validate_wireless_distance_rejects_invalid(value):
+    with pytest.raises(ValidationError):
+        validate_wireless_distance(value)
+
+
+def test_validate_wireless_distance_rejects_bool():
+    with pytest.raises(ValidationError):
+        validate_wireless_distance(True)  # type: ignore[arg-type]
+
+
+def test_validate_wireless_distance_rejects_non_int_non_str():
+    with pytest.raises(ValidationError):
+        validate_wireless_distance(9.5)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("minutes", [1, 3, 30, 60])
+def test_validate_dead_man_minutes_accepts_valid(minutes: int):
+    assert validate_dead_man_minutes(minutes) == minutes
+
+
+@pytest.mark.parametrize("minutes", [0, -1, 61, 120])
+def test_validate_dead_man_minutes_rejects_out_of_range(minutes: int):
+    with pytest.raises(ValidationError):
+        validate_dead_man_minutes(minutes)
+
+
+@pytest.mark.parametrize("minutes", ["3", 3.5, None, True])
+def test_validate_dead_man_minutes_rejects_non_int(minutes):
+    with pytest.raises(ValidationError):
+        validate_dead_man_minutes(minutes)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("name", ["deadman-abc0123def", "deadman-0", "deadman-" + "f" * 32])
+def test_validate_dead_man_name_accepts_valid(name: str):
+    assert validate_dead_man_name(name) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        "backup-daily",
+        "deadman-",
+        "deadman-GHOST",
+        "deadman-has spaces",
+        "deadman-" + "f" * 33,
+        "not-deadman-abc123",
+    ],
+)
+def test_validate_dead_man_name_rejects_invalid(name: str):
+    with pytest.raises(ValidationError):
+        validate_dead_man_name(name)
+
+
+def test_validate_dead_man_name_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_dead_man_name(None)  # type: ignore[arg-type]
+
+
+def test_validate_revert_command_accepts_valid():
+    command = '/interface/wireless set [find name="wlan1"] frequency=5500'
+    assert validate_revert_command(command) == command
+
+
+@pytest.mark.parametrize("command", ["", "   "])
+def test_validate_revert_command_rejects_empty(command: str):
+    with pytest.raises(ValidationError):
+        validate_revert_command(command)
+
+
+def test_validate_revert_command_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_revert_command(None)  # type: ignore[arg-type]
+
+
+def test_validate_revert_command_rejects_too_long():
+    with pytest.raises(ValidationError, match="too long"):
+        validate_revert_command("x" * 501)
+
+
+def test_validate_revert_command_rejects_control_characters():
+    with pytest.raises(ValidationError):
+        validate_revert_command('/interface/wireless set [find name="wlan1"]\nfrequency=5500')
+
+
+def test_validate_revert_command_accepts_the_find_name_idiom():
+    """finding 2(a) of the 2026-07 hardening review: `"`/`[`/`]` are
+    deliberately NOT in the unsafe-character set - guard._arm_wireless_revert
+    itself builds every internal revert command with this exact
+    `[find name="X"]` idiom (this package's established stable-identifier
+    convention), so blocking these characters would break
+    set_wireless_channel/set_wireless_tx_power/set_wireless_tuning's own
+    dead-man arming."""
+    command = '/interface/wireless set [find name="wlan1"] frequency=5500 channel-width=20mhz'
+    assert validate_revert_command(command) == command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        '/interface/wireless set [find name="wlan1"] comment=$foo',
+        '/interface/wireless set [find name="wlan1"] frequency=5500; /system reboot',
+        '/interface/wireless set [find name="wlan1"] comment=`whoami`',
+        '/interface/wireless set [find name="wlan1"] comment=a\\b',
+        '/interface/wireless set [find name="wlan1"] comment={foo}',
+        '/interface/wireless set [find name="wlan1"] comment=}',
+    ],
+)
+def test_validate_revert_command_rejects_unsafe_characters(command: str):
+    with pytest.raises(ValidationError):
+        validate_revert_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/system reboot",
+        "/system backup load name=broken.backup",
+        "/user add name=hacker group=full",
+        "/system reset-configuration no-defaults=yes",
+        "/system routerboard upgrade",
+        # Case-insensitive, and matched anywhere in the command (e.g.
+        # smuggled inside a `[...]` nested expression), not just when it's
+        # the leading verb.
+        "/SYSTEM REBOOT",
+        '/interface/wireless set [find name="wlan1"] comment=[/system reboot]',
+    ],
+)
+def test_validate_revert_command_rejects_denied_verbs(command: str):
+    with pytest.raises(ValidationError):
+        validate_revert_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A denylist of verbs alone does not catch these - each is a
+        # genuine, distinct lockout vector (opus re-review, 2026-07-13):
+        # removes a management IP / a route (e.g. the only route back
+        # across an 8.8km PtP link) / all firewall state, respectively.
+        "/ip address remove [find]",
+        "/ip route remove [find]",
+        "/ip firewall filter remove [find]",
+        # The parse-abort vector: an unbalanced quote/bracket passes the
+        # unsafe-character check (it's built entirely from allowed
+        # characters) but would corrupt the on-event script - RouterOS
+        # aborts the WHOLE script at the first unparseable statement, so
+        # the self-remove would never run either.
+        '/interface/wireless set [find name="x',
+        # No `set`/`[find ...]` at all.
+        "/system reboot",
+        # `set` with a selector but nothing to actually set - restores
+        # nothing, not a valid revert statement.
+        '/interface/wireless set [find name="wlan1"]',
+        # Wrong verb even with an otherwise well-formed selector.
+        '/interface/wireless remove [find name="wlan1"]',
+        # A dangerous verb smuggled inside a field VALUE via nested command
+        # substitution - the value charset excludes `[`/`]`/spaces, so this
+        # can't match the field=value shape either.
+        '/interface/wireless set [find name="wlan1"] comment=[/system reboot]',
+    ],
+)
+def test_validate_revert_command_rejects_non_set_find_shape(command: str):
+    """finding 3 follow-up (opus re-review, 2026-07-13): a positive
+    structural allowlist - `/<path> set [find <field>="<value>"]
+    <field>=<value> ...` - replaces the verb denylist as the primary
+    control, closing every gap a denylist-only approach left open."""
+    with pytest.raises(ValidationError):
+        validate_revert_command(command)
+
+
+def test_validate_revert_command_denylist_still_catches_a_verb_hidden_in_a_field_value():
+    """The verb denylist is a redundant, cheap extra layer under the
+    structural allowlist (not the primary control anymore) - proven still
+    exercised: `/user` fits the structural allowlist's field-VALUE charset
+    (letters and `/` are both allowed there, for values like
+    `channel-width=20/40/80mhz-Ceee`), so a value of exactly `/user`
+    passes the shape check and is caught by the denylist instead."""
+    with pytest.raises(ValidationError, match="/user"):
+        validate_revert_command('/interface/wireless set [find name="wlan1"] comment=/user')
+
+
+def test_validate_revert_command_accepts_realistic_set_find_shape():
+    """The exact family of shapes guard._arm_wireless_revert produces -
+    including a mixed-case, slash-containing channel-width value and a
+    space-separated (rather than slash-joined) menu path, both valid
+    RouterOS script - must still pass the new structural allowlist."""
+    command = '/interface wireless set [find name="wlan1"] frequency=5835 channel-width=20/40/80mhz-Ceee'
+    assert validate_revert_command(command) == command
+
+
+def test_validate_revert_commands_accepts_valid_list():
+    commands = ['/interface/wireless set [find name="wlan1"] frequency=5500']
+    assert validate_revert_commands(commands) == commands
+
+
+def test_validate_revert_commands_rejects_empty_list():
+    with pytest.raises(ValidationError):
+        validate_revert_commands([])
+
+
+def test_validate_revert_commands_rejects_non_list():
+    with pytest.raises(ValidationError):
+        validate_revert_commands("not-a-list")  # type: ignore[arg-type]
+
+
+def test_validate_revert_commands_rejects_too_many():
+    with pytest.raises(ValidationError):
+        validate_revert_commands([f'/ip/route set [find dst-address="10.{i}.0.0/24"] distance=1' for i in range(11)])
+
+
+def test_validate_revert_commands_rejects_invalid_item():
+    with pytest.raises(ValidationError):
+        validate_revert_commands(["ok command", ""])
