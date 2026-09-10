@@ -216,12 +216,12 @@ midnight/month boundaries correctly; `arm_dead_man` raises if the device's
 ## [1.10.1] - 2026-07-12
 
 **PoE fix, found testing against a new switch in the fleet: MikroTik
-CRS318-16P-2S+ (ROS6.49.20, 192.168.21.251).**
+CRS318-16P-2S+ (ROS6.49.20).**
 
 - `poe_monitor` (`client.py`, backing `poe_status`): `/interface/ethernet/
   poe/monitor` used to send the port name as `interface=<name>` exclusively
-  - confirmed working in the past against an OmniTik (ROS6, .243) and a
-  mANTBox (ROS7, .237), but **rejected outright by the CRS318** with a
+  - confirmed working in the past against an OmniTik (ROS6) and a
+  mANTBox (ROS7), but **rejected outright by the CRS318** with a
   `TrapError` ("unknown parameter"). `numbers=<name>` (and its batch form,
   `numbers=<name1>,<name2>`) works on the CRS318 and is now sent FIRST;
   `interface=` is only retried as a fallback if `numbers=` itself traps, so
