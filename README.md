@@ -3,7 +3,7 @@
 [![CI](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml/badge.svg)](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml)
 [![Python 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![Coverage ≥95% enforced in CI](https://img.shields.io/badge/coverage-%E2%89%A595%25%20enforced-brightgreen)](.github/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for
 [MikroTik RouterOS](https://mikrotik.com/software) devices. It lets an MCP
@@ -1932,4 +1932,9 @@ sufficient protection for them on its own - see the comment above
 
 ## License
 
-Apache-2.0 - see [LICENSE](LICENSE).
+GPL-3.0-or-later - see [LICENSE](LICENSE).
+
+This project imports [librouteros](https://github.com/luqasz/librouteros)
+(GPL-2.0-or-later) in-process, so the combined work is distributed under the
+GPL. Versions up to 1.11.0 were published as Apache-2.0; from the next release
+on, the whole project is GPL-3.0-or-later.

@@ -4,9 +4,15 @@ version = "1.11.0"
 description = "Model Context Protocol server for managing MikroTik RouterOS devices"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Thalis Antunes" }]
 keywords = ["mcp", "mikrotik", "routeros", "model-context-protocol"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
 dependencies = [
     "mcp>=1.2.0",
     "librouteros>=3.4.0",

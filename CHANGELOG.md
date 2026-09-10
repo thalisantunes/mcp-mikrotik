@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+**License changed from Apache-2.0 to GPL-3.0-or-later.** The runtime
+dependency `librouteros` is GPL-2.0-or-later and is imported in-process, which
+makes this a combined work; the project license now reflects that instead of
+leaving the copyleft dependency undisclosed.
+
 ## [1.11.0] - 2026-07-13
 
 **The dead-man / lockout-proof write primitive, plus the wireless RF tuning
