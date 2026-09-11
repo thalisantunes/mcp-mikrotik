@@ -14,7 +14,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=1.2.0,<2",
     "librouteros>=3.4.0",
     "PyYAML>=6.0",
 ]
