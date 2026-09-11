@@ -1,5 +1,7 @@
 # mcp-mikrotik
 
+<!-- mcp-name: io.github.thalisantunes/mcp-mikrotik -->
+
 [![CI](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml/badge.svg)](https://github.com/thalisantunes/mcp-mikrotik/actions/workflows/ci.yml)
 [![Python 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](pyproject.toml)
 [![Coverage ≥95% enforced in CI](https://img.shields.io/badge/coverage-%E2%89%A595%25%20enforced-brightgreen)](.github/workflows/ci.yml)
