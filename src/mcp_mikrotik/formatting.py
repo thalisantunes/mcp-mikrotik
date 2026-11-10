@@ -379,3 +379,119 @@ def normalize_wireless_registration(row: dict[str, Any]) -> dict[str, Any]:
         "distance": row.get("distance"),
         "uptime": row.get("uptime"),
     }
+
+
+# Unreleased: `/user/group` policy names that let an account holding them
+# CHANGE the device (its configuration, stored state, or running state) or
+# READ secret material (stored or in transit) - shared by server.py's
+# `user_groups` read tool via `normalize_user_group` below. Deliberately
+# conservative within that definition: a policy is counted if it can change
+# or expose anything at all, even only the account's own password (`password`)
+# or the device's uptime (`reboot`). The per-policy reasoning,
+# and why `test`/`romon`/the login-channel policies are NOT counted, lives in
+# `normalize_user_group`'s docstring (and README's "AAA/PKI visibility").
+WRITE_CAPABLE_USER_POLICIES = frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"})
+
+
+def parse_ros_policy(value: Any) -> tuple[list[str], list[str]] | None:
+    """Split a RouterOS `/user/group` `policy` field into
+    `(enabled, negated)` - two sorted, de-duplicated lists of lower-case
+    policy names - or `None` if `value` isn't a string at all (an unexpected
+    reply shape: the caller should treat the group's rights as UNKNOWN, never
+    as "no rights").
+
+    RouterOS sends `policy` as one comma-separated string, e.g.
+    `"local,ssh,read,api"`. Some RouterOS versions also list every policy the
+    group does NOT have, prefixed with `!` (e.g.
+    `"local,ssh,read,api,!ftp,!write,!policy,!sensitive"`); those go into
+    `negated`, without the `!`. Whitespace and empty items are ignored.
+
+    A name that appears both enabled and negated in the same (malformed)
+    string is reported as ENABLED only - the conservative reading, so a
+    contradictory reply can never make a group look less privileged than
+    it might be.
+    """
+    if not isinstance(value, str):
+        return None
+    enabled: set[str] = set()
+    negated: set[str] = set()
+    for item in value.split(","):
+        name = item.strip().lower()
+        if name.startswith("!"):
+            name = name[1:].strip()
+            if name:
+                negated.add(name)
+        elif name:
+            enabled.add(name)
+    return sorted(enabled), sorted(negated - enabled)
+
+
+def normalize_user_group(row: dict[str, Any]) -> dict[str, Any]:
+    """Project one `/user/group` row onto the fixed shape `user_groups`
+    reports: `name`, `policy` (sorted list of ENABLED policies),
+    `negated_policy` (sorted list of policies RouterOS explicitly lists as
+    `!`-negated, if any), `skin`, `comment`, `can_write`, and
+    `write_capable_policies` (the enabled policies that made `can_write`
+    true, sorted - empty when it is false).
+
+    An explicit projection, NOT a pass-through of the raw row: only the
+    fields above can ever be returned, so an unexpected extra field on a
+    future RouterOS version can never leak through this tool. Missing source
+    fields come back as `None` (never fabricated).
+
+    `can_write` is `True` when the group has at least one policy from
+    `WRITE_CAPABLE_USER_POLICIES`, chosen from MikroTik's documented meaning
+    of each policy:
+
+      - `write`: change the device configuration.
+      - `policy`: manage users and groups - an account with it can grant
+        itself (or a new account) `full`, so it is equivalent to everything.
+      - `sensitive`: see passwords and other sensitive values that are
+        otherwise hidden from a `read` account.
+      - `ftp`: upload files to device storage (RouterOS runs uploaded
+        `*.auto.rsc` scripts and installs uploaded packages on reboot) and
+        download files such as backups/exports, which can carry credentials.
+      - `reboot`: restart the device - a change to its running state that
+        takes every service on it down.
+      - `password`: change the account's own stored password - a persisted
+        write to `/user`, and enough to lock other holders of a shared
+        service account out.
+      - `sniff`: run the packet sniffer, which can capture transit traffic
+        (possibly carrying other systems' cleartext credentials) and stream
+        it off the device.
+
+    NOT counted, also deliberately: `read` (the baseline; sensitive values
+    stay hidden without `sensitive`), `test` (ping/traceroute/bandwidth-test/
+    wireless scan - needed by this package's own `ping`/`traceroute`; a
+    bandwidth test can load a link and a wireless scan interrupts that
+    radio's clients, but neither changes configuration or reveals a secret),
+    `romon` (use this device as a RoMON hop toward OTHER RoMON-enabled
+    devices, which authenticate that session themselves - it changes nothing
+    here), and the login-channel policies (`local`, `telnet`, `ssh`, `web`,
+    `winbox`, `api`, `rest-api`, `dude`, `tikapp`), which control HOW an
+    account can log in, not WHAT it can do once logged in. A policy name not
+    listed anywhere here (e.g. one added by a future RouterOS version) is
+    still reported in `policy` but does not affect `can_write`.
+
+    `can_write` is `None` (unknown) when the row has no usable `policy`
+    field at all - RouterOS always sends one, so this only happens on an
+    unexpected reply. Only `can_write is False` means "verified to hold no
+    write-capable policy"; treat `None` as NOT verified.
+    """
+    parsed = parse_ros_policy(row.get("policy"))
+    if parsed is None:
+        enabled: list[str] = []
+        negated: list[str] = []
+        can_write: bool | None = None
+    else:
+        enabled, negated = parsed
+        can_write = any(name in WRITE_CAPABLE_USER_POLICIES for name in enabled)
+    return {
+        "name": row.get("name"),
+        "policy": enabled,
+        "negated_policy": negated,
+        "skin": row.get("skin"),
+        "comment": row.get("comment"),
+        "can_write": can_write,
+        "write_capable_policies": [name for name in enabled if name in WRITE_CAPABLE_USER_POLICIES],
+    }

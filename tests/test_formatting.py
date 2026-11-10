@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 
 from mcp_mikrotik.formatting import (
+    WRITE_CAPABLE_USER_POLICIES,
     coerce_ros_bool,
     coerce_ros_number,
     days_until,
     filter_disabled,
+    normalize_user_group,
     normalize_wireless_registration,
     parse_ros_datetime,
+    parse_ros_policy,
     ros_bool,
     rows_to_list,
     split_address_port,
@@ -354,4 +357,75 @@ def test_normalize_wireless_registration_missing_fields_are_none():
         "rx_rate": None,
         "distance": None,
         "uptime": None,
+    }
+
+
+# --- parse_ros_policy / normalize_user_group (user_groups) --------------------
+
+
+def test_parse_ros_policy_splits_enabled_and_negated_sorted():
+    enabled, negated = parse_ros_policy("ssh,read,api,!write,!ftp")
+    assert enabled == ["api", "read", "ssh"]
+    assert negated == ["ftp", "write"]
+
+
+def test_parse_ros_policy_ignores_whitespace_case_empty_items_and_duplicates():
+    enabled, negated = parse_ros_policy(" Read , API,,read, ! Write ,!, ")
+    assert enabled == ["api", "read"]
+    assert negated == ["write"]
+
+
+def test_parse_ros_policy_empty_string_is_no_policies():
+    assert parse_ros_policy("") == ([], [])
+
+
+def test_parse_ros_policy_none_for_non_string():
+    assert parse_ros_policy(None) is None
+    assert parse_ros_policy(["read", "write"]) is None
+
+
+def test_parse_ros_policy_contradictory_entry_counts_as_enabled():
+    """Conservative reading of a malformed reply: a policy both enabled and
+    negated is reported as enabled only, never as negated."""
+    enabled, negated = parse_ros_policy("read,write,!write")
+    assert enabled == ["read", "write"]
+    assert negated == []
+
+
+def test_write_capable_user_policies_is_exactly_the_documented_set():
+    """Pinned so widening or narrowing what `can_write` means is always a
+    deliberate, reviewed change (docstring + README + CHANGELOG)."""
+    assert frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"}) == (
+        WRITE_CAPABLE_USER_POLICIES
+    )
+
+
+def test_normalize_user_group_full_shape():
+    row = {
+        ".id": "*9",
+        "name": "ops",
+        "policy": "read,api,reboot,!write",
+        "skin": "custom-skin",
+        "comment": "ops team",
+    }
+    assert normalize_user_group(row) == {
+        "name": "ops",
+        "policy": ["api", "read", "reboot"],
+        "negated_policy": ["write"],
+        "skin": "custom-skin",
+        "comment": "ops team",
+        "can_write": True,
+        "write_capable_policies": ["reboot"],
+    }
+
+
+def test_normalize_user_group_missing_fields_are_none_and_can_write_unknown():
+    assert normalize_user_group({}) == {
+        "name": None,
+        "policy": [],
+        "negated_policy": [],
+        "skin": None,
+        "comment": None,
+        "can_write": None,
+        "write_capable_policies": [],
     }

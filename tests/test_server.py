@@ -12,6 +12,7 @@ import pytest
 from librouteros.exceptions import LibRouterosError
 from mcp.server.fastmcp.exceptions import ToolError
 
+from mcp_mikrotik import audit
 from mcp_mikrotik.client import MikrotikClient
 from mcp_mikrotik.config import Device, Settings
 from mcp_mikrotik.exceptions import DeviceCommandError
@@ -112,6 +113,7 @@ EXPECTED_TOOLS = {
     "disable_mangle_rule",
     "certificates",
     "users",
+    "user_groups",
     "user_active",
     "radius",
     "ntp_client",
@@ -4032,6 +4034,194 @@ async def test_users_returns_empty_when_menu_absent(settings: Settings):
     fake = FakeConnection(raise_for={("user",): LibRouterosError("no such command")})
     mcp = build_server(settings=settings, client_factory=_factory(fake))
     _content, result = await mcp.call_tool("users", {"device_name": "core-switch"})
+    assert result["result"] == []
+
+
+# --- user_groups (read-only, `/user/group` policies + computed can_write) ----
+
+_USER_GROUP_KEYS = {"name", "policy", "negated_policy", "skin", "comment", "can_write", "write_capable_policies"}
+
+
+def _user_groups_server(settings: Settings, rows: list[dict]):
+    fake = FakeConnection(data={("user", "group"): rows})
+    return build_server(settings=settings, client_factory=_factory(fake))
+
+
+@pytest.mark.asyncio
+async def test_user_groups_happy_path_default_groups(settings: Settings, fake_connection: FakeConnection):
+    """The three built-in groups, through the real MCP tool layer and with
+    the default read-only settings (this is a read tool - never gated)."""
+    assert settings.allow_write is False
+    mcp = build_server(settings=settings, client_factory=_factory(fake_connection))
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    groups = {row["name"]: row for row in result["result"]}
+    assert list(groups) == ["read", "write", "full"]
+
+    read = groups["read"]
+    assert read["policy"] == [
+        "api",
+        "local",
+        "password",
+        "read",
+        "reboot",
+        "rest-api",
+        "romon",
+        "sniff",
+        "ssh",
+        "telnet",
+        "test",
+        "web",
+        "winbox",
+    ]
+    assert read["negated_policy"] == ["ftp", "policy", "sensitive", "write"]
+    assert read["skin"] == "default"
+    assert read["comment"] is None
+    # Deliberately conservative: the built-in `read` group can still reboot
+    # the device, change its own password and run the packet sniffer.
+    assert read["can_write"] is True
+    assert read["write_capable_policies"] == ["password", "reboot", "sniff"]
+
+    write = groups["write"]
+    assert "write" in write["policy"]
+    assert write["negated_policy"] == ["ftp", "policy", "sensitive"]
+    assert write["can_write"] is True
+    assert write["write_capable_policies"] == ["password", "reboot", "sniff", "write"]
+
+    full = groups["full"]
+    assert full["negated_policy"] == []
+    assert full["can_write"] is True
+    assert full["write_capable_policies"] == ["ftp", "password", "policy", "reboot", "sensitive", "sniff", "write"]
+
+    for row in result["result"]:
+        assert set(row) == _USER_GROUP_KEYS
+
+
+@pytest.mark.asyncio
+async def test_user_groups_custom_group_with_negated_policies(settings: Settings):
+    """A custom least-privilege group: RouterOS's `!`-negated entries land
+    in `negated_policy` (without the `!`), never in `policy`, and the group
+    is verified NOT write-capable."""
+    mcp = _user_groups_server(
+        settings,
+        [
+            {
+                ".id": "*4",
+                "name": "monitoring",
+                "policy": "read,api,test,!local,!telnet,!ssh,!ftp,!reboot,!write,!policy,!winbox,!password,"
+                "!web,!sniff,!sensitive,!romon,!rest-api",
+                "skin": "default",
+                "comment": "read-only monitoring",
+            }
+        ],
+    )
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["name"] == "monitoring"
+    assert row["policy"] == ["api", "read", "test"]
+    assert row["negated_policy"] == [
+        "ftp",
+        "local",
+        "password",
+        "policy",
+        "reboot",
+        "rest-api",
+        "romon",
+        "sensitive",
+        "sniff",
+        "ssh",
+        "telnet",
+        "web",
+        "winbox",
+        "write",
+    ]
+    assert row["comment"] == "read-only monitoring"
+    assert row["can_write"] is False
+    assert row["write_capable_policies"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"])
+async def test_user_groups_can_write_true_for_each_write_capable_policy(settings: Settings, policy: str):
+    """Each write-capable policy, on its own on top of `read,api`, is enough
+    to flip can_write - none is silently ignored."""
+    mcp = _user_groups_server(settings, [{"name": "custom", "policy": f"read,api,{policy}"}])
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["can_write"] is True
+    assert row["write_capable_policies"] == [policy]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy_string",
+    [
+        "read",
+        "read,api",
+        "read,api,test",
+        "read,api,romon",
+        "local,telnet,ssh,read,test,winbox,web,api,romon,rest-api,dude,tikapp",
+        "",
+    ],
+)
+async def test_user_groups_can_write_false_without_a_write_capable_policy(settings: Settings, policy_string: str):
+    """`read`, `test`, `romon` and the login-channel policies are NOT
+    write-capable (see formatting.normalize_user_group's docstring), and a
+    group with no policies at all is trivially not write-capable either."""
+    mcp = _user_groups_server(settings, [{"name": "custom", "policy": policy_string}])
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["can_write"] is False
+    assert row["write_capable_policies"] == []
+
+
+@pytest.mark.asyncio
+async def test_user_groups_can_write_unknown_when_policy_field_missing(settings: Settings):
+    """No usable `policy` field means the group's rights are UNKNOWN -
+    `can_write` must be None, never a reassuring False."""
+    mcp = _user_groups_server(settings, [{"name": "odd-group"}])
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["can_write"] is None
+    assert row["policy"] == []
+    assert row["negated_policy"] == []
+    assert row["write_capable_policies"] == []
+
+
+@pytest.mark.asyncio
+async def test_user_groups_never_returns_a_secret_shaped_key(settings: Settings):
+    """SECURITY: `/user/group` carries no password or key today, but the
+    tool is an explicit projection - an unexpected secret-shaped field on
+    some future reply (or any other extra field) must never pass through."""
+    marker = "FAKE-GROUP-SECRET-MUST-NEVER-LEAK"
+    mcp = _user_groups_server(
+        settings,
+        [
+            {
+                ".id": "*1",
+                "name": "full",
+                "policy": "read,write,policy,sensitive",
+                "skin": "default",
+                "comment": "",
+                "password": marker,
+                "secret": marker,
+                "private-key": marker,
+                "token": marker,
+            }
+        ],
+    )
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert set(row) == _USER_GROUP_KEYS
+    # Same secret-shaped-name test the audit journal's backstop uses.
+    assert not [key for key in row if audit._SENSITIVE_KEY.search(key)]
+    assert marker not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_user_groups_returns_empty_when_menu_absent(settings: Settings):
+    fake = FakeConnection(raise_for={("user", "group"): LibRouterosError("no such command")})
+    mcp = build_server(settings=settings, client_factory=_factory(fake))
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
     assert result["result"] == []
 
 

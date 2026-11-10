@@ -10,6 +10,40 @@ dependency `librouteros` is GPL-2.0-or-later and is imported in-process, which
 makes this a combined work; the project license now reflects that instead of
 leaving the copyleft dependency undisclosed.
 
+**New read-only tool `user_groups`** (`/user/group`, AAA visibility): `users`
+reports each account's group NAME but not what that group may do, so an
+operator could not check from an MCP client whether an API account - for
+example a monitoring account, or the one this server itself logs in with -
+is really least-privilege, especially with custom groups.
+
+- Each group: `name`, `policy` (RouterOS's comma-separated policy string
+  parsed into a sorted list of enabled policies), `negated_policy` (the
+  policies RouterOS lists as explicitly `!`-negated, if any), `skin`,
+  `comment`, a computed `can_write`, and `write_capable_policies` (which
+  enabled policies made `can_write` true).
+- `can_write` is true if the group holds any of `write`, `policy`,
+  `sensitive`, `ftp`, `reboot`, `password` or `sniff` - anything that lets
+  an account change the device's configuration, stored state or running
+  state, or read secret material. Conservative on purpose: on stock
+  RouterOS the built-in `read` group usually reports `can_write: true`
+  (it includes `reboot`, `password` and `sniff`). `read`, `test`, `romon`
+  and the login-channel policies (`api`, `ssh`, `winbox`, ...) are not
+  counted. `None` (unknown, not verified) if a row has no usable `policy`
+  field. Per-policy reasoning in `formatting.normalize_user_group` and
+  README's "AAA/PKI visibility".
+- **SECURITY**: an explicit projection of the fields above, never a
+  pass-through of the raw row, so an unexpected field on a future RouterOS
+  reply can't leak through; `/user/group` carries no password or key in the
+  first place. See `test_user_groups_never_returns_a_secret_shaped_key`.
+- Returns an empty list (never an error) if `/user/group` is unavailable,
+  same convention as `users`. READ only - there is no `/user/group` write.
+- New helpers in `formatting.py`: `parse_ros_policy`,
+  `normalize_user_group`, and the pinned `WRITE_CAPABLE_USER_POLICIES` set.
+- README's "AAA/PKI visibility" section now describes how to combine
+  `list_devices` (the configured `username`), `users` (that account's
+  `group`) and `user_groups` (that group's `can_write`) to check this
+  server's own account.
+
 ## [1.11.0] - 2026-07-13
 
 **The dead-man / lockout-proof write primitive, plus the wireless RF tuning

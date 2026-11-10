@@ -36,6 +36,9 @@ set_wireless_tx_power/set_wireless_tuning (RF tuning on
 `/interface/wireless`) and the reusable dead-man primitive itself,
 arm_dead_man/cancel_dead_man - see guard.py's module note above their
 ALLOWLIST entries and README's "Dead-man / lockout-proof writes" section.
+(Unreleased) one more read-only tool - user_groups (`/user/group` policies
+plus a computed `can_write`, so a caller can check what the `group` name
+`users` reports actually allows - see "AAA/PKI visibility" in README).
 Transport is stdio only - this process is meant to run on
 the operator's own machine, launched by an MCP client (e.g. Claude Code)
 over stdio, with no network exposure at all.
@@ -68,6 +71,7 @@ from .formatting import (
     coerce_ros_number,
     days_until,
     filter_disabled,
+    normalize_user_group,
     normalize_wireless_registration,
     rows_to_list,
     split_address_port,
@@ -1403,6 +1407,51 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             return rows_to_list(client.path("user"))
         except DeviceCommandError:
             return []
+
+    @mcp.tool()
+    @_safe
+    def user_groups(device_name: str) -> list[dict[str, Any]]:
+        """List RouterOS user groups (`/user/group`) and what each one may
+        actually DO - the rights behind the `group` name `users` reports.
+
+        Each entry: `name`, `policy` (sorted list of ENABLED policies,
+        parsed from RouterOS's comma-separated string), `negated_policy`
+        (policies RouterOS lists as explicitly `!`-negated, if any), `skin`,
+        `comment`, `can_write`, and `write_capable_policies` (which enabled
+        policies made `can_write` true).
+
+        `can_write` is true if the group holds ANY of `write`, `policy`,
+        `sensitive`, `ftp`, `reboot`, `password`, `sniff` - anything that
+        lets an account change the device's configuration/stored/running
+        state or read secret material (stored or in transit). Conservative
+        on purpose: on stock RouterOS even the built-in `read` group
+        usually includes `reboot`/`password`/`sniff` and so reports
+        `can_write: true`. NOT counted: `read`, `test` (ping/traceroute,
+        which this package's own `ping`/`traceroute` tools need), `romon`,
+        and the login-channel policies (`api`, `ssh`, `winbox`, ...). See
+        `formatting.normalize_user_group` for the per-policy reasoning.
+        `can_write` is `None` (unknown - NOT verified) if a row carries no
+        usable `policy` field.
+
+        To check that the account THIS server logs in with is
+        least-privilege: `list_devices` gives the device's `username`,
+        `users` gives that account's `group`, and this tool gives that
+        group's `can_write`/`write_capable_policies`.
+
+        A READ only (no `/user/group` write exists in this package). Only
+        the fields above are ever returned - an explicit projection, never
+        a pass-through of the raw row - and `/user/group` carries no
+        password or key in the first place.
+
+        Returns an empty list (never an error) if `/user/group` is
+        unavailable, same convention as `users`.
+        """
+        client = _client(device_name)
+        try:
+            rows = rows_to_list(client.path("user", "group"))
+        except DeviceCommandError:
+            return []
+        return [normalize_user_group(row) for row in rows]
 
     @mcp.tool()
     @_safe
