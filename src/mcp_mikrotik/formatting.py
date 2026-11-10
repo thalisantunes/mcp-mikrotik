@@ -386,11 +386,21 @@ def normalize_wireless_registration(row: dict[str, Any]) -> dict[str, Any]:
 # READ secret material (stored or in transit) - shared by server.py's
 # `user_groups` read tool via `normalize_user_group` below. Deliberately
 # conservative within that definition: a policy is counted if it can change
-# or expose anything at all, even only the account's own password (`password`)
-# or the device's uptime (`reboot`). The per-policy reasoning,
-# and why `test`/`romon`/the login-channel policies are NOT counted, lives in
-# `normalize_user_group`'s docstring (and README's "AAA/PKI visibility").
-WRITE_CAPABLE_USER_POLICIES = frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"})
+# or expose anything at all, even only the account's own password (`password`),
+# the device's uptime (`reboot`) or a file in device storage (`test`, via
+# `/tool fetch`). The per-policy reasoning lives in `normalize_user_group`'s
+# docstring (and README's "AAA/PKI visibility").
+WRITE_CAPABLE_USER_POLICIES = frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff", "test"})
+
+# Unreleased: the `/user/group` policy names KNOWN not to be write-capable in
+# the sense above - `read`, `romon` and the login-channel policies. Any
+# enabled policy in neither this set nor `WRITE_CAPABLE_USER_POLICIES` (e.g.
+# one a future RouterOS version adds) is UNKNOWN, and makes `can_write`
+# `None` rather than `False`: `user_groups` fails closed. Reasoning in
+# `normalize_user_group`'s docstring.
+NON_WRITE_USER_POLICIES = frozenset(
+    {"read", "romon", "local", "telnet", "ssh", "web", "winbox", "api", "rest-api", "dude", "tikapp"}
+)
 
 
 def parse_ros_policy(value: Any) -> tuple[list[str], list[str]] | None:
@@ -403,8 +413,8 @@ def parse_ros_policy(value: Any) -> tuple[list[str], list[str]] | None:
     RouterOS sends `policy` as one comma-separated string, e.g.
     `"local,ssh,read,api"`. Some RouterOS versions also list every policy the
     group does NOT have, prefixed with `!` (e.g.
-    `"local,ssh,read,api,!ftp,!write,!policy,!sensitive"`); those go into
-    `negated`, without the `!`. Whitespace and empty items are ignored.
+    `"local,ssh,read,api,!ftp,!write,!policy"`); those go into `negated`,
+    without the `!`. Whitespace and empty items are ignored.
 
     A name that appears both enabled and negated in the same (malformed)
     string is reported as ENABLED only - the conservative reading, so a
@@ -430,9 +440,10 @@ def normalize_user_group(row: dict[str, Any]) -> dict[str, Any]:
     """Project one `/user/group` row onto the fixed shape `user_groups`
     reports: `name`, `policy` (sorted list of ENABLED policies),
     `negated_policy` (sorted list of policies RouterOS explicitly lists as
-    `!`-negated, if any), `skin`, `comment`, `can_write`, and
+    `!`-negated, if any), `skin`, `comment`, `can_write`,
     `write_capable_policies` (the enabled policies that made `can_write`
-    true, sorted - empty when it is false).
+    true, sorted - empty when there are none), and `unknown_policies` (the
+    enabled policies this module does not classify, sorted - normally empty).
 
     An explicit projection, NOT a pass-through of the raw row: only the
     fields above can ever be returned, so an unexpected extra field on a
@@ -440,14 +451,20 @@ def normalize_user_group(row: dict[str, Any]) -> dict[str, Any]:
     fields come back as `None` (never fabricated).
 
     `can_write` is `True` when the group has at least one policy from
-    `WRITE_CAPABLE_USER_POLICIES`, chosen from MikroTik's documented meaning
-    of each policy:
+    `WRITE_CAPABLE_USER_POLICIES`. The meanings below come from MikroTik's
+    documentation (the RouterOS "User" manual page and the `/user group`
+    reference); they have not been checked policy-by-policy on hardware:
 
-      - `write`: change the device configuration.
-      - `policy`: manage users and groups - an account with it can grant
-        itself (or a new account) `full`, so it is equivalent to everything.
-      - `sensitive`: see passwords and other sensitive values that are
-        otherwise hidden from a `read` account.
+      - `write`: change the device configuration (everything except user
+        management).
+      - `policy`: user-management rights. MikroTik says to pair it with
+        `write`; with `write`, an account can grant any group - including
+        `full` - to itself or to a new account.
+      - `sensitive`: lets the account switch off RouterOS's "hide
+        sensitive" setting, i.e. see passwords, keys and other secret
+        values that are hidden from an account without it. Note that the
+        STOCK `read` and `write` groups both include `sensitive`, so on a
+        default device even a `read` account can see secrets.
       - `ftp`: upload files to device storage (RouterOS runs uploaded
         `*.auto.rsc` scripts and installs uploaded packages on reboot) and
         download files such as backups/exports, which can carry credentials.
@@ -456,36 +473,54 @@ def normalize_user_group(row: dict[str, Any]) -> dict[str, Any]:
       - `password`: change the account's own stored password - a persisted
         write to `/user`, and enough to lock other holders of a shared
         service account out.
-      - `sniff`: run the packet sniffer, which can capture transit traffic
-        (possibly carrying other systems' cleartext credentials) and stream
-        it off the device.
+      - `sniff`: run the packet sniffer, torch and the traffic generator.
+        The sniffer can capture transit traffic (possibly carrying other
+        systems' cleartext credentials) and stream it off the device; the
+        traffic generator can flood a link. This package's own `torch` tool
+        needs `sniff`.
+      - `test`: ping, traceroute, bandwidth-test and wireless scan, but per
+        MikroTik also snooper, `fetch`, `email` and other test tools.
+        `/tool fetch` can save a downloaded file to device storage (stored
+        state) and upload a device file - a backup or export, say - to a
+        remote server, and `/tool e-mail` can send files off the device.
+        This package's own `ping`/`traceroute` tools need `test`, so an
+        account that holds it only for them still reports `can_write: True`
+        with `write_capable_policies == ["test"]` - the honest answer, since
+        the same account can also run `fetch`.
 
-    NOT counted, also deliberately: `read` (the baseline; sensitive values
-    stay hidden without `sensitive`), `test` (ping/traceroute/bandwidth-test/
-    wireless scan - needed by this package's own `ping`/`traceroute`; a
-    bandwidth test can load a link and a wireless scan interrupts that
-    radio's clients, but neither changes configuration or reveals a secret),
-    `romon` (use this device as a RoMON hop toward OTHER RoMON-enabled
-    devices, which authenticate that session themselves - it changes nothing
-    here), and the login-channel policies (`local`, `telnet`, `ssh`, `web`,
-    `winbox`, `api`, `rest-api`, `dude`, `tikapp`), which control HOW an
-    account can log in, not WHAT it can do once logged in. A policy name not
-    listed anywhere here (e.g. one added by a future RouterOS version) is
-    still reported in `policy` but does not affect `can_write`.
+    NOT counted (`NON_WRITE_USER_POLICIES`): `read` (the baseline; secret
+    values stay hidden without `sensitive`), `romon` (use this device as a
+    RoMON hop toward OTHER RoMON-enabled devices, which authenticate that
+    session themselves - it changes nothing here), and the login-channel
+    policies (`local`, `telnet`, `ssh`, `web`, `winbox`, `api`, `rest-api`,
+    `dude`, `tikapp`), which control HOW an account can log in, not WHAT it
+    can do once logged in.
 
-    `can_write` is `None` (unknown) when the row has no usable `policy`
-    field at all - RouterOS always sends one, so this only happens on an
-    unexpected reply. Only `can_write is False` means "verified to hold no
-    write-capable policy"; treat `None` as NOT verified.
+    Fails closed: an enabled policy in NEITHER set (e.g. one added by a
+    future RouterOS version) is listed in `unknown_policies` and, unless a
+    known write-capable policy already made `can_write` `True`, makes
+    `can_write` `None` (unknown) instead of `False`. `can_write` is also
+    `None` when the row has no usable `policy` field at all - RouterOS
+    always sends one, so this only happens on an unexpected reply. Only
+    `can_write is False` means "verified to hold no write-capable policy";
+    treat `None` as NOT verified. Negated policies never affect `can_write`.
     """
     parsed = parse_ros_policy(row.get("policy"))
-    if parsed is None:
-        enabled: list[str] = []
-        negated: list[str] = []
-        can_write: bool | None = None
-    else:
+    enabled: list[str] = []
+    negated: list[str] = []
+    write_capable: list[str] = []
+    unknown: list[str] = []
+    can_write: bool | None = None
+    if parsed is not None:
         enabled, negated = parsed
-        can_write = any(name in WRITE_CAPABLE_USER_POLICIES for name in enabled)
+        write_capable = [name for name in enabled if name in WRITE_CAPABLE_USER_POLICIES]
+        unknown = [
+            name for name in enabled if name not in WRITE_CAPABLE_USER_POLICIES and name not in NON_WRITE_USER_POLICIES
+        ]
+        if write_capable:
+            can_write = True
+        elif not unknown:
+            can_write = False
     return {
         "name": row.get("name"),
         "policy": enabled,
@@ -493,5 +528,6 @@ def normalize_user_group(row: dict[str, Any]) -> dict[str, Any]:
         "skin": row.get("skin"),
         "comment": row.get("comment"),
         "can_write": can_write,
-        "write_capable_policies": [name for name in enabled if name in WRITE_CAPABLE_USER_POLICIES],
+        "write_capable_policies": write_capable,
+        "unknown_policies": unknown,
     }

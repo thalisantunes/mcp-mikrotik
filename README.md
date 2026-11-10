@@ -59,7 +59,7 @@ retry, circuit breaker. See `CHANGELOG.md` for the full version-by-version
 history, and `ROADMAP.md` for what's next (and what's deliberately out of
 scope, and why).
 
-The full pytest suite currently has 1866 tests (115 tools), all passing
+The full pytest suite currently has 1872 tests (115 tools), all passing
 against an in-memory fake device layer (`pytest -q`), at 100% line coverage
 (CI enforces a 95% floor) - see "Development & CI" below. Many tools are
 additionally smoke-tested against real ROS6/ROS7 hardware before release
@@ -250,7 +250,7 @@ representative exchanges:
 | `list_backups` | List backup files on the device (`/file`, filtered to `*.backup`): name, size, creation-time. See "Backup" below. |
 | `certificates` | List certificates (`/certificate`): name, common-name, subject/issuer fields, invalid-before/invalid-after (raw), key-size/key-type, fingerprint, `expired`/`trusted` flags. Adds a computed `daysUntilExpiry` from invalid-after when parseable. **Never exposes a `private-key`**, even defensively. See "AAA/PKI visibility" below. |
 | `users` | List RouterOS login accounts (`/user`): name, group, address (allowed-source restriction), last-logged-in, disabled, comment. `/user` never exposes a password over the API. Read only - no `/user` creation/edit (see "Roadmap & non-goals"). See "AAA/PKI visibility" below. |
-| `user_groups` | List RouterOS user groups (`/user/group`): name, `policy` (sorted list of enabled policies), `negated_policy` (`!`-negated ones), skin, comment, plus a computed `can_write` and the `write_capable_policies` behind it - what the `group` name `users` reports actually allows. Read only. See "AAA/PKI visibility" below. |
+| `user_groups` | List RouterOS user groups (`/user/group`): name, `policy` (sorted list of enabled policies), `negated_policy` (`!`-negated ones), skin, comment, plus a computed `can_write`, the `write_capable_policies` behind it and any `unknown_policies` (which make `can_write` `None`, not `false`) - what the `group` name `users` reports actually allows. Read only. See "AAA/PKI visibility" below. |
 | `user_active` | List currently active RouterOS management login sessions (`/user/active`: name, address, via, when) - who's logged into the device's own admin interface right now. |
 | `radius` | List RADIUS server configuration (`/radius`): service, address, timeout, accounting-port, authentication-port. **Never exposes the shared `secret`**, same redaction mechanism as `ppp_secrets`. See "AAA/PKI visibility" below. |
 | `interface_monitor` | Link/optical status of one ethernet `interface` (`/interface/ethernet/monitor once=yes`): status, rate, full-duplex, auto-negotiation, plus SFP/DDM optics fields when the port has an SFP cage and a module is present. Empty dict (not an error) with no reply. See "SFP/optical monitor, DHCP-server config, bridge VLAN filtering" below. |
@@ -1244,44 +1244,68 @@ the rights behind the `group` name `users` reports, which matters most for
 custom groups: `name`, `policy` (RouterOS's comma-separated policy string
 parsed into a sorted list of enabled policies), `negated_policy` (the
 policies RouterOS lists as explicitly `!`-negated, if any), `skin`,
-`comment`, a computed `can_write`, and `write_capable_policies` (which
-enabled policies made `can_write` true). `can_write` is true if the group
-holds any of `write`, `policy`, `sensitive`, `ftp`, `reboot`, `password` or
-`sniff` - anything that lets an account change the device's configuration,
-stored state or running state, or read secret material:
+`comment`, a computed `can_write`, `write_capable_policies` (which enabled
+policies made `can_write` true), and `unknown_policies` (enabled policies
+this package does not classify - normally empty). `can_write` is true if
+the group holds any of `write`, `policy`, `sensitive`, `ftp`, `reboot`,
+`password`, `sniff` or `test` - anything that lets an account change the
+device's configuration, stored state or running state, or read secret
+material. The meanings below come from MikroTik's documentation (the
+RouterOS "User" manual page and the `/user group` reference); they have not
+been checked policy-by-policy on hardware:
 
 | Policy | Why it counts |
 |---|---|
-| `write` | Changes the configuration. |
-| `policy` | Manages users and groups - can grant itself `full`. |
-| `sensitive` | Reveals passwords/keys otherwise hidden from a `read` account. |
+| `write` | Changes the configuration (everything except user management). |
+| `policy` | User-management rights (normally paired with `write`; with it, can grant any group, including `full`). |
+| `sensitive` | Lets the account turn off "hide sensitive" and see passwords/keys. **The stock `read` and `write` groups include it**, so on a default device even a `read` account can see secrets. |
 | `ftp` | Uploads files (RouterOS runs uploaded `*.auto.rsc` scripts and installs uploaded packages on reboot) and downloads backups/exports, which can carry credentials. |
 | `reboot` | Restarts the device, taking every service on it down. |
 | `password` | Changes the account's own stored password - a persisted write, and enough to lock other holders of a shared account out. |
-| `sniff` | Runs the packet sniffer, which can capture transit traffic (possibly other systems' cleartext credentials) and stream it off the device. |
+| `sniff` | Runs the packet sniffer, torch and the traffic generator. The sniffer can capture transit traffic (possibly other systems' cleartext credentials) and stream it off the device; the traffic generator can flood a link. |
+| `test` | Ping, traceroute, bandwidth-test and wireless scan, but per MikroTik also snooper, `fetch`, `email` and other test tools. `/tool fetch` can save a downloaded file to device storage and upload a device file (a backup or export, say) to a remote host; `/tool e-mail` can send files off the device. |
 
-Not counted: `read`, `test` (ping/traceroute/bandwidth-test/wireless scan -
-this package's own `ping`/`traceroute` need it; it can load a link or
-interrupt a radio's clients, but changes no configuration and reveals no
-secret), `romon` (a hop toward other RoMON-enabled devices, which
-authenticate that session themselves), and the login-channel policies
+Not counted: `read`, `romon` (a hop toward other RoMON-enabled devices,
+which authenticate that session themselves), and the login-channel policies
 (`local`, `telnet`, `ssh`, `web`, `winbox`, `api`, `rest-api`, `dude`,
 `tikapp`), which control how an account logs in, not what it can do. The
-definition is conservative on purpose, so on stock RouterOS **even the
-built-in `read` group usually reports `can_write: true`** (it includes
-`reboot`, `password` and `sniff`) - a genuinely read-only account needs a
-custom group (e.g. `read,api`, plus `test` if you want `ping`/`traceroute`).
-`can_write` is `None` (unknown - treat it as NOT verified) if a row carries
-no usable `policy` field. Only an explicit set of fields is ever returned -
-never a pass-through of the raw row - and `/user/group` carries no password
-or key in the first place.
+definition is conservative on purpose, so on stock RouterOS **the built-in
+`read` group reports `can_write: true`** (it includes `sensitive`, so it
+can see passwords and keys, as well as `reboot`, `password`, `sniff` and
+`test`); MikroTik itself warns that the `read` group should not be given to
+untrusted users. `can_write` is `None` (unknown - treat it as NOT verified)
+if a row carries no usable `policy` field, or if an enabled policy is one
+this package does not know (it is then listed in `unknown_policies`) and no
+known write-capable policy is present - the check fails closed rather than
+reporting an unfamiliar policy as harmless. Only an explicit set of fields
+is ever returned - never a pass-through of the raw row - and `/user/group`
+carries no password or key in the first place.
 
 **Checking that this server's own account is least-privilege:**
 `list_devices` shows the `username` each device is configured with, `users`
 shows that account's `group`, and `user_groups` shows whether that group is
-`can_write` and why. `security_audit`'s users check (#7) only matches the
-built-in `write`/`full` group names, so `user_groups` is the way to see what
-a custom group actually allows.
+`can_write` and why (`write_capable_policies`), plus any `unknown_policies`.
+`security_audit`'s users check (#7) only matches the built-in `write`/`full`
+group names, so `user_groups` is the way to see what a custom group actually
+allows.
+
+A group that reports `can_write: false` holds only `read`, `romon` and
+login-channel policies (e.g. `read,api`). By MikroTik's policy
+descriptions, some of this package's read tools need more than that, and
+each of these makes `can_write` true:
+
+| Tool | Needs | Shows up as |
+|---|---|---|
+| `ping`, `traceroute` | `test` | `write_capable_policies: ["test"]` |
+| `torch` | `sniff` | `write_capable_policies: ["sniff"]` |
+
+So an account that only adds `test` for `ping`/`traceroute` reports
+`can_write: true` with `write_capable_policies == ["test"]` - the honest
+answer, since the same account can also run `/tool fetch`. Whether that
+trade-off is acceptable is the operator's call; `user_groups` reports it
+rather than hiding it. This table lists only the tools whose needs
+MikroTik's policy descriptions make explicit; no tool's policy needs were
+checked on hardware.
 
 **`user_active(device_name)`** lists `/user/active`: `name`, `address`,
 `via` (e.g. `api`/`winbox`/`ssh`/`web`), `when` - who is currently logged

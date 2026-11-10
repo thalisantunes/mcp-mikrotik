@@ -19,17 +19,29 @@ is really least-privilege, especially with custom groups.
 - Each group: `name`, `policy` (RouterOS's comma-separated policy string
   parsed into a sorted list of enabled policies), `negated_policy` (the
   policies RouterOS lists as explicitly `!`-negated, if any), `skin`,
-  `comment`, a computed `can_write`, and `write_capable_policies` (which
-  enabled policies made `can_write` true).
+  `comment`, a computed `can_write`, `write_capable_policies` (which
+  enabled policies made `can_write` true), and `unknown_policies` (enabled
+  policies this package does not classify - normally empty).
 - `can_write` is true if the group holds any of `write`, `policy`,
-  `sensitive`, `ftp`, `reboot`, `password` or `sniff` - anything that lets
-  an account change the device's configuration, stored state or running
-  state, or read secret material. Conservative on purpose: on stock
-  RouterOS the built-in `read` group usually reports `can_write: true`
-  (it includes `reboot`, `password` and `sniff`). `read`, `test`, `romon`
-  and the login-channel policies (`api`, `ssh`, `winbox`, ...) are not
-  counted. `None` (unknown, not verified) if a row has no usable `policy`
-  field. Per-policy reasoning in `formatting.normalize_user_group` and
+  `sensitive`, `ftp`, `reboot`, `password`, `sniff` or `test` - anything
+  that lets an account change the device's configuration, stored state or
+  running state, or read secret material. Policy meanings are taken from
+  MikroTik's documentation, not checked policy-by-policy on hardware.
+  Conservative on purpose: on stock RouterOS the built-in `read` group
+  reports `can_write: true` - it includes `sensitive` (so it can see
+  passwords and keys) as well as `reboot`, `password`, `sniff` and `test`.
+  `sniff` covers the packet sniffer, torch and the traffic generator (this
+  package's `torch` tool needs it). `test` covers ping/traceroute/
+  bandwidth-test/wireless scan but, per MikroTik, also `fetch` and `email`,
+  which can write files to device storage and send files off the device -
+  so an account that holds `test` only for this package's `ping`/
+  `traceroute` tools reports `can_write: true` with
+  `write_capable_policies == ["test"]`. `read`, `romon` and the
+  login-channel policies (`api`, `ssh`, `winbox`, ...) are not counted.
+- Fails closed: `can_write` is `None` (unknown, not verified) if a row has
+  no usable `policy` field, or if it has an enabled policy this package
+  does not know (listed in `unknown_policies`) and no known write-capable
+  one. Per-policy reasoning in `formatting.normalize_user_group` and
   README's "AAA/PKI visibility".
 - **SECURITY**: an explicit projection of the fields above, never a
   pass-through of the raw row, so an unexpected field on a future RouterOS
@@ -38,11 +50,14 @@ is really least-privilege, especially with custom groups.
 - Returns an empty list (never an error) if `/user/group` is unavailable,
   same convention as `users`. READ only - there is no `/user/group` write.
 - New helpers in `formatting.py`: `parse_ros_policy`,
-  `normalize_user_group`, and the pinned `WRITE_CAPABLE_USER_POLICIES` set.
+  `normalize_user_group`, and the pinned `WRITE_CAPABLE_USER_POLICIES` and
+  `NON_WRITE_USER_POLICIES` sets.
 - README's "AAA/PKI visibility" section now describes how to combine
   `list_devices` (the configured `username`), `users` (that account's
   `group`) and `user_groups` (that group's `can_write`) to check this
-  server's own account.
+  server's own account, and which of this package's read tools need a
+  policy beyond `read`/`api` (`ping`/`traceroute` need `test`, `torch`
+  needs `sniff`).
 
 ## [1.11.0] - 2026-07-13
 

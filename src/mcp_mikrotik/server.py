@@ -1417,26 +1417,36 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         Each entry: `name`, `policy` (sorted list of ENABLED policies,
         parsed from RouterOS's comma-separated string), `negated_policy`
         (policies RouterOS lists as explicitly `!`-negated, if any), `skin`,
-        `comment`, `can_write`, and `write_capable_policies` (which enabled
-        policies made `can_write` true).
+        `comment`, `can_write`, `write_capable_policies` (which enabled
+        policies made `can_write` true), and `unknown_policies` (enabled
+        policies this package does not classify - normally empty).
 
         `can_write` is true if the group holds ANY of `write`, `policy`,
-        `sensitive`, `ftp`, `reboot`, `password`, `sniff` - anything that
-        lets an account change the device's configuration/stored/running
-        state or read secret material (stored or in transit). Conservative
-        on purpose: on stock RouterOS even the built-in `read` group
-        usually includes `reboot`/`password`/`sniff` and so reports
-        `can_write: true`. NOT counted: `read`, `test` (ping/traceroute,
-        which this package's own `ping`/`traceroute` tools need), `romon`,
-        and the login-channel policies (`api`, `ssh`, `winbox`, ...). See
-        `formatting.normalize_user_group` for the per-policy reasoning.
-        `can_write` is `None` (unknown - NOT verified) if a row carries no
-        usable `policy` field.
+        `sensitive`, `ftp`, `reboot`, `password`, `sniff`, `test` -
+        anything that lets an account change the device's configuration/
+        stored/running state or read secret material (stored or in
+        transit). Conservative on purpose. The stock `read` group includes
+        `sensitive` (it CAN see passwords and keys) plus `reboot`,
+        `password`, `sniff` and `test`, so it reports `can_write: true`.
+        `test` counts because, per MikroTik, it also grants `fetch` and
+        `email` (write files to device storage, send files off the device),
+        so an account that has `test` only for this package's `ping`/
+        `traceroute` tools still reports `can_write: true`
+        (`write_capable_policies == ["test"]`); this package's `torch` tool
+        needs `sniff`, which counts too. NOT counted: `read`, `romon`, and
+        the login-channel policies (`api`, `ssh`, `winbox`, ...). See
+        `formatting.normalize_user_group` for the per-policy reasoning,
+        taken from MikroTik's documentation, not checked on hardware.
+
+        Fails closed: `can_write` is `None` (unknown - treat as NOT
+        verified) if a row carries no usable `policy` field, or if it has
+        an enabled policy listed in `unknown_policies` and no known
+        write-capable one. Only `can_write: false` means verified.
 
         To check that the account THIS server logs in with is
         least-privilege: `list_devices` gives the device's `username`,
         `users` gives that account's `group`, and this tool gives that
-        group's `can_write`/`write_capable_policies`.
+        group's `can_write`/`write_capable_policies`/`unknown_policies`.
 
         A READ only (no `/user/group` write exists in this package). Only
         the fields above are ever returned - an explicit projection, never

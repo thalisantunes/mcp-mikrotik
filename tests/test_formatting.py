@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from mcp_mikrotik.formatting import (
+    NON_WRITE_USER_POLICIES,
     WRITE_CAPABLE_USER_POLICIES,
     coerce_ros_bool,
     coerce_ros_number,
@@ -395,9 +396,23 @@ def test_parse_ros_policy_contradictory_entry_counts_as_enabled():
 def test_write_capable_user_policies_is_exactly_the_documented_set():
     """Pinned so widening or narrowing what `can_write` means is always a
     deliberate, reviewed change (docstring + README + CHANGELOG)."""
-    assert frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"}) == (
+    assert frozenset({"write", "policy", "sensitive", "ftp", "reboot", "password", "sniff", "test"}) == (
         WRITE_CAPABLE_USER_POLICIES
     )
+
+
+def test_non_write_user_policies_is_exactly_the_documented_set():
+    """Pinned for the same reason: anything enabled outside both sets is
+    UNKNOWN and makes `can_write` None, so moving a name into this set is
+    what lets a group come back as verified-False."""
+    assert (
+        frozenset({"read", "romon", "local", "telnet", "ssh", "web", "winbox", "api", "rest-api", "dude", "tikapp"})
+        == NON_WRITE_USER_POLICIES
+    )
+
+
+def test_user_policy_sets_are_disjoint():
+    assert not WRITE_CAPABLE_USER_POLICIES & NON_WRITE_USER_POLICIES
 
 
 def test_normalize_user_group_full_shape():
@@ -416,7 +431,18 @@ def test_normalize_user_group_full_shape():
         "comment": "ops team",
         "can_write": True,
         "write_capable_policies": ["reboot"],
+        "unknown_policies": [],
     }
+
+
+def test_normalize_user_group_unknown_enabled_policy_makes_can_write_none():
+    """Fail closed: an enabled policy outside both known sets leaves the
+    group's write capability UNKNOWN, never a reassuring False."""
+    result = normalize_user_group({"name": "g", "policy": "read,api,some-future-policy,!other-future-policy"})
+    assert result["can_write"] is None
+    assert result["write_capable_policies"] == []
+    assert result["unknown_policies"] == ["some-future-policy"]
+    assert result["negated_policy"] == ["other-future-policy"]
 
 
 def test_normalize_user_group_missing_fields_are_none_and_can_write_unknown():
@@ -428,4 +454,5 @@ def test_normalize_user_group_missing_fields_are_none_and_can_write_unknown():
         "comment": None,
         "can_write": None,
         "write_capable_policies": [],
+        "unknown_policies": [],
     }

@@ -4039,7 +4039,16 @@ async def test_users_returns_empty_when_menu_absent(settings: Settings):
 
 # --- user_groups (read-only, `/user/group` policies + computed can_write) ----
 
-_USER_GROUP_KEYS = {"name", "policy", "negated_policy", "skin", "comment", "can_write", "write_capable_policies"}
+_USER_GROUP_KEYS = {
+    "name",
+    "policy",
+    "negated_policy",
+    "skin",
+    "comment",
+    "can_write",
+    "write_capable_policies",
+    "unknown_policies",
+}
 
 
 def _user_groups_server(settings: Settings, rows: list[dict]):
@@ -4066,6 +4075,7 @@ async def test_user_groups_happy_path_default_groups(settings: Settings, fake_co
         "reboot",
         "rest-api",
         "romon",
+        "sensitive",
         "sniff",
         "ssh",
         "telnet",
@@ -4073,24 +4083,38 @@ async def test_user_groups_happy_path_default_groups(settings: Settings, fake_co
         "web",
         "winbox",
     ]
-    assert read["negated_policy"] == ["ftp", "policy", "sensitive", "write"]
+    assert read["negated_policy"] == ["ftp", "policy", "write"]
     assert read["skin"] == "default"
     assert read["comment"] is None
-    # Deliberately conservative: the built-in `read` group can still reboot
-    # the device, change its own password and run the packet sniffer.
+    # MikroTik's stock `read` group can see secrets (`sensitive`), reboot the
+    # device, change its own password, run the sniffer/torch/traffic
+    # generator and `fetch` files (`test`) - it is NOT a read-only group.
     assert read["can_write"] is True
-    assert read["write_capable_policies"] == ["password", "reboot", "sniff"]
+    assert read["write_capable_policies"] == ["password", "reboot", "sensitive", "sniff", "test"]
+    assert read["unknown_policies"] == []
 
     write = groups["write"]
     assert "write" in write["policy"]
-    assert write["negated_policy"] == ["ftp", "policy", "sensitive"]
+    assert "sensitive" in write["policy"]
+    assert write["negated_policy"] == ["ftp", "policy"]
     assert write["can_write"] is True
-    assert write["write_capable_policies"] == ["password", "reboot", "sniff", "write"]
+    assert write["write_capable_policies"] == ["password", "reboot", "sensitive", "sniff", "test", "write"]
+    assert write["unknown_policies"] == []
 
     full = groups["full"]
     assert full["negated_policy"] == []
     assert full["can_write"] is True
-    assert full["write_capable_policies"] == ["ftp", "password", "policy", "reboot", "sensitive", "sniff", "write"]
+    assert full["write_capable_policies"] == [
+        "ftp",
+        "password",
+        "policy",
+        "reboot",
+        "sensitive",
+        "sniff",
+        "test",
+        "write",
+    ]
+    assert full["unknown_policies"] == []
 
     for row in result["result"]:
         assert set(row) == _USER_GROUP_KEYS
@@ -4107,7 +4131,7 @@ async def test_user_groups_custom_group_with_negated_policies(settings: Settings
             {
                 ".id": "*4",
                 "name": "monitoring",
-                "policy": "read,api,test,!local,!telnet,!ssh,!ftp,!reboot,!write,!policy,!winbox,!password,"
+                "policy": "read,api,!local,!telnet,!ssh,!ftp,!reboot,!write,!policy,!test,!winbox,!password,"
                 "!web,!sniff,!sensitive,!romon,!rest-api",
                 "skin": "default",
                 "comment": "read-only monitoring",
@@ -4117,7 +4141,7 @@ async def test_user_groups_custom_group_with_negated_policies(settings: Settings
     _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
     [row] = result["result"]
     assert row["name"] == "monitoring"
-    assert row["policy"] == ["api", "read", "test"]
+    assert row["policy"] == ["api", "read"]
     assert row["negated_policy"] == [
         "ftp",
         "local",
@@ -4130,6 +4154,7 @@ async def test_user_groups_custom_group_with_negated_policies(settings: Settings
         "sniff",
         "ssh",
         "telnet",
+        "test",
         "web",
         "winbox",
         "write",
@@ -4137,18 +4162,23 @@ async def test_user_groups_custom_group_with_negated_policies(settings: Settings
     assert row["comment"] == "read-only monitoring"
     assert row["can_write"] is False
     assert row["write_capable_policies"] == []
+    assert row["unknown_policies"] == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["write", "policy", "sensitive", "ftp", "reboot", "password", "sniff"])
+@pytest.mark.parametrize("policy", ["write", "policy", "sensitive", "ftp", "reboot", "password", "sniff", "test"])
 async def test_user_groups_can_write_true_for_each_write_capable_policy(settings: Settings, policy: str):
     """Each write-capable policy, on its own on top of `read,api`, is enough
-    to flip can_write - none is silently ignored."""
+    to flip can_write - none is silently ignored. That includes `test`
+    (needed by this package's own `ping`/`traceroute`): per MikroTik it also
+    grants `fetch`/`email`, which can write files to device storage and send
+    files off the device."""
     mcp = _user_groups_server(settings, [{"name": "custom", "policy": f"read,api,{policy}"}])
     _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
     [row] = result["result"]
     assert row["can_write"] is True
     assert row["write_capable_policies"] == [policy]
+    assert row["unknown_policies"] == []
 
 
 @pytest.mark.asyncio
@@ -4157,21 +4187,49 @@ async def test_user_groups_can_write_true_for_each_write_capable_policy(settings
     [
         "read",
         "read,api",
-        "read,api,test",
         "read,api,romon",
-        "local,telnet,ssh,read,test,winbox,web,api,romon,rest-api,dude,tikapp",
+        "local,telnet,ssh,read,winbox,web,api,romon,rest-api,dude,tikapp",
+        "read,api,!test,!some-future-policy",
         "",
     ],
 )
 async def test_user_groups_can_write_false_without_a_write_capable_policy(settings: Settings, policy_string: str):
-    """`read`, `test`, `romon` and the login-channel policies are NOT
-    write-capable (see formatting.normalize_user_group's docstring), and a
-    group with no policies at all is trivially not write-capable either."""
+    """`read`, `romon` and the login-channel policies are KNOWN not to be
+    write-capable (see formatting.normalize_user_group's docstring), a
+    negated policy - even an unknown one - never counts, and a group with no
+    policies at all is trivially not write-capable either."""
     mcp = _user_groups_server(settings, [{"name": "custom", "policy": policy_string}])
     _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
     [row] = result["result"]
     assert row["can_write"] is False
     assert row["write_capable_policies"] == []
+    assert row["unknown_policies"] == []
+
+
+@pytest.mark.asyncio
+async def test_user_groups_unknown_policy_fails_closed(settings: Settings):
+    """An enabled policy name this package doesn't classify (e.g. one a
+    future RouterOS version adds) makes `can_write` None - NOT verified -
+    rather than a reassuring False, and is named in `unknown_policies`."""
+    mcp = _user_groups_server(settings, [{"name": "custom", "policy": "read,api,some-future-policy"}])
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["can_write"] is None
+    assert row["write_capable_policies"] == []
+    assert row["unknown_policies"] == ["some-future-policy"]
+    assert row["policy"] == ["api", "read", "some-future-policy"]
+
+
+@pytest.mark.asyncio
+async def test_user_groups_unknown_policy_alongside_a_write_capable_one_is_still_true(settings: Settings):
+    """A known write-capable policy already settles `can_write: true`; an
+    unknown policy next to it is still reported, but can't lower that."""
+    mcp = _user_groups_server(settings, [{"name": "custom", "policy": "read,api,write,some-future-policy"}])
+    _content, result = await mcp.call_tool("user_groups", {"device_name": "core-switch"})
+    [row] = result["result"]
+    assert row["can_write"] is True
+    assert row["write_capable_policies"] == ["write"]
+    assert row["unknown_policies"] == ["some-future-policy"]
 
 
 @pytest.mark.asyncio
@@ -4185,6 +4243,7 @@ async def test_user_groups_can_write_unknown_when_policy_field_missing(settings:
     assert row["policy"] == []
     assert row["negated_policy"] == []
     assert row["write_capable_policies"] == []
+    assert row["unknown_policies"] == []
 
 
 @pytest.mark.asyncio

@@ -485,17 +485,19 @@ def fake_connection() -> FakeConnection:
                     "comment": "",
                 }
             ],
-            # RouterOS's three built-in groups, in the policy-string shape a
-            # device sends over the API: `read`/`write` also list the
-            # policies they LACK, `!`-prefixed, while `full` has none to
-            # negate. See formatting.normalize_user_group / `user_groups`.
+            # RouterOS's three built-in groups, with the default policy
+            # strings MikroTik documents for them (RouterOS "User" manual
+            # page): `read`/`write` also list the policies they LACK,
+            # `!`-prefixed, while `full` has none to negate. Note that the
+            # stock `read` and `write` groups both INCLUDE `sensitive`. See
+            # formatting.normalize_user_group / `user_groups`.
             ("user", "group"): [
                 {
                     ".id": "*1",
                     "name": "read",
                     "policy": (
-                        "local,telnet,ssh,reboot,read,test,winbox,password,web,sniff,api,romon,rest-api,"
-                        "!ftp,!write,!policy,!sensitive"
+                        "local,telnet,ssh,reboot,read,test,winbox,password,web,sniff,sensitive,api,romon,"
+                        "rest-api,!ftp,!write,!policy"
                     ),
                     "skin": "default",
                 },
@@ -503,8 +505,8 @@ def fake_connection() -> FakeConnection:
                     ".id": "*2",
                     "name": "write",
                     "policy": (
-                        "local,telnet,ssh,reboot,read,write,test,winbox,password,web,sniff,api,romon,rest-api,"
-                        "!ftp,!policy,!sensitive"
+                        "local,telnet,ssh,reboot,read,write,test,winbox,password,web,sniff,sensitive,api,"
+                        "romon,rest-api,!ftp,!policy"
                     ),
                     "skin": "default",
                 },
