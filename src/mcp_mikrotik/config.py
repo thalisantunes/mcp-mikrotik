@@ -46,15 +46,19 @@ class Device:
     # False only for devices using RouterOS's self-signed api-ssl cert, which
     # trades away MITM protection on that connection; see README "Security
     # model" and devices.yaml.example for the explicit trade-off writeup.
+    # Ignored when tls_fingerprints is set (the pin is the authentication);
+    # for a self-signed cert, pinning is the authenticated alternative to False.
     tls_verify: bool = True
     # Optional path to a CA bundle to validate the device's cert against,
-    # instead of the system trust store. Ignored when tls_verify is False.
+    # instead of the system trust store. Ignored when tls_verify is False;
+    # never combined with tls_fingerprints (the loader rejects both together).
     tls_ca_cert: str | None = None
     # Certificate pinning (devices.yaml key `tls_fingerprint`, a string or a
     # list of strings): the accepted SHA-256 fingerprints of this device's
     # own api-ssl certificate (the DER leaf), normalized by
     # normalize_tls_fingerprint() to 64 lowercase hex chars. Empty = no
-    # pinning. When non-empty, the pin REPLACES chain + hostname
+    # pinning, which the loader only produces when the key is absent (a
+    # present-but-empty key is a ConfigError). When non-empty, the pin REPLACES chain + hostname
     # verification rather than adding to it - client._build_ssl_context()
     # checks this before tls_verify/tls_ca_cert, and the YAML loader
     # rejects an explicit `tls_verify: true` or a `tls_ca_cert` alongside
@@ -150,13 +154,21 @@ def normalize_tls_fingerprint(value: str) -> str | None:
 
 
 def _parse_tls_fingerprints(raw_value: Any, name: str, path: Path) -> tuple[str, ...]:
-    """Parse a device's `tls_fingerprint` (a string, or a list of strings to
-    allow certificate rotation) into normalized pins. Missing/null means no
-    pinning; an empty list or any invalid entry is a ConfigError naming the
-    device - never silently treated as "no pinning", which would quietly
-    downgrade the connection's authentication."""
+    """Parse the value of a device's `tls_fingerprint` key (a string, or a
+    list of strings to allow certificate rotation) into normalized pins.
+
+    Only called when the key is present - an absent key is the one way to
+    say "no pinning". A present key with no usable value (null - which is
+    also what a bare `tls_fingerprint:` or `~` loads as - an empty list, an
+    empty string) or any invalid entry is a ConfigError naming the device,
+    never silently treated as "no pinning": on a device with
+    `tls_verify: false` that would quietly downgrade the connection to an
+    unauthenticated one while the config still reads as pinned."""
     if raw_value is None:
-        return ()
+        raise ConfigError(
+            f"{path}: device {name!r} has a 'tls_fingerprint' key with no value (null); put the router's "
+            "certificate fingerprint there or remove the key. An empty pin is never treated as 'no pinning'."
+        )
     values = raw_value if isinstance(raw_value, list) else [raw_value]
     if not values:
         raise ConfigError(
@@ -202,7 +214,18 @@ def _device_from_dict(raw: dict[str, Any], path: Path) -> Device:
     use_ssl = bool(raw.get("use_ssl", False))
     tls_verify = bool(raw.get("tls_verify", True))
     tls_ca_cert = raw.get("tls_ca_cert")
-    tls_fingerprints = _parse_tls_fingerprints(raw.get("tls_fingerprint"), name, path)
+    # `tls_fingerprints` (plural) is the natural spelling for a list and the
+    # name of the Device attribute, but it is not the YAML key. Unknown keys
+    # are otherwise ignored; this one would silently leave the device
+    # unpinned (with `tls_verify: false`, unauthenticated) while the config
+    # reads as pinned, so it is rejected rather than ignored. One spelling
+    # only - no alias - so there is never a question of which key wins.
+    if "tls_fingerprints" in raw:
+        raise ConfigError(
+            f"{path}: device {name!r} uses the key 'tls_fingerprints'; the key is 'tls_fingerprint' "
+            "(singular), for a single fingerprint or a list of them. Rename it."
+        )
+    tls_fingerprints = _parse_tls_fingerprints(raw["tls_fingerprint"], name, path) if "tls_fingerprint" in raw else ()
     if tls_fingerprints:
         # Pinning only means anything on an api-ssl connection; on the plain
         # API there is no certificate to pin, and silently ignoring the key

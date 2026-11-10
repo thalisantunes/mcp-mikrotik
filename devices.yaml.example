@@ -12,31 +12,41 @@
 #   comment     - free-text note, returned to callers (unlike password)
 #   timeout     - connect timeout in seconds (default: MIKROTIK_TIMEOUT env var, else 10);
 #                 raise this for devices behind a slow/high-latency link
-#   tls_verify  - only used when use_ssl: true. Default true validates the device's
-#                 certificate against the system trust store (or tls_ca_cert below).
-#                 RouterOS api-ssl commonly serves a SELF-SIGNED certificate, so this
-#                 will fail out-of-the-box unless you also set tls_ca_cert. Setting
-#                 tls_verify: false skips certificate/hostname validation entirely for
-#                 that device - a deliberate, explicit, per-device trade-off (it drops
-#                 MITM protection on that connection). Never the default; opt in
-#                 per device only when you accept that trade-off. See README's
-#                 "TLS verification for api-ssl" section.
-#   tls_ca_cert - only used when use_ssl: true and tls_verify: true. Path to a CA
-#                 bundle/certificate to validate the device against, instead of the
-#                 system trust store - the safer alternative to tls_verify: false if
-#                 you can provision RouterOS with a certificate you control.
+#   tls_verify  - only used when use_ssl: true and no tls_fingerprint is set. With
+#                 tls_fingerprint set it is not used - the pin is the authentication -
+#                 so leave it out there (an explicit true is rejected as ambiguous,
+#                 false is accepted and changes nothing). Default true validates the
+#                 device's certificate against the system trust store (or tls_ca_cert
+#                 below) and checks the hostname. RouterOS api-ssl commonly serves a
+#                 SELF-SIGNED certificate, so this will fail out-of-the-box; for such a
+#                 certificate use tls_fingerprint below. Setting tls_verify: false
+#                 skips certificate/hostname validation entirely for that device - a
+#                 deliberate, explicit, per-device trade-off (it drops MITM protection
+#                 on that connection). Never the default; opt in per device only when
+#                 you accept that trade-off. See README's "TLS verification for
+#                 api-ssl" section.
+#   tls_ca_cert - only used when use_ssl: true and tls_verify: true; not combinable
+#                 with tls_fingerprint. Path to a CA bundle/certificate to validate the
+#                 device against, instead of the system trust store - for a RouterOS
+#                 certificate issued by a CA you control whose subjectAltName covers
+#                 `host`. For a self-signed certificate, use tls_fingerprint instead.
 #   tls_fingerprint - only valid with use_ssl: true. Certificate pinning: the SHA-256
 #                 fingerprint of this router's own api-ssl certificate, obtained out
 #                 of band (e.g. /certificate export-certificate on the router, then
 #                 `openssl x509 -noout -fingerprint -sha256 -in cert_export_<name>.crt`).
 #                 64 hex chars, case-insensitive, plain or ':'-separated, optional
 #                 "sha256:" prefix - quote it. Also accepts a list, to roll out a new
-#                 certificate before removing the old one. The pin REPLACES CA/hostname
-#                 checks (works with self-signed certs and no matching SAN) and is
-#                 checked after the TLS handshake, before any login byte is sent - a
-#                 mismatch closes the connection without sending credentials. Do not
-#                 combine with tls_verify: true or tls_ca_cert (rejected as ambiguous);
-#                 leave tls_verify out. The recommended alternative to tls_verify: false.
+#                 certificate before removing the old one (devices.yaml is read at
+#                 startup: restart the server after each change). The key is singular
+#                 even for a list - `tls_fingerprints` is rejected - and a key with no
+#                 value (`tls_fingerprint:`, null, "", []) is a config error, never "no
+#                 pinning". The pin REPLACES CA/hostname checks (works with self-signed
+#                 certs and no matching SAN) and is checked after the TLS handshake,
+#                 before any login byte is sent - a mismatch closes the connection
+#                 without sending credentials. Do not combine with tls_verify: true or
+#                 tls_ca_cert (rejected as ambiguous); leave tls_verify out. The
+#                 recommended option for self-signed certificates, and the
+#                 authenticated alternative to tls_verify: false.
 
 devices:
   - name: core-switch
@@ -52,7 +62,7 @@ devices:
     host: 192.168.88.254
     port: 8729
     use_ssl: true
-    tls_verify: false  # RouterOS api-ssl self-signed cert; see field docs above
+    tls_verify: false  # unauthenticated; prefer tls_fingerprint (see branch-router below)
     username: admin
     password: change-me
     disabled: false

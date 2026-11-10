@@ -335,8 +335,13 @@ def test_mismatch_with_several_pins_lists_all_of_them(cert_a: GeneratedCert, cer
 
 
 def test_peer_without_a_certificate_fails_closed():
-    """A peer that presents no certificate at all (e.g. an anonymous cipher
-    suite) can never satisfy a pin."""
+    """A peer that presents no certificate at all can never satisfy a pin.
+
+    Unlike the tests above, this is a unit test of _verify_peer_fingerprint
+    with a stub socket, not a handshake against FakeApiSslServer: a live
+    certificate-less handshake isn't reachable with the pinned context,
+    since its cipher list offers no anonymous (aNULL) suite and TLS 1.3 has
+    none (see the next test). The no-certificate branch is defence in depth."""
 
     class NoCertSocket:
         def getpeercert(self, binary_form: bool = False):
@@ -347,6 +352,16 @@ def test_peer_without_a_certificate_fails_closed():
         _verify_peer_fingerprint(NoCertSocket(), device)
     assert "presented no certificate" in str(exc_info.value)
     assert exc_info.value.presented is None
+
+
+def test_pinned_context_offers_no_anonymous_cipher_suites():
+    """Why the no-certificate branch above is unreachable in a real
+    handshake: the context used for a pinned device never offers a suite
+    that lets the server skip sending a certificate."""
+    context = _build_ssl_context(_pinned_device(8729, "ab" * 32))
+    ciphers = context.get_ciphers()
+    assert ciphers
+    assert [c["name"] for c in ciphers if c.get("auth") == "auth-null"] == []
 
 
 # --- Error classification: no read retry, counts toward the breaker -----------

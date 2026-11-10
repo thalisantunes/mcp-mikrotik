@@ -28,8 +28,10 @@ same three, and a PR can't merge until all of them pass on Python 3.11,
 3.12, and 3.13:
 
 ```bash
-# Tests - the suite never touches a real router (see tests/fakes.py); it's
-# entirely in-memory and fast.
+# Tests - the suite never touches a real router. Almost everything runs
+# against the in-memory fake in tests/fakes.py; tests/test_tls_pinning.py
+# runs a loopback-only TLS server on 127.0.0.1 with throwaway certificates,
+# and uses the openssl CLI if it is installed. Still fast.
 pytest -q
 
 # Tests + coverage report. CI fails the build under 95% - see "Test

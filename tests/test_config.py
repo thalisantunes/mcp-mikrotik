@@ -290,9 +290,39 @@ def test_device_has_no_tls_fingerprints_by_default(tmp_path: Path):
     assert load_devices(path)["d1"].tls_fingerprints == ()
 
 
-def test_load_devices_tls_fingerprint_null_means_no_pinning(tmp_path: Path):
-    path = _write(tmp_path, "devices:\n  - name: d1\n    host: 192.0.2.1\n    tls_fingerprint: null\n")
-    assert load_devices(path)["d1"].tls_fingerprints == ()
+@pytest.mark.parametrize("null_value", ["", " ~", " null"])
+def test_load_devices_rejects_a_tls_fingerprint_key_with_no_value(tmp_path: Path, null_value: str):
+    """A bare `tls_fingerprint:` (a pasted value missing, a template left
+    empty), `~` and `null` all load as None in YAML. Next to
+    `tls_verify: false` that must not quietly become an unauthenticated,
+    unpinned connection - only an absent key means "no pinning"."""
+    path = _write(
+        tmp_path,
+        "devices:\n  - name: edge-router\n    host: 192.0.2.10\n    port: 8729\n    use_ssl: true\n"
+        f"    tls_verify: false\n    tls_fingerprint:{null_value}\n",
+    )
+    with pytest.raises(ConfigError, match="'edge-router' has a 'tls_fingerprint' key with no value"):
+        load_devices(path)
+
+
+@pytest.mark.parametrize("value", [f' "{_FP}"', f' ["{_FP}"]', "", " null"])
+def test_load_devices_rejects_the_plural_tls_fingerprints_key(tmp_path: Path, value: str):
+    """`tls_fingerprints` (the Device attribute's name, and the natural
+    spelling for a list) is not the YAML key; ignoring it like other unknown
+    keys would leave the device unpinned while the config reads as pinned."""
+    path = _write(
+        tmp_path,
+        "devices:\n  - name: edge-router\n    host: 192.0.2.10\n    port: 8729\n    use_ssl: true\n"
+        f"    tls_verify: false\n    tls_fingerprints:{value}\n",
+    )
+    with pytest.raises(ConfigError, match="'edge-router' uses the key 'tls_fingerprints'.*'tls_fingerprint'"):
+        load_devices(path)
+
+
+def test_load_devices_rejects_the_plural_key_even_next_to_a_valid_singular_one(tmp_path: Path):
+    path = _write(tmp_path, _pinned_yaml(f'"{_FP}"', f'    tls_fingerprints: ["{_FP_OTHER}"]\n'))
+    with pytest.raises(ConfigError, match="'tls_fingerprints'"):
+        load_devices(path)
 
 
 @pytest.mark.parametrize(

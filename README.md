@@ -1849,7 +1849,11 @@ it there is a config error rather than a silent no-op.
 (`3f9a...c4`) or as 32 `:`-separated pairs (`3F:9A:...:C4`, the `openssl`
 format), optionally prefixed with `sha256:`. Quote the value in YAML. A
 wrong length, a non-hex character, or a partly-separated value is a config
-error naming the device.
+error naming the device. So is a key with no value (`tls_fingerprint:` with
+nothing after it, `null`, `""`, `[]`) - only leaving the key out means "no
+pinning", so a pasted value that went missing can't silently turn a device
+into an unauthenticated one. The key is `tls_fingerprint` (singular) even
+when it holds a list; `tls_fingerprints` is rejected rather than ignored.
 
 **Getting the fingerprint - out of band.** The value must come from a path
 you already trust (console, a management network, your provisioning
@@ -1880,7 +1884,11 @@ first connection.
 **Rotation.** `tls_fingerprint` also accepts a list. To replace a router's
 certificate without an outage: add the new certificate's fingerprint next to
 the old one, restart the server, switch api-ssl to the new certificate on the
-router, then remove the old fingerprint.
+router, then remove the old fingerprint and restart the server again.
+`devices.yaml` is only read at startup, so until that second restart the old
+certificate is still accepted. If you are rotating because the old
+certificate's private key may be compromised, remove its pin and restart
+right away rather than at the end of a rollout.
 
 ```yaml
     tls_fingerprint:
@@ -1900,6 +1908,13 @@ also changes it. Certificate validity dates and revocation are not checked
 in pinned mode - the pin is the identity; renew or rotate on your own
 schedule.
 
+**Validation status.** Pinning has been validated against a local TLS
+server only (the test suite's, TLS 1.2 and 1.3), not yet against real
+RouterOS `api-ssl` on ROS6/ROS7 hardware. That includes the RouterOS-side
+steps above (`/ip service print detail`, `/certificate export-certificate`
+and its `cert_export_<name>.crt` file name, the `/certificate print detail`
+fingerprint): treat them as unconfirmed until this note says otherwise.
+
 ## Development & CI
 
 ```bash
@@ -1911,7 +1926,11 @@ The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
 `client_factory` parameter on `build_server()`. It currently has 1298 tests,
-zero of which touch a real device or the network, at 100% line coverage.
+zero of which touch a real device, at 100% line coverage. Almost all of them
+run against that in-memory fake; the exception is
+`tests/test_tls_pinning.py`, which runs a loopback-only TLS server on
+`127.0.0.1` with throwaway certificates generated at test time, and uses the
+`openssl` CLI if it is installed (that one test is skipped otherwise).
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every push to `main`
 and every pull request, as three separate jobs that must all pass before a
