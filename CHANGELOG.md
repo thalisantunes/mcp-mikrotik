@@ -10,6 +10,68 @@ dependency `librouteros` is GPL-2.0-or-later and is imported in-process, which
 makes this a combined work; the project license now reflects that instead of
 leaving the copyleft dependency undisclosed.
 
+### Added
+
+- **Per-device certificate pinning for api-ssl (`tls_fingerprint`).** A
+  device entry can now pin the SHA-256 fingerprint of the router's own
+  api-ssl certificate - a string, or a list of strings to roll out a
+  replacement certificate before removing the old one. Accepted as 64 hex
+  characters, case-insensitive, plain or `:`-separated, with an optional
+  `sha256:` prefix. This is the authenticated alternative to
+  `tls_verify: false` for fleets that use self-signed or per-device-CA
+  certificates (commonly without a subjectAltName for the device's
+  address), where CA + hostname verification can never succeed. The pin is
+  checked in the `ssl_wrapper` handed to librouteros, right after the TLS
+  handshake and before any RouterOS login byte is sent: on a mismatch (or no
+  peer certificate) the socket is closed and a new
+  `TLSFingerprintMismatchError` (a `DeviceConnectionError`) names the device
+  and both the presented and expected fingerprints - the credentials are
+  never sent to an unpinned peer. Comparison uses `hmac.compare_digest` on
+  the SHA-256 of the DER certificate. A mismatch is not retried by the read
+  retry loop (it is not a transient network error) and counts toward the
+  device's circuit breaker like any other failed connection.
+
+### Notes
+
+- Design choice: a pin **replaces** CA-chain and hostname verification
+  instead of being checked in addition to it (the certificates it exists for
+  can't pass those checks, and the pin is the stricter identity check).
+  Startup therefore rejects, as a config error naming the device: an
+  invalid fingerprint (wrong length, non-hex, partly separated), a
+  `tls_fingerprint` key with no value (a bare `tls_fingerprint:`, `null`,
+  `""`, `[]` - only an absent key means "no pinning"), the plural key
+  `tls_fingerprints` (not silently ignored like other unknown keys, since
+  that would leave the device unpinned), `tls_fingerprint` without
+  `use_ssl: true`, and `tls_fingerprint` combined with an explicit
+  `tls_verify: true` or with `tls_ca_cert` (ambiguous - the config would
+  claim a check that isn't performed). `list_devices` and other tool output
+  are unchanged. See README's "TLS verification for api-ssl" for how to
+  obtain the fingerprint out of band, rotation (`devices.yaml` is read at
+  startup, so restart after each pin change), and the trade-offs.
+- `SECURITY.md` now describes pinned mode as a documented mode (CA/hostname
+  checks off by design, the pin being the authentication) and lists a way
+  around the pin - credentials or API bytes reaching a peer whose
+  certificate doesn't match, credentials sent before the pin check, a flaw
+  in the comparison, a configured pin that isn't enforced - as in scope.
+- Validated against a local TLS server (TLS 1.2 and 1.3) only; not yet
+  confirmed against real RouterOS api-ssl on ROS6/ROS7 hardware, including
+  the RouterOS commands README gives for exporting the certificate and
+  reading its fingerprint.
+
+### Tests
+
+- Config validation for every accepted and rejected form, including the
+  key-with-no-value and plural-key cases next to `tls_verify: false`.
+- End-to-end tests against a real local TLS server (loopback only) with
+  throwaway certificates generated at test time, proving a matching pin
+  logs in, a list of pins accepts any listed certificate, and a mismatching
+  pin fails with the server having received **zero bytes** after the
+  handshake (TLS 1.2 and 1.3). The peer-without-a-certificate path is a unit
+  test with a stub socket (a live certificate-less handshake isn't
+  reachable: the pinned context offers no anonymous cipher suite, which a
+  test asserts). `cryptography` is now listed in the `dev` extra for the
+  certificate generation (it was already installed transitively).
+
 ## [1.11.0] - 2026-07-13
 
 **The dead-man / lockout-proof write primitive, plus the wireless RF tuning

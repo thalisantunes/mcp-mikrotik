@@ -129,8 +129,9 @@ Each device entry supports its own `port` and `use_ssl`, since a fleet is
 commonly a mix of plain API (8728) and api-ssl (8729) devices, and possibly a
 mix of RouterOS 6.x and 7.x. It can also override `timeout` (seconds; falls
 back to `MIKROTIK_TIMEOUT`, then 10s - useful for devices behind a slow
-link) and, when `use_ssl: true`, `tls_verify` (see "TLS verification for
-api-ssl" below).
+link) and, when `use_ssl: true`, `tls_verify`/`tls_ca_cert` or
+`tls_fingerprint` (certificate pinning - see "TLS verification for api-ssl"
+below).
 
 ## Running
 
@@ -1766,7 +1767,9 @@ entirely before `MikrotikClient` ever attempts a connection.
   with a short backoff (0.5s, then 1s). Up to `MIKROTIK_READ_RETRIES` extra
   attempts (default 2). A command rejected by RouterOS itself (a
   `LibRouterosError`, not an `OSError`) is never retried - it would just be
-  rejected again. **Writes never retry**, regardless of this setting:
+  rejected again - and neither is an api-ssl certificate that doesn't match
+  the device's pinned `tls_fingerprint` (see "TLS verification for api-ssl"
+  below). **Writes never retry**, regardless of this setting:
   `update`/`add`/`remove`/`start`/`stop` aren't guaranteed idempotent, so retrying one
   could duplicate or reapply a change.
 - **Circuit breaker.** Each device gets its own in-memory, thread-safe
@@ -1785,17 +1788,132 @@ entirely before `MikrotikClient` ever attempts a connection.
 
 ### TLS verification for api-ssl
 
-RouterOS's `api-ssl` typically serves a self-signed certificate, so the
-default `tls_verify: true` (which validates against the system trust store,
-or an explicit `tls_ca_cert` if given) will fail out-of-the-box for most
-fleets. Two ways to make an SSL device work:
+RouterOS's `api-ssl` typically serves a self-signed certificate (or one
+issued by a per-device CA), often without a subjectAltName for the address
+this server connects to, so the default `tls_verify: true` (which validates
+the chain against the system trust store, or an explicit `tls_ca_cert`, and
+checks the hostname) will fail out-of-the-box for most fleets. Three ways to
+make an SSL device work, per device:
 
-- Set `tls_ca_cert: /path/to/ca.pem` on the device entry, if you provision
-  RouterOS with a certificate you can pin, keeping full verification.
-- Set `tls_verify: false` on that specific device to skip certificate/hostname
-  validation entirely. This is a deliberate, explicit, per-device trade-off
-  (it drops MITM protection on that connection) - it is never the default,
-  and it is opt-in per device, not global. See `devices.yaml.example`.
+- **`tls_ca_cert: /path/to/ca.pem`** - if you provision RouterOS with a
+  certificate issued by a CA you control *and* whose subjectAltName covers
+  the `host` you configure, keeping full chain + hostname verification.
+- **`tls_fingerprint: "<sha256>"`** (certificate pinning, recommended for
+  self-signed / per-device-CA fleets) - authenticates the router by the
+  SHA-256 fingerprint of its own api-ssl certificate, obtained out of band.
+  No CA and no matching subjectAltName needed. See below.
+- **`tls_verify: false`** - skips certificate/hostname validation entirely.
+  This is a deliberate, explicit, per-device trade-off (it drops MITM
+  protection on that connection: anything that answers on that address
+  receives the API username and password) - it is never the default, and it
+  is opt-in per device, not global. Prefer `tls_fingerprint` wherever you
+  can obtain the router's certificate.
+
+#### Certificate pinning (`tls_fingerprint`)
+
+```yaml
+  - name: edge-router
+    host: 192.0.2.10
+    port: 8729
+    use_ssl: true
+    tls_fingerprint: "sha256:3F:9A:...:C4"   # 64 hex chars; see below
+    username: api-user
+    password: change-me
+```
+
+**What is checked, and when.** Right after the TLS handshake and *before*
+any RouterOS login byte is sent, the server computes the SHA-256 of the
+DER-encoded certificate the router presented and compares it (constant-time)
+with the pinned value(s). On a mismatch - or if the peer presents no
+certificate - the socket is closed and the call fails with a clear error
+naming the device, the fingerprint the router presented, and the one(s)
+expected; **the username and password are never sent to an unpinned peer.**
+A mismatch is not treated as a transient network error: reads do not retry
+it (see "Read retry" above), and it counts toward the device's circuit
+breaker like any other failed connection.
+
+**Pin vs. `tls_verify`/`tls_ca_cert`.** A pin *replaces* CA-chain and
+hostname verification rather than being checked on top of it: the
+certificates pinning exists for (self-signed, per-device CA, no matching
+SAN) can never pass those checks, and the pin is the stricter identity check
+anyway - it accepts exactly the pinned certificate, not anything a CA signed
+for that name. Because chain/hostname checks are then not performed, a
+device that sets `tls_fingerprint` together with an explicit
+`tls_verify: true` or with `tls_ca_cert` is rejected at startup as ambiguous
+(the config would claim a check that doesn't happen). Leave `tls_verify` out
+(or set it to `false`) on a pinned device. `tls_fingerprint` also requires
+`use_ssl: true` - on the plain API there is no certificate to pin, so setting
+it there is a config error rather than a silent no-op.
+
+**Accepted formats.** 64 hex characters, case-insensitive, either plain
+(`3f9a...c4`) or as 32 `:`-separated pairs (`3F:9A:...:C4`, the `openssl`
+format), optionally prefixed with `sha256:`. Quote the value in YAML. A
+wrong length, a non-hex character, or a partly-separated value is a config
+error naming the device. So is a key with no value (`tls_fingerprint:` with
+nothing after it, `null`, `""`, `[]`) - only leaving the key out means "no
+pinning", so a pasted value that went missing can't silently turn a device
+into an unauthenticated one. The key is `tls_fingerprint` (singular) even
+when it holds a list; `tls_fingerprints` is rejected rather than ignored.
+
+**Getting the fingerprint - out of band.** The value must come from a path
+you already trust (console, a management network, your provisioning
+system), not from the network path you are trying to protect:
+
+1. Find the certificate api-ssl uses: `/ip service print detail where
+   name=api-ssl` (its `certificate=` field).
+2. Export it on the router: `/certificate export-certificate <name>`
+   (writes `cert_export_<name>.crt` to the router's files; only the
+   certificate is exported unless you give an `export-passphrase`, which
+   would also export the private key - don't), and copy that file off over
+   a trusted channel.
+3. Compute the fingerprint and paste the part after `=`:
+   ```bash
+   openssl x509 -noout -fingerprint -sha256 -in cert_export_<name>.crt
+   # sha256 Fingerprint=3F:9A:...:C4
+   ```
+
+RouterOS also shows a `fingerprint` per certificate in `/certificate print
+detail`; if it is 64 hex characters it is the same SHA-256 value - cross-check
+it against the `openssl` output once before relying on it. Reading the
+fingerprint from a first TLS connection instead
+(`openssl s_client -connect 192.0.2.10:8729 </dev/null | openssl x509 -noout -fingerprint -sha256`)
+is only acceptable if you then verify that value against the router itself
+through a trusted path - otherwise you are pinning whatever answered that
+first connection.
+
+**Rotation.** `tls_fingerprint` also accepts a list. To replace a router's
+certificate without an outage: add the new certificate's fingerprint next to
+the old one, restart the server, switch api-ssl to the new certificate on the
+router, then remove the old fingerprint and restart the server again.
+`devices.yaml` is only read at startup, so until that second restart the old
+certificate is still accepted. If you are rotating because the old
+certificate's private key may be compromised, remove its pin and restart
+right away rather than at the end of a rollout.
+
+```yaml
+    tls_fingerprint:
+      - "sha256:3F:9A:...:C4"   # current certificate
+      - "sha256:81:0D:...:7E"   # replacement, being rolled out
+```
+
+**Trade-offs.** Compared with `tls_verify: false`, a pin restores
+authentication of the router (a man-in-the-middle can't present the pinned
+certificate without the router's private key) at the cost of one
+out-of-band step per device. Compared with CA verification, a pin needs no
+CA and no SAN, but it is per certificate: whenever a router's certificate
+changes (re-generated, renewed, reset to defaults) the pin must be updated,
+and until then that device fails closed with the mismatch error. The pin
+covers the whole certificate, so re-issuing a certificate for the same key
+also changes it. Certificate validity dates and revocation are not checked
+in pinned mode - the pin is the identity; renew or rotate on your own
+schedule.
+
+**Validation status.** Pinning has been validated against a local TLS
+server only (the test suite's, TLS 1.2 and 1.3), not yet against real
+RouterOS `api-ssl` on ROS6/ROS7 hardware. That includes the RouterOS-side
+steps above (`/ip service print detail`, `/certificate export-certificate`
+and its `cert_export_<name>.crt` file name, the `/certificate print detail`
+fingerprint): treat them as unconfirmed until this note says otherwise.
 
 ## Development & CI
 
@@ -1808,7 +1926,11 @@ The test suite never talks to a real router: `tests/fakes.py` provides an
 in-memory fake that implements the same minimal interface `MikrotikClient`
 expects from a `librouteros` connection, and it is injected via a
 `client_factory` parameter on `build_server()`. It currently has 1298 tests,
-zero of which touch a real device or the network, at 100% line coverage.
+zero of which touch a real device, at 100% line coverage. Almost all of them
+run against that in-memory fake; the exception is
+`tests/test_tls_pinning.py`, which runs a loopback-only TLS server on
+`127.0.0.1` with throwaway certificates generated at test time, and uses the
+`openssl` CLI if it is installed (that one test is skipped otherwise).
 
 CI (`.github/workflows/ci.yml`, GitHub Actions) runs on every push to `main`
 and every pull request, as three separate jobs that must all pass before a

@@ -39,9 +39,18 @@ particular:
 - Command injection - anything that lets a value passed through a tool
   argument change *which* RouterOS command runs, rather than only its
   parameter values (see README's "Structured API, not shell commands").
-- A TLS verification bypass that isn't the explicit, opt-in, per-device
-  `tls_verify: false` documented in README's "TLS verification for
-  api-ssl".
+- A TLS verification bypass that isn't one of the two explicit, opt-in,
+  per-device modes documented in README's "TLS verification for api-ssl":
+  `tls_verify: false` (no authentication of the router), or certificate
+  pinning (`tls_fingerprint`), which deliberately replaces CA-chain and
+  hostname checks with the pin - the pin is the authentication in that
+  mode, so CA/hostname checks being off for a pinned device is by design.
+- For a pinned device, a way around the pin: completing a login with, or
+  sending the username/password (or any RouterOS API byte) to, a peer whose
+  certificate doesn't match a pinned fingerprint; sending credentials
+  before the pin check has passed; a flaw in the pin comparison itself; or
+  a `tls_fingerprint` in `devices.yaml` that loads without error but isn't
+  enforced.
 - Any way for one configured device's tool call to affect a different
   device, or to read config/credentials belonging to a device the caller
   didn't name.
