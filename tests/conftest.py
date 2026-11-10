@@ -485,6 +485,41 @@ def fake_connection() -> FakeConnection:
                     "comment": "",
                 }
             ],
+            # RouterOS's three built-in groups, with the default policy
+            # strings MikroTik documents for them (RouterOS "User" manual
+            # page): `read`/`write` also list the policies they LACK,
+            # `!`-prefixed, while `full` has none to negate. Note that the
+            # stock `read` and `write` groups both INCLUDE `sensitive`. See
+            # formatting.normalize_user_group / `user_groups`.
+            ("user", "group"): [
+                {
+                    ".id": "*1",
+                    "name": "read",
+                    "policy": (
+                        "local,telnet,ssh,reboot,read,test,winbox,password,web,sniff,sensitive,api,romon,"
+                        "rest-api,!ftp,!write,!policy"
+                    ),
+                    "skin": "default",
+                },
+                {
+                    ".id": "*2",
+                    "name": "write",
+                    "policy": (
+                        "local,telnet,ssh,reboot,read,write,test,winbox,password,web,sniff,sensitive,api,"
+                        "romon,rest-api,!ftp,!policy"
+                    ),
+                    "skin": "default",
+                },
+                {
+                    ".id": "*3",
+                    "name": "full",
+                    "policy": (
+                        "local,telnet,ssh,ftp,reboot,read,write,policy,test,winbox,password,web,sniff,"
+                        "sensitive,api,romon,rest-api"
+                    ),
+                    "skin": "default",
+                },
+            ],
             ("user", "active"): [
                 {
                     ".id": "*1",
