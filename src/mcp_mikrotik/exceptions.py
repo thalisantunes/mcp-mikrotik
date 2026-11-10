@@ -50,6 +50,43 @@ class CircuitOpenError(DeviceConnectionError):
         self.retry_after = retry_after
 
 
+class TLSFingerprintMismatchError(DeviceConnectionError):
+    """Raised when an api-ssl device with a pinned `tls_fingerprint` (see
+    config.Device.tls_fingerprints) presents a certificate whose SHA-256
+    fingerprint matches none of the pins - or presents no certificate at
+    all.
+
+    Raised from client.py's pinned ssl_wrapper right after the TLS
+    handshake and BEFORE librouteros sends any RouterOS login bytes, so no
+    credential ever reaches an unpinned peer; the TLS socket is closed
+    before this propagates.
+
+    A subclass of DeviceConnectionError so it counts toward the device's
+    circuit breaker exactly like any other failed connect (see
+    client.MikrotikClient._connect_guarded) and any existing `except
+    DeviceConnectionError` handling keeps working. It exists as its own
+    class so the read-retry loop (client.MikrotikClient._run_read) can
+    recognize it and NOT retry: a wrong certificate is not a transient
+    network blip, and re-handshaking with the same peer cannot fix it.
+
+    The message carries only the two fingerprints (public values, not
+    secrets) and the device name - never the password or username.
+    """
+
+    def __init__(self, device_name: str, presented: str | None, expected: tuple[str, ...]):
+        presented_text = presented if presented is not None else "no certificate"
+        expected_text = ("one of " if len(expected) > 1 else "") + ", ".join(expected)
+        super().__init__(
+            device_name,
+            f"TLS certificate fingerprint mismatch (SHA-256): the device presented {presented_text}, "
+            f"expected {expected_text}. Connection closed before login - no credentials were sent. "
+            "If this device's certificate was legitimately replaced, verify the new certificate out of band "
+            "and update its tls_fingerprint; otherwise treat this as a possible man-in-the-middle.",
+        )
+        self.presented = presented
+        self.expected = expected
+
+
 class DeviceCommandError(MikrotikMCPError):
     """A RouterOS API command failed on the device side."""
 

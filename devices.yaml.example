@@ -25,6 +25,18 @@
 #                 bundle/certificate to validate the device against, instead of the
 #                 system trust store - the safer alternative to tls_verify: false if
 #                 you can provision RouterOS with a certificate you control.
+#   tls_fingerprint - only valid with use_ssl: true. Certificate pinning: the SHA-256
+#                 fingerprint of this router's own api-ssl certificate, obtained out
+#                 of band (e.g. /certificate export-certificate on the router, then
+#                 `openssl x509 -noout -fingerprint -sha256 -in cert_export_<name>.crt`).
+#                 64 hex chars, case-insensitive, plain or ':'-separated, optional
+#                 "sha256:" prefix - quote it. Also accepts a list, to roll out a new
+#                 certificate before removing the old one. The pin REPLACES CA/hostname
+#                 checks (works with self-signed certs and no matching SAN) and is
+#                 checked after the TLS handshake, before any login byte is sent - a
+#                 mismatch closes the connection without sending credentials. Do not
+#                 combine with tls_verify: true or tls_ca_cert (rejected as ambiguous);
+#                 leave tls_verify out. The recommended alternative to tls_verify: false.
 
 devices:
   - name: core-switch
@@ -45,6 +57,21 @@ devices:
     password: change-me
     disabled: false
     comment: WAN edge router, api-ssl only
+
+  - name: branch-router
+    host: 192.0.2.10
+    port: 8729
+    use_ssl: true
+    # Pin this router's api-ssl certificate (placeholder value - use your own):
+    tls_fingerprint: "sha256:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+    # During a certificate rotation, list both:
+    # tls_fingerprint:
+    #   - "sha256:<current certificate fingerprint>"
+    #   - "sha256:<replacement certificate fingerprint>"
+    username: admin
+    password: change-me
+    disabled: false
+    comment: branch router, api-ssl with a pinned self-signed certificate
 
   - name: slow-link-ap
     host: 192.168.90.1

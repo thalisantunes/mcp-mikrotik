@@ -27,6 +27,11 @@ dev = [
     "ruff==0.17.4",
     "mypy>=1.13",
     "types-PyYAML>=6.0",
+    # Generates throwaway self-signed certificates at test time for the
+    # api-ssl certificate-pinning tests (tests/test_tls_pinning.py). Already
+    # installed transitively (mcp -> pyjwt[crypto]); listed so the tests
+    # don't depend on that.
+    "cryptography>=42",
 ]
 
 [project.scripts]

@@ -19,7 +19,10 @@ same MikrotikClient layer - see the TODO at the bottom of this file.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import os
+import socket
 import ssl
 import threading
 import time
@@ -31,7 +34,7 @@ import librouteros
 from librouteros.exceptions import LibRouterosError, TrapError
 
 from .config import Device, Settings
-from .exceptions import CircuitOpenError, DeviceCommandError, DeviceConnectionError
+from .exceptions import CircuitOpenError, DeviceCommandError, DeviceConnectionError, TLSFingerprintMismatchError
 
 DEFAULT_TIMEOUT = 10.0
 
@@ -227,13 +230,78 @@ def _build_ssl_context(device: Device) -> ssl.SSLContext:
     (RouterOS api-ssl commonly uses a self-signed cert) - this is a
     documented, explicit, per-device trade-off (see README "Security model"
     and devices.yaml.example), never the default.
+
+    A device with pinned fingerprints (device.tls_fingerprints) takes
+    precedence over both: the context skips CA-chain and hostname checks
+    because the pin - enforced by _pinned_ssl_wrapper right after the
+    handshake, before any login byte - is the authentication instead (see
+    config._device_from_dict for why a pin replaces, rather than adds to,
+    chain verification).
     """
-    if device.tls_verify:
+    if device.tls_verify and not device.tls_fingerprints:
         return ssl.create_default_context(cafile=device.tls_ca_cert)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     return context
+
+
+def _format_fingerprint(hex_digest: str) -> str:
+    """64 lowercase hex chars -> `AB:CD:...`, the same shape `openssl x509
+    -noout -fingerprint -sha256` prints, so an operator can compare an
+    error message against that output directly."""
+    return ":".join(hex_digest[i : i + 2] for i in range(0, len(hex_digest), 2)).upper()
+
+
+def _verify_peer_fingerprint(tls_sock: ssl.SSLSocket, device: Device) -> None:
+    """Raise TLSFingerprintMismatchError unless the certificate the peer
+    presented in the (already completed) handshake matches one of the
+    device's pins.
+
+    The pin is the SHA-256 of the DER-encoded leaf certificate
+    (getpeercert(binary_form=True) - available even though the context
+    uses CERT_NONE, since the server still sends its certificate). Compared
+    with hmac.compare_digest; the pins aren't secret, but a constant-time
+    compare costs nothing and keeps this check free of any timing question.
+    A peer that sends no certificate at all fails closed.
+    """
+    der = tls_sock.getpeercert(binary_form=True)
+    expected = tuple(_format_fingerprint(pin) for pin in device.tls_fingerprints)
+    if not der:
+        raise TLSFingerprintMismatchError(device.name, None, expected)
+    presented = hashlib.sha256(der).digest()
+    if any(hmac.compare_digest(presented, bytes.fromhex(pin)) for pin in device.tls_fingerprints):
+        return
+    raise TLSFingerprintMismatchError(device.name, _format_fingerprint(presented.hex()), expected)
+
+
+def _pinned_ssl_wrapper(device: Device, context: ssl.SSLContext) -> Callable[[socket.socket], socket.socket]:
+    """Build librouteros' `ssl_wrapper` for a device with pinned
+    fingerprints.
+
+    librouteros.connect() calls `ssl_wrapper(sock)` inside its
+    create_transport(), and only AFTER that returns does it build the API
+    protocol and run the login method that sends `/login` with the
+    username and password. So this wrapper is the last point before any
+    credential byte leaves the process: it completes the TLS handshake
+    (wrap_socket with do_handshake_on_connect=True), checks the presented
+    certificate against the pins, and on a mismatch closes the TLS socket
+    and raises TLSFingerprintMismatchError - which propagates out of
+    librouteros.connect() before the login ever starts. The pin check is
+    therefore never skippable by the login path, and no credential is ever
+    written to an unpinned peer.
+    """
+
+    def wrap(sock: socket.socket) -> socket.socket:
+        tls_sock = context.wrap_socket(sock, server_hostname=device.host, do_handshake_on_connect=True)
+        try:
+            _verify_peer_fingerprint(tls_sock, device)
+        except BaseException:
+            tls_sock.close()
+            raise
+        return tls_sock
+
+    return wrap
 
 
 def _connect(device: Device) -> RouterosConnection:
@@ -246,7 +314,13 @@ def _connect(device: Device) -> RouterosConnection:
     }
     if device.use_ssl:
         context = _build_ssl_context(device)
-        kwargs["ssl_wrapper"] = partial(context.wrap_socket, server_hostname=device.host)
+        if device.tls_fingerprints:
+            kwargs["ssl_wrapper"] = _pinned_ssl_wrapper(device, context)
+        else:
+            kwargs["ssl_wrapper"] = partial(context.wrap_socket, server_hostname=device.host)
+    # A TLSFingerprintMismatchError raised by the pinned ssl_wrapper is
+    # already a DeviceConnectionError (not a LibRouterosError/OSError), so it
+    # propagates unchanged past the handlers below.
     try:
         return librouteros.connect(**kwargs)
     except LibRouterosError as exc:
@@ -312,20 +386,25 @@ class MikrotikClient:
         retries reuse 1s), retrying `fn` against the SAME connection object
         (no reconnect attempt is forced - see _execute_once). Only retried
         when the failure looks transient - a fresh CircuitOpenError (breaker
-        already deliberately failing fast) is never retried, a
-        DeviceConnectionError from an actual failed connect attempt is
-        always retried (each retry re-attempts the connect too, through the
-        breaker), and a DeviceCommandError is retried only when its cause
-        was an OSError (a dropped socket, a timeout) rather than a
-        LibRouterosError (RouterOS itself rejected the command - retrying
-        would just get rejected again).
+        already deliberately failing fast) is never retried, nor is a
+        TLSFingerprintMismatchError (the device presented a certificate
+        that matches none of its pins - not a network blip; re-handshaking
+        with the same peer can't fix it, and hammering a possible MITM with
+        repeated attempts helps no one - it still counts toward the breaker
+        via _connect_guarded), any other DeviceConnectionError from an
+        actual failed connect attempt is always retried (each retry
+        re-attempts the connect too, through the breaker), and a
+        DeviceCommandError is retried only when its cause was an OSError (a
+        dropped socket, a timeout) rather than a LibRouterosError (RouterOS
+        itself rejected the command - retrying would just get rejected
+        again).
         """
         retries = _read_retries()
         attempt = 0
         while True:
             try:
                 return self._execute_once(description, fn)
-            except CircuitOpenError:
+            except (CircuitOpenError, TLSFingerprintMismatchError):
                 raise
             except DeviceConnectionError:
                 if attempt >= retries:

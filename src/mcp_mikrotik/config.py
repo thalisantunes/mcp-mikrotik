@@ -13,6 +13,7 @@ See .env.example for the full list.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,17 @@ class Device:
     # Optional path to a CA bundle to validate the device's cert against,
     # instead of the system trust store. Ignored when tls_verify is False.
     tls_ca_cert: str | None = None
+    # Certificate pinning (devices.yaml key `tls_fingerprint`, a string or a
+    # list of strings): the accepted SHA-256 fingerprints of this device's
+    # own api-ssl certificate (the DER leaf), normalized by
+    # normalize_tls_fingerprint() to 64 lowercase hex chars. Empty = no
+    # pinning. When non-empty, the pin REPLACES chain + hostname
+    # verification rather than adding to it - client._build_ssl_context()
+    # checks this before tls_verify/tls_ca_cert, and the YAML loader
+    # rejects an explicit `tls_verify: true` or a `tls_ca_cert` alongside
+    # it as ambiguous (see _device_from_dict for why). Not secret, but also
+    # not part of to_public_dict(): tool output doesn't need it.
+    tls_fingerprints: tuple[str, ...] = ()
     # Per-device connection timeout (seconds). None means "use the
     # MIKROTIK_TIMEOUT env var if set, else client.DEFAULT_TIMEOUT" - see
     # client._resolve_timeout(). Some fleet links are slow enough (15-40s
@@ -112,6 +124,59 @@ def _coerce_str(value: Any, field_name: str, path: Path) -> str:
     raise ConfigError(f"{path}: device field {field_name!r} must be a string, got {value!r}.")
 
 
+_FINGERPRINT_PREFIX = "sha256:"
+_FINGERPRINT_PLAIN = re.compile(r"[0-9a-f]{64}")
+_FINGERPRINT_COLON_SEPARATED = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){31}")
+
+
+def normalize_tls_fingerprint(value: str) -> str | None:
+    """Normalize one SHA-256 certificate fingerprint to 64 lowercase hex
+    chars, or return None if `value` isn't one.
+
+    Accepted, case-insensitively: 64 hex chars (`ab12...`), or 32 ':'
+    separated hex pairs (`AB:12:...`, the `openssl x509 -fingerprint
+    -sha256` format), either optionally prefixed with `sha256:`.
+    Separators are all-or-nothing - a value with only some ':' is
+    rejected rather than guessed at, since that usually means a pair was
+    dropped or mistyped. Anything else (wrong length, non-hex chars, a
+    SHA-1/MD5 fingerprint) returns None.
+    """
+    text = value.strip().lower()
+    if text.startswith(_FINGERPRINT_PREFIX):
+        text = text[len(_FINGERPRINT_PREFIX) :].strip()
+    if _FINGERPRINT_COLON_SEPARATED.fullmatch(text):
+        text = text.replace(":", "")
+    return text if _FINGERPRINT_PLAIN.fullmatch(text) else None
+
+
+def _parse_tls_fingerprints(raw_value: Any, name: str, path: Path) -> tuple[str, ...]:
+    """Parse a device's `tls_fingerprint` (a string, or a list of strings to
+    allow certificate rotation) into normalized pins. Missing/null means no
+    pinning; an empty list or any invalid entry is a ConfigError naming the
+    device - never silently treated as "no pinning", which would quietly
+    downgrade the connection's authentication."""
+    if raw_value is None:
+        return ()
+    values = raw_value if isinstance(raw_value, list) else [raw_value]
+    if not values:
+        raise ConfigError(
+            f"{path}: device {name!r} has an empty 'tls_fingerprint' list; list at least one "
+            "fingerprint or remove the key."
+        )
+    pins: list[str] = []
+    for value in values:
+        normalized = normalize_tls_fingerprint(value) if isinstance(value, str) else None
+        if normalized is None:
+            raise ConfigError(
+                f"{path}: device {name!r} has an invalid 'tls_fingerprint' value {value!r}: expected a "
+                "SHA-256 certificate fingerprint - 64 hex characters, optionally as ':'-separated pairs "
+                "and/or prefixed with 'sha256:' (quote it in YAML)."
+            )
+        if normalized not in pins:
+            pins.append(normalized)
+    return tuple(pins)
+
+
 def _device_from_dict(raw: dict[str, Any], path: Path) -> Device:
     if "name" not in raw or "host" not in raw:
         raise ConfigError(f"{path}: each device entry needs at least 'name' and 'host'.")
@@ -134,17 +199,60 @@ def _device_from_dict(raw: dict[str, Any], path: Path) -> Device:
         except (ValueError, TypeError) as exc:
             raise ConfigError(f"{path}: device {name!r} has an invalid 'timeout': {timeout_raw!r}") from exc
 
+    use_ssl = bool(raw.get("use_ssl", False))
+    tls_verify = bool(raw.get("tls_verify", True))
+    tls_ca_cert = raw.get("tls_ca_cert")
+    tls_fingerprints = _parse_tls_fingerprints(raw.get("tls_fingerprint"), name, path)
+    if tls_fingerprints:
+        # Pinning only means anything on an api-ssl connection; on the plain
+        # API there is no certificate to pin, and silently ignoring the key
+        # would leave the operator believing the device is authenticated.
+        if not use_ssl:
+            raise ConfigError(
+                f"{path}: device {name!r} sets 'tls_fingerprint' without 'use_ssl: true'. Certificate "
+                "pinning only applies to api-ssl - enable use_ssl (and point port at the api-ssl service, "
+                "usually 8729) or remove tls_fingerprint."
+            )
+        # Design choice: a pin REPLACES CA-chain + hostname verification
+        # instead of being checked in addition to it. The case pinning exists
+        # for - RouterOS's self-signed / per-device-CA certs, commonly with
+        # no subjectAltName for the address the server connects to - can
+        # never pass chain + hostname checks, so "pin in addition" would make
+        # the pin unusable exactly where it's needed (or force `tls_verify:
+        # false` next to it, which reads as "unauthenticated" when it isn't).
+        # The pin is also the stronger identity check: it accepts exactly one
+        # certificate per pin rather than anything a CA signed for that name.
+        # Because chain/hostname checks are then NOT performed, an explicit
+        # `tls_verify: true` or a `tls_ca_cert` next to a pin would make the
+        # config claim a check that doesn't happen - rejected as ambiguous
+        # rather than silently ignored. `tls_verify: false` (or omitting it)
+        # is consistent with pin-only mode and accepted.
+        if "tls_verify" in raw and tls_verify:
+            raise ConfigError(
+                f"{path}: device {name!r} sets both 'tls_fingerprint' and 'tls_verify: true'. With a pinned "
+                "fingerprint the pin is the authentication and CA-chain/hostname checks are not performed, "
+                "so this combination is ambiguous - remove tls_verify (or set it to false), or remove "
+                "tls_fingerprint to use CA verification instead."
+            )
+        if tls_ca_cert:
+            raise ConfigError(
+                f"{path}: device {name!r} sets both 'tls_fingerprint' and 'tls_ca_cert'. They are not "
+                "combined: tls_ca_cert validates the certificate chain against a CA, tls_fingerprint pins "
+                "this device's exact certificate instead - keep one of them."
+            )
+
     return Device(
         name=name,
         host=host,
         port=port,
-        use_ssl=bool(raw.get("use_ssl", False)),
+        use_ssl=use_ssl,
         username=raw.get("username", "admin"),
         password=raw.get("password", ""),
         disabled=bool(raw.get("disabled", False)),
         comment=raw.get("comment", ""),
-        tls_verify=bool(raw.get("tls_verify", True)),
-        tls_ca_cert=raw.get("tls_ca_cert"),
+        tls_verify=tls_verify,
+        tls_ca_cert=tls_ca_cert,
+        tls_fingerprints=tls_fingerprints,
         timeout=timeout,
     )
 
